@@ -1,0 +1,64 @@
+{
+  "name": "@zakkster/lite-gc-profiler",
+  "version": "1.0.0",
+  "description": "Zero-dependency GC and heap profiler that makes the zero-GC claim falsifiable: precise garbage-collection events in node (perf_hooks), a heap-drop heuristic in Chrome, and long-frame anomaly detection everywhere else, with a maxMajor:0 budget gate.",
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "node": "./index.js",
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "llms.txt",
+    "LICENSE.txt"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --expose-gc --test",
+    "bundle-check": "npx esbuild index.js --bundle --format=esm --outfile=test-bundle.js",
+    "prepublishOnly": "npm run test && npm run bundle-check"
+  },
+  "keywords": [
+    "profiler",
+    "gc",
+    "garbage-collection",
+    "heap",
+    "memory",
+    "zero-gc",
+    "performance",
+    "perf_hooks",
+    "regression",
+    "lite"
+  ],
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-gc-profiler#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.com/zakkster/lite-gc-profiler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-gc-profiler/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  }
+}

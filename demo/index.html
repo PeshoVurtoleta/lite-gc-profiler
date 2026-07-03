@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>lite-gc-profiler &mdash; prove the zero-GC claim</title>
+    <style>
+        :root {
+            --bg: #05100a;
+            --bg: oklch(0.16 0.03 155);
+            --panel: #0a1a10;
+            --panel: oklch(0.21 0.035 155);
+            --grid: #1f6f4529;
+            --grid: oklch(0.55 0.11 155 / 0.16);
+            --ink: #7df7b0;
+            --ink: oklch(0.88 0.16 155);
+            --ink-dim: #3f9c68;
+            --ink-dim: oklch(0.66 0.10 155);
+            --ink-faint: #2a6f49;
+            --ink-faint: oklch(0.52 0.07 155);
+            --warn: #ffb454;
+            --warn: oklch(0.82 0.15 68);
+            --bad: #ff6b6b;
+            --bad: oklch(0.72 0.18 25);
+            --trace: #54f7c0;
+            --trace: oklch(0.90 0.17 168);
+            --edge: #2f5a4480;
+            --edge: oklch(0.42 0.06 155 / 0.5);
+            --r: 0.5rem;
+            --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+        }
+
+        body {
+            background: linear-gradient(transparent 0 calc(1.5rem - 1px), var(--grid) calc(1.5rem - 1px) 1.5rem),
+            linear-gradient(90deg, transparent 0 calc(1.5rem - 1px), var(--grid) calc(1.5rem - 1px) 1.5rem),
+            var(--bg);
+            background-size: 1.5rem 1.5rem;
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            padding: 1.5rem;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .wrap {
+            max-width: 60rem;
+            margin: 0 auto;
+        }
+
+        header {
+            border-bottom: 1px solid var(--edge);
+            padding-bottom: 0.9rem;
+            margin-bottom: 1.2rem;
+        }
+
+        h1 {
+            font-size: 1.15rem;
+            margin: 0 0 0.2rem;
+            letter-spacing: 0.02em;
+        }
+
+        h1 .v {
+            color: var(--ink-faint);
+            font-weight: 400;
+        }
+
+        .sub {
+            color: var(--ink-dim);
+            font-size: 0.82rem;
+            max-width: 44rem;
+        }
+
+        .banner {
+            margin: 0.9rem 0 1.1rem;
+            padding: 0.5rem 0.8rem;
+            border-radius: var(--r);
+            border: 1px solid var(--edge);
+            background: var(--panel);
+            font-size: 0.78rem;
+            color: var(--ink-dim);
+        }
+
+        .banner b {
+            color: var(--ink);
+        }
+
+        .row {
+            display: grid;
+            grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+            gap: 1rem;
+            align-items: start;
+        }
+
+        @media (max-width: 46rem) {
+            .row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--edge);
+            border-radius: var(--r);
+            padding: 0.9rem 1rem;
+        }
+
+        .card h2 {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--ink-faint);
+            margin: 0 0 0.7rem;
+            font-weight: 600;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            border-radius: calc(var(--r) - 2px);
+            background: var(--bg);
+        }
+
+        .c-bad {
+            color: var(--bad);
+        }
+
+        .c-ink {
+            color: var(--ink);
+        }
+
+        .stage-gap {
+            margin-top: 0.8rem;
+        }
+
+        .stage {
+            height: 12rem;
+        }
+
+        .scope {
+            height: 10rem;
+        }
+
+        .cal {
+            color: var(--ink-faint);
+            font-size: 0.72rem;
+            margin-top: 0.5rem;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.55rem 1rem;
+        }
+
+        .stat .k {
+            color: var(--ink-faint);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+        }
+
+        .stat .val {
+            font-size: 1.1rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .stat .val .u {
+            font-size: 0.66rem;
+            color: var(--ink-dim);
+            margin-left: 0.15rem;
+        }
+
+        .modes {
+            display: flex;
+            gap: 0.4rem;
+            margin: 1.1rem 0 0.2rem;
+        }
+
+        .mode {
+            flex: 1;
+            font: inherit;
+            color: var(--ink-dim);
+            background: var(--bg);
+            border: 1px solid var(--edge);
+            border-radius: var(--r);
+            padding: 0.5rem 0.7rem;
+            cursor: pointer;
+            letter-spacing: 0.02em;
+        }
+
+        .mode.active[data-kind="leaky"] {
+            color: var(--bg);
+            background: var(--bad);
+            border-color: var(--bad);
+        }
+
+        .mode.active[data-kind="pooled"] {
+            color: var(--bg);
+            background: var(--ink);
+            border-color: var(--ink);
+        }
+
+        @media (hover: hover) {
+            .mode:not(.active):hover {
+                color: var(--ink);
+                border-color: var(--ink-faint);
+            }
+        }
+
+        .verdict {
+            margin-top: 0.9rem;
+            padding: 0.6rem 0.8rem;
+            border-radius: var(--r);
+            border: 1px solid var(--edge);
+            background: var(--bg);
+            font-size: 0.82rem;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+        }
+
+        .lamp {
+            width: 0.8rem;
+            height: 0.8rem;
+            border-radius: 50%;
+            background: var(--ink-faint);
+            flex: none;
+        }
+
+        .verdict[data-v="ok"] .lamp {
+            background: var(--ink);
+            box-shadow: 0 0 0.5rem var(--ink);
+        }
+
+        .verdict[data-v="bad"] .lamp {
+            background: var(--bad);
+            box-shadow: 0 0 0.5rem var(--bad);
+        }
+
+        .verdict[data-v="bad"] .msg {
+            color: var(--bad);
+        }
+
+        .note {
+            color: var(--ink-faint);
+            font-size: 0.72rem;
+            margin-top: 0.8rem;
+        }
+
+        code {
+            color: var(--ink);
+            background: color-mix(in oklab, var(--ink) 10%, transparent);
+            padding: 0 0.25rem;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <header>
+        <h1>lite-gc-profiler <span class="v">&mdash; prove the zero-GC claim</span></h1>
+        <p class="sub">
+            The same particle workload runs two ways. <b class="c-bad">Leaky</b> allocates a fresh
+            array of objects every frame; <b class="c-ink">Pooled</b> mutates one preallocated typed
+            array and allocates nothing. Watch the heap trace: a sawtooth (fill, collect, repeat) versus a flat line.
+        </p>
+    </header>
+
+    <div class="banner" id="banner">detecting source&hellip;</div>
+
+    <div class="row">
+        <div class="card">
+            <h2 id="scopeTitle">Heap trace</h2>
+            <canvas class="scope" id="scope"></canvas>
+            <p class="cal" id="scopeCal">&nbsp;</p>
+            <canvas class="stage stage-gap" id="stage"></canvas>
+        </div>
+        <div class="card">
+            <h2>Live</h2>
+            <div class="stats">
+                <div class="stat">
+                    <div class="k">source</div>
+                    <div class="val" id="mSource">&mdash;</div>
+                </div>
+                <div class="stat">
+                    <div class="k">display</div>
+                    <div class="val"><span id="mFps">0</span><span class="u">fps</span></div>
+                </div>
+                <div class="stat">
+                    <div class="k">heap used</div>
+                    <div class="val"><span id="mUsed">0</span><span class="u">MB</span></div>
+                </div>
+                <div class="stat">
+                    <div class="k">alloc rate</div>
+                    <div class="val"><span id="mRate">0</span><span class="u">MB/s</span></div>
+                </div>
+                <div class="stat">
+                    <div class="k">collections</div>
+                    <div class="val" id="mDrops">0</div>
+                </div>
+                <div class="stat">
+                    <div class="k">freed</div>
+                    <div class="val"><span id="mFreed">0</span><span class="u">MB</span></div>
+                </div>
+                <div class="stat">
+                    <div class="k">long frames</div>
+                    <div class="val" id="mLong">0</div>
+                </div>
+                <div class="stat">
+                    <div class="k">instances</div>
+                    <div class="val" id="mInst">0</div>
+                </div>
+            </div>
+            <div class="modes">
+                <button class="mode active" data-kind="pooled" id="modePooled">Pooled (0 alloc)</button>
+                <button class="mode" data-kind="leaky" id="modeLeaky">Leaky (per-frame)</button>
+            </div>
+            <div class="verdict" data-v="ok" id="verdict">
+                <span class="lamp"></span><span class="msg"
+                                                id="verdictMsg">Pooled: no allocation on the hot path.</span>
+            </div>
+            <p class="note">
+                Chrome exposes <code>performance.memory</code>, so this shows real heap movement. Firefox and Safari
+                don't; there the trace falls back to frame time and only long-frame anomalies are flagged. Precise
+                per-collection counts (minor/major) are a node feature &mdash; see the test suite.
+            </p>
+        </div>
+    </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-gc-profiler": "../index.js"
+  }
+}
+
+</script>
+<script type="module">
+    import {GcProfiler} from '@zakkster/lite-gc-profiler';
+
+    const MB = 1024 * 1024;
+    const DPR = Math.min(2, window.devicePixelRatio || 1);
+    const TAU = Math.PI * 2;
+
+    const gc = new GcProfiler(256);
+    const source = gc.source;                    // 'gc' (node only), 'heap' (Chrome), or 'none'
+    const heapMode = source === 'heap';          // in-browser precise-ish heap path
+
+    // ---- cached refs ($-prefixed) ----
+    const $scope = document.getElementById('scope');
+    const $stage = document.getElementById('stage');
+    const $banner = document.getElementById('banner');
+    const $scopeTitle = document.getElementById('scopeTitle');
+    const $scopeCal = document.getElementById('scopeCal');
+    const $mSource = document.getElementById('mSource'), $mFps = document.getElementById('mFps');
+    const $mUsed = document.getElementById('mUsed'), $mRate = document.getElementById('mRate');
+    const $mDrops = document.getElementById('mDrops'), $mFreed = document.getElementById('mFreed');
+    const $mLong = document.getElementById('mLong'), $mInst = document.getElementById('mInst');
+    const $verdict = document.getElementById('verdict'), $verdictMsg = document.getElementById('verdictMsg');
+
+    $banner.innerHTML = heapMode
+        ? 'Source: <b>heap</b> &mdash; reading <code>performance.memory</code>. The heap trace below is real.'
+        : (source === 'gc'
+            ? 'Source: <b>gc</b> &mdash; precise perf_hooks events. (You are seeing this in node?)'
+            : 'Source: <b>none</b> &mdash; no <code>performance.memory</code> here. Trace shows frame time; only long-frame anomalies are flagged.');
+    $scopeTitle.textContent = heapMode ? 'Heap used (sawtooth = GC)' : 'Frame time';
+
+    // ---- scope: one sample per column, full resolution (no strobing) ----
+    const sctx = $scope.getContext('2d');
+    let SW = 1, SH = 1, cols = 1, ring, head = 0, filled = 0, topVal = heapMode ? 32 * MB : 33;
+
+    function scopeResize() {
+        const r = $scope.getBoundingClientRect();
+        $scope.width = Math.max(1, Math.round(r.width * DPR));
+        $scope.height = Math.max(1, Math.round(r.height * DPR));
+        SW = $scope.width;
+        SH = $scope.height;
+        cols = SW;
+        ring = new Float32Array(cols);
+        head = 0;
+        filled = 0;
+    }
+
+    function scopePush(v) {
+        ring[head] = v;
+        head = (head + 1) % cols;
+        if (filled < cols) filled++;
+        if (v > topVal) topVal = v;
+    }
+
+    function scopeReset() {
+        head = 0;
+        filled = 0;
+        topVal = heapMode ? 32 * MB : 33;
+    }
+
+    function scopeDraw() {
+        sctx.clearRect(0, 0, SW, SH);
+        const scale = SH / (topVal * 1.1);
+        sctx.strokeStyle = 'oklch(0.55 0.11 155 / 0.18)';
+        sctx.lineWidth = 1;
+        for (let d = 1; d < 5; d++) {
+            const y = SH - (SH / 5) * d;
+            sctx.beginPath();
+            sctx.moveTo(0, y);
+            sctx.lineTo(SW, y);
+            sctx.stroke();
+        }
+        if (!heapMode) {   // 16.7ms budget line for the frame-time fallback
+            sctx.strokeStyle = 'oklch(0.82 0.15 68 / 0.7)';
+            sctx.setLineDash([4, 4]);
+            const by = SH - (1000 / 60) * scale;
+            sctx.beginPath();
+            sctx.moveTo(0, by);
+            sctx.lineTo(SW, by);
+            sctx.stroke();
+            sctx.setLineDash([]);
+        }
+        if (filled > 1) {
+            sctx.strokeStyle = 'oklch(0.90 0.17 168)';
+            sctx.lineWidth = 1.4 * DPR;
+            sctx.beginPath();
+            const start = (head - filled + cols) % cols;
+            for (let i = 0; i < filled; i++) {
+                const v = ring[(start + i) % cols];
+                const x = (i / (cols - 1)) * SW, y = SH - Math.min(topVal, v) * scale;
+                if (i === 0) sctx.moveTo(x, y); else sctx.lineTo(x, y);
+            }
+            sctx.stroke();
+        }
+    }
+
+    scopeResize();
+
+    // ---- particle stage ----
+    const gctx = $stage.getContext('2d');
+    const MAXP = 4000;
+    const px = new Float32Array(MAXP), py = new Float32Array(MAXP), vx = new Float32Array(MAXP),
+        vy = new Float32Array(MAXP);
+    let np = 1400, GW = 1, GH = 1;
+
+    function stageResize() {
+        const r = $stage.getBoundingClientRect();
+        $stage.width = Math.max(1, Math.round(r.width * DPR));
+        $stage.height = Math.max(1, Math.round(r.height * DPR));
+        GW = $stage.width;
+        GH = $stage.height;
+        for (let i = 0; i < MAXP; i++) {
+            px[i] = Math.random() * GW;
+            py[i] = Math.random() * GH;
+            const a = Math.random() * TAU, s = 20 + Math.random() * 50;
+            vx[i] = Math.cos(a) * s;
+            vy[i] = Math.sin(a) * s;
+        }
+    }
+
+    stageResize();
+
+    // ---- mode ----
+    let mode = 'pooled';   // 'pooled' | 'leaky'
+    const POOL = new Float64Array(MAXP * 4);   // the reused buffer for pooled mode
+    function setMode(m) {
+        mode = m;
+        document.getElementById('modePooled').classList.toggle('active', m === 'pooled');
+        document.getElementById('modeLeaky').classList.toggle('active', m === 'leaky');
+        gc.reset();
+        scopeReset();
+        $verdict.dataset.v = m === 'pooled' ? 'ok' : 'bad';
+        $verdictMsg.textContent = m === 'pooled'
+            ? 'Pooled: no allocation on the hot path.'
+            : 'Leaky: a fresh array of objects every frame. Watch the heap climb and collapse.';
+    }
+
+    document.getElementById('modePooled').addEventListener('click', () => setMode('pooled'));
+    document.getElementById('modeLeaky').addEventListener('click', () => setMode('leaky'));
+
+    // ---- fps + throttled HUD ----
+    let fps = 0, fpsFrames = 0, fpsT0 = performance.now();
+    let hudAccum = 0;
+    const fmt1 = (n) => n.toFixed(1);
+
+    let last = performance.now();
+    let fpsT0Frame = performance.now();
+    let lastScopeT = performance.now();
+
+    function frame(now) {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+
+        // --- the workload; mode decides whether it allocates ---
+        gctx.clearRect(0, 0, GW, GH);
+        gctx.fillStyle = mode === 'leaky' ? 'oklch(0.72 0.18 25)' : 'oklch(0.88 0.16 155)';   // once per frame, not per particle
+        for (let i = 0; i < np; i++) {
+            let x = px[i] + vx[i] * dt, y = py[i] + vy[i] * dt;
+            if (x < 0 || x > GW) {
+                vx[i] = -vx[i];
+                x = px[i];
+            }
+            if (y < 0 || y > GH) {
+                vy[i] = -vy[i];
+                y = py[i];
+            }
+            px[i] = x;
+            py[i] = y;
+            const s = 1.5 * DPR;
+            gctx.fillRect(x - s, y - s, s * 2, s * 2);
+        }
+        if (mode === 'leaky') {
+            // allocate and touch a fresh array of objects every frame -> young-gen churn
+            const junk = new Array(np);
+            for (let i = 0; i < np; i++) junk[i] = {x: px[i], y: py[i], vx: vx[i], vy: vy[i], k: 'p' + (i & 63)};
+            if (junk[np - 1].k === '__never') GW += 1;   // keep it live so it isn't optimised away
+        } else {
+            for (let i = 0; i < np; i++) {
+                const b = i * 4;
+                POOL[b] = px[i];
+                POOL[b + 1] = py[i];
+                POOL[b + 2] = vx[i];
+                POOL[b + 3] = vy[i];
+            }
+        }
+
+        // --- profile (zero-alloc calls) ---
+        // Read the heap figure ONCE and hand it to both the profiler and the scope.
+        // Calling gc.summary() here would allocate a full report object every frame --
+        // the demo's own instrumentation would then pollute the very heap trace it
+        // draws. summary() stays in the throttled HUD block below, where it belongs.
+        let usedNow = 0;
+        if (heapMode) {
+            usedNow = performance.memory.usedJSHeapSize;
+            gc.sampleHeap(now, usedNow);
+        } else {
+            gc.sampleHeap(now);       // inert without a heap API
+        }
+        gc.markFrame((now - fpsT0Frame)); // frame ms; see below
+        fpsT0Frame = now;
+
+        // fps
+        fpsFrames++;
+        if (now - fpsT0 >= 500) {
+            fps = Math.round(fpsFrames * 1000 / (now - fpsT0));
+            fpsFrames = 0;
+            fpsT0 = now;
+        }
+
+        // scope sample per frame
+        scopePush(heapMode ? usedNow : (now - lastScopeT));
+        lastScopeT = now;
+
+        // throttled HUD (~10Hz): toFixed and DOM writes here, never in the loop above
+        hudAccum += dt;
+        if (hudAccum >= 0.1) {
+            hudAccum = 0;
+            const s = gc.summary();
+            $mSource.textContent = s.source;
+            $mFps.textContent = fps;
+            $mUsed.textContent = heapMode ? fmt1(s.heap.used / MB) : '\u2014';
+            $mRate.textContent = heapMode ? fmt1(s.heap.allocRateBytesPerSec / MB) : '\u2014';
+            $mDrops.textContent = heapMode ? s.heap.gcDrops : '\u2014';
+            $mFreed.textContent = heapMode ? fmt1(s.heap.freedBytes / MB) : '\u2014';
+            $mLong.textContent = s.frames.long;
+            $mInst.textContent = np;
+            $scopeCal.textContent = heapMode
+                ? ('used ' + fmt1(s.heap.used / MB) + ' MB \u00b7 peak ' + fmt1(s.heap.peak / MB) + ' MB \u00b7 top ' + fmt1(topVal * 1.1 / MB) + ' MB')
+                : ('frame ms \u00b7 budget 16.7 ms \u00b7 long frames ' + s.frames.long);
+            scopeDraw();
+        }
+
+        requestAnimationFrame(frame);
+    }
+
+    window.addEventListener('resize', () => {
+        scopeResize();
+        stageResize();
+    });
+
+    setMode('pooled');
+    requestAnimationFrame(frame);
+</script>
+</body>
+</html>
