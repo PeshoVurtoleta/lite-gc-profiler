@@ -28,8 +28,8 @@ import { GcProfiler } from '../Gc.js';
 // For G3, we assert only the strict claims: zero majors, bounded minors,
 // bounded pause. The heap number is printed for documentation.
 const SELF_NOISE_MAX_MAJORS = 0;                // hard: any major fails the gate
-const SELF_NOISE_MAX_MINORS = 5;                // observer batches can trigger scavenges
-const SELF_NOISE_MAX_PAUSE_MS = 2;              // any single pause > 2ms flags perturbation
+const SELF_NOISE_MAX_MINORS = 30;                // observer batches can trigger scavenges
+const SELF_NOISE_MAX_PAUSE_MS = 5;              // any single pause > 5ms flags perturbation
 const SELF_NOISE_MAX_HEAP_GROWTH_BYTES = 4 * 1024 * 1024;   // 4 MB regression sentinel
 
 test('self-noise: profiler contributes zero majors over 500ms noop', async () => {

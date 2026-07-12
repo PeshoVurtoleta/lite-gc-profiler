@@ -679,7 +679,7 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 node --expose-gc --test test/*.mjs test/torture/*.mjs
 ```
 
-241 tests, all passing on this hardware. Torture tests (48 scenarios across
+240 tests, all passing on this hardware. Torture tests (48 scenarios across
 four axes) enforce that adversarial inputs never silently pass, that real
 signal in noise always fails, that clean signal under hostile conditions
 always passes, and that self-consistency invariants hold across the API.

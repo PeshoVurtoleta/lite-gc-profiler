@@ -52,7 +52,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "test": "node --expose-gc --test",
+    "test": "node --expose-gc --test 'test/*.test.mjs' 'test/torture/*.test.mjs'",
     "bundle-check": "npx esbuild Gc.js --bundle --format=esm --outfile=test-bundle.js",
     "prepublishOnly": "npm run test && npm run bundle-check"
   },

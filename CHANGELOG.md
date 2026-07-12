@@ -122,7 +122,7 @@ names in `package.json` exports are unchanged.
 
 ### Tests
 
-241 tests, all passing under `node --expose-gc`. Includes 48 torture
+240 tests, all passing under `node --expose-gc`. Includes 48 torture
 scenarios (18 verdict-integrity, 17 rep/differential/baseline, 13
 attribution) enforcing:
 
