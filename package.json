@@ -1,22 +1,50 @@
 {
   "name": "@zakkster/lite-gc-profiler",
-  "version": "1.0.0",
-  "description": "Zero-dependency GC and heap profiler that makes the zero-GC claim falsifiable: precise garbage-collection events in node (perf_hooks), a heap-drop heuristic in Chrome, and long-frame anomaly detection everywhere else, with a maxMajor:0 budget gate.",
+  "version": "1.1.0",
+  "description": "Zero-dependency GC and heap profiler that makes the zero-GC claim falsifiable: three-state verdicts, phases, regions, differential and rep-aware gating, baselines, CLI, and explain mode. precise garbage-collection events in node (perf_hooks), a heap-drop heuristic in Chrome, and long-frame anomaly detection everywhere else.",
   "type": "module",
-  "main": "./index.js",
-  "module": "./index.js",
-  "types": "./index.d.ts",
+  "main": "./Gc.js",
+  "module": "./Gc.js",
+  "types": "./Gc.d.ts",
   "exports": {
     ".": {
-      "types": "./index.d.ts",
-      "node": "./index.js",
-      "import": "./index.js",
-      "default": "./index.js"
+      "types": "./Gc.d.ts",
+      "node": "./Gc.js",
+      "import": "./Gc.js",
+      "default": "./Gc.js"
+    },
+    "./register": {
+      "node": "./Register.mjs",
+      "default": "./Register.mjs"
+    },
+    "./test-helpers": {
+      "types": "./TestHelpers.d.ts",
+      "node": "./TestHelpers.js",
+      "import": "./TestHelpers.js",
+      "default": "./TestHelpers.js"
+    },
+    "./explain": {
+      "types": "./Explain.d.ts",
+      "node": "./Explain.js",
+      "import": "./Explain.js",
+      "default": "./Explain.js"
     }
   },
+  "bin": {
+    "lite-gc-gate": "./bin/LiteGcGate.mjs"
+  },
   "files": [
+    "Gc.js",
+    "Gc.d.ts",
     "index.js",
     "index.d.ts",
+    "Register.mjs",
+    "TestHelpers.js",
+    "TestHelpers.d.ts",
+    "Explain.js",
+    "Explain.d.ts",
+    "bin/LiteGcGate.mjs",
+    "templates/GcGate.mjs",
     "README.md",
     "CHANGELOG.md",
     "llms.txt",
@@ -25,7 +53,7 @@
   "sideEffects": false,
   "scripts": {
     "test": "node --expose-gc --test",
-    "bundle-check": "npx esbuild index.js --bundle --format=esm --outfile=test-bundle.js",
+    "bundle-check": "npx esbuild Gc.js --bundle --format=esm --outfile=test-bundle.js",
     "prepublishOnly": "npm run test && npm run bundle-check"
   },
   "keywords": [
@@ -38,6 +66,10 @@
     "performance",
     "perf_hooks",
     "regression",
+    "gate",
+    "ci",
+    "baseline",
+    "differential",
     "lite"
   ],
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",

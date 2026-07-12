@@ -1,81 +1,53 @@
-# @zakkster/lite-gc-profiler
+# @zakkster/lite-gc-profiler v1.1.0
 
-> Zero-dependency GC and heap profiler. It exists to make the "zero-GC" claim
-> falsifiable rather than asserted: it counts garbage-collection events, times the
-> pauses, and gates on them.
+Zero-dependency GC and heap profiler that makes the zero-GC claim
+falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
+in Chrome, frame-anomaly fallback elsewhere. Three-state gate verdicts
+(pass/fail/inconclusive), phases, nesting regions, differential and
+rep-aware gating, baselines with fingerprinting, CLI, node:test helper,
+explain mode via node:inspector heap sampling. Single-file browser
+surface; node-only subpaths for register/test-helpers/explain and the
+lite-gc-gate CLI.
 
-## Sources (auto-detected)
+## Entry points
 
-- node   -> 'gc'   : precise. perf_hooks 'gc' PerformanceEntries -- kind (minor /
-                     major / incremental / weakcb) and pause duration, straight from V8.
-- Chrome -> 'heap' : heuristic. performance.memory sampling -- allocation rate from
-                     positive deltas, collections inferred from heap drops.
-- others -> 'none' : no heap API; only the long-frame anomaly heuristic is available.
+- `@zakkster/lite-gc-profiler` (browser-safe, main): `GcProfiler`,
+  `checkNoGc`, `assertNoGc`, `compareGc`, `assertCompare`,
+  `aggregateGc`, `gateReps`, `assertReps`, `captureFingerprint`,
+  `createBaseline`, `checkAgainstBaseline`, `assertAgainstBaseline`,
+  `formatConsole`, `formatJson`, `formatMarkdown`,
+  `formatGithubAnnotations`, `GcBudgetError`, `GcInconclusiveError`,
+  `GC_DEFAULT_RULES`, `GC_DEFAULT_DIFFERENTIAL_RULES`,
+  `REP_POLICY_DEFAULTS`, `VERDICT_MATRIX`, `VERSION`,
+  `GC_MINOR`/`GC_MAJOR`/`GC_INCREMENTAL`/`GC_WEAKCB`.
+- `@zakkster/lite-gc-profiler/register` (node): auto-attach preload.
+- `@zakkster/lite-gc-profiler/test-helpers` (node): `withGcGate`,
+  `measureGc`.
+- `@zakkster/lite-gc-profiler/explain` (node): `startExplainSampling`,
+  `formatExplainConsole`.
+- `bin/lite-gc-gate` (CLI).
 
-`profiler.source` reports which one is live.
+## Key semantics
 
-## Why major GC is the signal
+- Three-state verdict never silently green on unverifiable rules.
+- Phases (linear, no nesting), regions (nested, LIFO enter/exit).
+- Attribution is firing-site, not allocator. Explain mode answers the
+  allocator question separately via node:inspector heap sampling.
+- Rep policy defaults: majors/minors -> all-clean, pauses/rates ->
+  best-clean. Override per rule.
+- Baseline regression semantic: current.median > baseline.max.
+- Fingerprint mismatch -> inconclusive (D6).
+- CLI exit codes: 0 pass, 1 fail, 2 inconclusive, 3 infrastructure error.
 
-Minor (Scavenge) collections happen from ambient young-generation allocation even in
-careful code. A major (Mark-Sweep-Compact) collection means the heap filled enough to
-need a full pass -- that is the pressure a zero-GC hot path must avoid. So the default
-gate is `{ maxMajor: 0 }`. Empirically, a pooled (zero-allocation) loop produces zero
-GC events; an equivalent loop that allocates per iteration produces majors and hundreds
-of ms of pause. This profiler is how you prove which one you wrote.
+## Zero-alloc guarantees
 
-## API
-
-new GcProfiler(capacity = 256, options?)
-  options: { heap = true, autoStart = false }
-  capacity: size of the pause-duration percentile window (rounded up to a power of two)
-
-  start() / stop()            attach / detach the perf_hooks GC observer (node)
-  record(kind, durationMs)    inject an event (tests, or a custom source)
-  sampleHeap(now?, usedBytes?)  sample the heap; Chrome auto-reads performance.memory,
-                              elsewhere pass e.g. process.memoryUsage().heapUsed. Zero-alloc.
-  markFrame(frameMs)          feed a frame time for the long-frame anomaly heuristic
-  summary(meta?)              snapshot (see shape below)
-  reset() / destroy()
-  getters: supported, source, running, gcCount, majorCount, minorCount
-
-Kind constants: GC_MINOR (1), GC_MAJOR (4), GC_INCREMENTAL (8), GC_WEAKCB (16).
-
-## Summary shape
-
-{
-  schema: 'lite-gc/1', source: 'gc'|'heap'|'none', supported,
-  gc:   { count, totalMs, maxMs, avgMs, p99Ms, minor, major, incremental, weakcb },
-  heap: { supported, used, peak, firstSample, samples, allocBytes,
-          allocRateBytesPerSec, gcDrops, freedBytes },
-  frames: { count, long }
-}
-
-## Gate
-
-checkNoGc(summary, rules?) -> { ok, violations, source }
-assertNoGc(summary, rules?) -> throws GcBudgetError, or returns the report
-
-rules (all optional; default { maxMajor: 0 }):
-  maxMajor, maxMinor, maxPauseMs, maxTotalMs, maxAllocRate (bytes/sec, heap path)
-
-## Node usage (precise)
-
-  import { GcProfiler, assertNoGc } from '@zakkster/lite-gc-profiler';
-  const gc = new GcProfiler().start();
-  runHotLoop();
-  await new Promise(r => setTimeout(r, 50));   // GC entries arrive asynchronously
-  assertNoGc(gc.summary());                    // throws if any major GC happened
-  gc.stop();
-
-GC entries are delivered between frames by the runtime; the per-frame methods
-(sampleHeap, markFrame) allocate nothing.
-
-## Install
-
-  npm i @zakkster/lite-gc-profiler
-
-No dependencies. No peer dependencies.
+Hot-path methods (`record`, `sampleHeap`, `markFrame`, `phase`, `enter`,
+`exit`) allocate nothing after the intern tables settle. Observer
+callback increments one integer per batch beyond delivering entries.
+Self-noise on old hardware: 0 majors, 2-4 minors, ~0.5 ms longest pause,
+250-770 KB heap growth per 500ms noop window (mostly V8, not the
+profiler).
 
 ## License
 
-MIT (c) Zahary Shinikchiev
+MIT. Copyright Zahary Shinikchiev.
