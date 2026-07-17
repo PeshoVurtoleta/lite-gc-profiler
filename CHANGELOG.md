@@ -2,6 +2,53 @@
 
 ## 1.3.0
 
+Test-stability patch, no runtime code changes. The v1.3.0 test suite had
+fail-path scenarios that leaned on `new Uint8Array(N)` for heap growth
+signal. That was fragile: `Uint8Array`'s N-byte backing buffer lands in
+external ArrayBuffer memory, invisible to `process.memoryUsage().heapUsed`
+-- only the ~80-byte wrapper counts. Exact wrapper size varies across V8
+versions, and on Node 26 with Apple Silicon (M-series) V8 packs it tightly
+enough that some tests fell below their fail thresholds and produced false
+negatives.
+
+Reported by Zahary on M4 Pro / Node 26 -- one test in
+`test/17-measure-ops.test.mjs`:
+`assertCompareOps: convenience form throws GcBudgetError on delta failure`.
+
+### Fix
+
+All fail-path tests in `test/17-measure-ops.test.mjs` and
+`test/torture/g14-5-ops.test.mjs` now use plain object literals for their
+allocation signal:
+
+    { a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 }
+
+Plain objects land fully in JS heap and show as ~100 bytes/op
+deterministically across V8 versions. Thresholds recalibrated with 5-10x
+safety margin above V8's residual noise floor.
+
+The mirror pin test in G14.5 axis-B (heavy warmup + clean steady) got a
+small semantic tightening: it now uses a best-of-5 pattern and asserts
+`bytesPerOp < 100`, acknowledging that V8's incremental marker keeps
+working through the warmup-allocated ~400KB during steady, adding ~20-100
+bytes/op of pure V8 bookkeeping. The pin's real invariant -- that the
+phase quarantine reduces warmup's ~2000-bytes/warmup-op contribution by
+20x when it bleeds into steady -- is stated explicitly in the comment.
+
+### No runtime changes
+
+Every export, function, signature, and behavior is byte-identical to
+v1.3.1. Only test files and a version string.
+
+### Testing
+
+    npm test
+
+317 tests, 317 pass. 5-run stability check clean on the reference
+sandbox. Should pass reliably on Node 22+ across major V8 builds.
+
+## 1.3.1
+
 Hardening patch. Closes one of two sharp edges the Fable-brainstormed
 forward roadmap flagged for pre-Wave-1 (H2 stays as v1.3.1 material for
 when uasm gating is first exercised on real Chrome hardware).

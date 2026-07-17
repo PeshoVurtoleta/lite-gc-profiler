@@ -149,17 +149,21 @@ test('checkOps: inconclusive when a rule can\'t be verified on this source', () 
 });
 
 test('checkOps: fail when maxBytesPerOp is clearly exceeded', () => {
-    // Force a hefty per-op allocation by pushing into a growing array kept alive
-    // in the outer closure. That guarantees a large heap delta on steady end.
+    // Use plain object allocation (not Uint8Array) so heap growth lands in
+    // process.memoryUsage().heapUsed rather than external ArrayBuffer memory.
+    // Uint8Array backing buffers are invisible to the sampling channel; only
+    // the wrapper (~80 bytes) counts, and its exact size varies across V8
+    // versions. Plain objects give ~100 bytes/op deterministically.
     const sink = [];
-    function heavyWorkload(i) { sink.push(new Uint8Array(1024)); }
+    function heavyWorkload(i) {
+        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
+    }
     const r = measureOps(heavyWorkload, { ops: 500, warmup: 10 });
-    // With 500 iterations * 1KB retained, delta is on the order of 500KB;
-    // per-op should be around 1024. A limit of 100 must fail.
-    const rep = checkOps(r, { maxBytesPerOp: 100 });
-    if (r.bytesPerOp === null || r.bytesPerOp < 100) {
-        // Edge case: if GC ran and freed everything mid-steady, we can't
-        // assert fail. That's a torture-scenario concern, not standard.
+    // ~50 KB heap growth over 500 ops = ~100 bytes/op. A limit of 20 must fail.
+    const rep = checkOps(r, { maxBytesPerOp: 20 });
+    if (r.bytesPerOp === null || r.bytesPerOp < 20) {
+        // Edge case: if a scavenge happened between the paired boundary
+        // samples and cancellation over-corrected. Skip rather than flake.
         return;
     }
     assert.equal(rep.verdict, 'fail');
@@ -192,9 +196,11 @@ test('assertOps: passes through when allowInconclusive is set', () => {
 
 test('assertOps: throws GcBudgetError on fail', () => {
     const sink = [];
-    function heavy(i) { sink.push(new Uint8Array(2048)); }
+    function heavy(i) {
+        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
+    }
     assert.throws(
-        () => assertOps(heavy, { maxBytesPerOp: 10 }, { ops: 500 }),
+        () => assertOps(heavy, { maxBytesPerOp: 5 }, { ops: 500 }),
         GcBudgetError
     );
 });
@@ -218,14 +224,16 @@ test('compareOps: convenience form (two functions)', () => {
 });
 
 test('compareOps: candidate leaks vs clean control -> fail', () => {
-    const sinkC = [];
     const sinkK = [];
-    function control(i)   { sinkC.length = 0; return i | 0; }             // no retention
-    function candidate(i) { sinkK.push(new Uint8Array(1024)); return i; } // retention
+    function control(i)   { return i | 0; }                                    // no allocation
+    function candidate(i) {
+        sinkK.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
+        return i;
+    }
     const ctlR = measureOps(control,   { ops: 500, warmup: 50 });
     const canR = measureOps(candidate, { ops: 500, warmup: 50 });
-    const rep = compareOps(ctlR, canR, { maxExtraBytesPerOp: 100 });
-    if (canR.bytesPerOp === null || (ctlR.bytesPerOp !== null && canR.bytesPerOp - ctlR.bytesPerOp < 100)) {
+    const rep = compareOps(ctlR, canR, { maxExtraBytesPerOp: 20 });
+    if (canR.bytesPerOp === null || (ctlR.bytesPerOp !== null && canR.bytesPerOp - ctlR.bytesPerOp < 20)) {
         return; // GC intervention edge case
     }
     assert.equal(rep.verdict, 'fail');
@@ -246,11 +254,20 @@ test('compareOps: throws on non-result inputs (primitive form)', () => {
 });
 
 test('assertCompareOps: convenience form throws GcBudgetError on delta failure', () => {
+    // Uint8Array's 2048-byte backing buffer lands in external ArrayBuffer
+    // memory, not JS heap; process.memoryUsage().heapUsed only sees the
+    // ~80-byte wrapper. On some V8 versions (notably Node 26 on Apple
+    // Silicon) the wrapper is packed tightly enough that per-op growth
+    // falls below the maxExtraBytesPerOp threshold. Use plain object
+    // allocation, which lands in heapUsed deterministically at ~100 bytes/op.
     const sink = [];
     function control(i) { return i | 0; }
-    function candidate(i) { sink.push(new Uint8Array(2048)); return i; }
+    function candidate(i) {
+        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
+        return i;
+    }
     assert.throws(
-        () => assertCompareOps(control, candidate, { maxExtraBytesPerOp: 50 }, { ops: 300, warmup: 30 }),
+        () => assertCompareOps(control, candidate, { maxExtraBytesPerOp: 20 }, { ops: 500, warmup: 50 }),
         GcBudgetError
     );
 });
@@ -265,34 +282,31 @@ test('assertCompareOps: returns report on pass', () => {
 // -----------------------------------------------------------------------------
 
 test('measureOps: warmup allocations do not inflate steady bytesPerOp', () => {
-    let phase = 'warmup';
-    const warmupSink = [];
-    const steadySink = [];
-    function fn(i) {
-        if (phase === 'warmup') warmupSink.push(new Uint8Array(4096));
-        // in steady, do nothing
-    }
     // Toggle to steady after warmup completes; measureOps calls fn(i) once
-    // per iteration, so we can peek at the iteration index via the callback
-    // and switch based on it -- but we can't easily know when warmup ended
-    // from inside fn. Instead: rely on measureOps's phase boundary and
-    // pre-fill the warmupSink OURSELVES before calling steady work.
-    // Alternate strategy: use closures to track calls.
+    // per iteration, so we can peek at the iteration index via a closure
+    // and switch based on call count. Alternate strategy: use closures to
+    // track calls; measureOps doesn't tell us which phase we're in from
+    // inside fn.
+    const warmupSink = [];
     let callCount = 0;
     const warmupCount = 100, opsCount = 500;
     function fn2(i) {
         callCount++;
         if (callCount <= warmupCount) {
-            warmupSink.push(new Uint8Array(4096));         // heavy warmup
+            // heavy warmup allocation -- plain objects, ~200 bytes each,
+            // land in JS heap (visible to process.memoryUsage().heapUsed)
+            warmupSink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1,
+                             f: i - 1, g: 'x', h: i, k: i, l: i });
         }
         // steady iterations are noops
     }
     const r = measureOps(fn2, { ops: opsCount, warmup: warmupCount });
     // The KEY assertion: steady bytesPerOp is small because steady iterations
     // did nothing. The warmup allocations are quarantined by the phase()
-    // boundary that measureOps places.
+    // boundary that measureOps places. A large object literal at warmup is
+    // ~200 bytes; steady should be well under that.
     if (r.bytesPerOp !== null) {
-        assert.ok(r.bytesPerOp < 4096,
-            'steady bytesPerOp (' + r.bytesPerOp + ') must be much smaller than warmup alloc size 4096');
+        assert.ok(r.bytesPerOp < 200,
+            'steady bytesPerOp (' + r.bytesPerOp + ') must be much smaller than the warmup per-op alloc size');
     }
 });
