@@ -273,7 +273,14 @@ test('assertCompareOps: convenience form throws GcBudgetError on delta failure',
 });
 
 test('assertCompareOps: returns report on pass', () => {
-    const rep = assertCompareOps(noopWorkload, noopWorkload, { maxExtraBytesPerOp: 1024 }, { ops: 200 });
+    // Two identical noop workloads must net to ~0 extra bytes. Over only 200
+    // ops with no warmup, the raw two-point heap delta is pure cold-start
+    // noise (a stray allocation between the candidate's start/end samples can
+    // read multiple KB/op on a fast machine). stabilize:true GC-anchors both
+    // boundaries so the comparison is deterministic. Requires --expose-gc,
+    // which the test script sets.
+    const rep = assertCompareOps(noopWorkload, noopWorkload,
+        { maxExtraBytesPerOp: 1024 }, { ops: 200, stabilize: true });
     assert.equal(rep.verdict, 'pass');
 });
 

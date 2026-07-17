@@ -130,30 +130,36 @@ test('[axis B pin #1] warmup allocation is quarantined out of steady bytesPerFra
 });
 
 test('[axis B pin #2] a real steady leak reads clearly above the clean floor', async () => {
-    // Mirror pin: a workload that allocates during STEADY (not warmup) must
-    // produce a bytesPerFrame clearly separated from the clean floor -- in a
-    // SINGLE stabilized run, with no best-of-attempts crutch. Stabilize anchors
-    // both boundaries with a forced GC, so the retained ~1.7 KB/frame shows
-    // through as a true rate rather than being lost under scheduler churn or
-    // collapsed to zero by a mid-run collection.
+    // A workload that retains a large allocation each STEADY frame must read a
+    // bytesPerFrame far above THIS machine's clean floor -- in a SINGLE
+    // stabilized run, no best-of-attempts. The assertion is RELATIVE to the
+    // measured floor: retained-object byte sizes vary by V8 build/arch (a plain
+    // object is ~1.7 KB on one engine and ~340 B on another, tagged-pointer
+    // slots depend on pointer compression), so an absolute threshold is not
+    // portable. The leak retains a 1024-slot array per frame -- heap-visible
+    // and always many times the floor on any build.
     const warmupFrames = 60, steadyFrames = 300;
+
+    const clean = await measureFrames((i) => i | 0, {
+        frames: steadyFrames, warmup: warmupFrames, scheduler: fastSched
+    });
+
     const steadySink = [];
     let callCount = 0;
     function leakyFn(i) {
         callCount++;
-        if (callCount > warmupFrames) {
-            const o = {};
-            for (let k = 0; k < 30; k++) o['k' + k] = i * k;   // ~1.7 KB retained/frame
-            steadySink.push(o);
-        }
+        if (callCount > warmupFrames) steadySink.push(new Array(1024).fill(i));
     }
-    const r = await measureFrames(leakyFn, {
+    const leak = await measureFrames(leakyFn, {
         frames: steadyFrames, warmup: warmupFrames, scheduler: fastSched
     });
-    assert.equal(r.bytesPerFrameStable, true);
-    assert.ok(r.bytesPerFrame > 800,
-        'PIN: a ~1.7 KB/frame steady leak must read well above the clean floor in a single '
-        + 'stabilized run; got ' + r.bytesPerFrame);
+
+    assert.equal(clean.bytesPerFrameStable, true);
+    assert.equal(leak.bytesPerFrameStable, true);
+    const floor = Math.max(clean.bytesPerFrame, 128);
+    assert.ok(leak.bytesPerFrame > 4 * floor,
+        'PIN: a per-frame array leak must read many times the clean floor ('
+        + clean.bytesPerFrame + '); got ' + leak.bytesPerFrame);
 });
 
 // =============================================================================
@@ -189,7 +195,7 @@ test('[axis D] cold-run and warm-run produce the same verdict on maxBytesPerFram
     // specific byte count.
     const cleanFn = (i) => i | 0;
     const sink = [];
-    const leakyFn = (i) => { const o = {}; for (let k = 0; k < 30; k++) o['k' + k] = i * k; sink.push(o); };
+    const leakyFn = (i) => { sink.push(new Array(1024).fill(i)); };   // heap-visible, >> the 512 gate on any build
     const opts = { frames: 300, warmup: 60, scheduler: fastSched };
     const RULE = { maxBytesPerFrame: 512 };
 
