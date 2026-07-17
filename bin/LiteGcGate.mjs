@@ -93,10 +93,15 @@ function runOnce(scriptPath, tmpDir, repIdx) {
         env: Object.assign({}, process.env, { LITE_GC_GATE_REPORT_PATH: reportPath }),
         stdio: ['ignore', 'inherit', 'inherit']
     });
-    if (res.status !== 0) {
-        return { error: 'target exited with status ' + res.status };
-    }
+    // v1.3.0 (G16.5): don't treat non-zero exit as fatal if a report exists.
+    // If the target called process.exit(N), the sync exit handler in register
+    // may have written a partial report; we prefer to gate on that partial
+    // (with an inconclusive verdict) rather than surfacing an infrastructure
+    // error the operator can't distinguish from a truly broken harness.
     if (!existsSync(reportPath)) {
+        if (res.status !== 0) {
+            return { error: 'target exited with status ' + res.status + ' and did not write a report' };
+        }
         return { error: 'target did not write report (did it call process.exit()?)' };
     }
     let summary;
@@ -104,6 +109,18 @@ function runOnce(scriptPath, tmpDir, repIdx) {
         summary = JSON.parse(readFileSync(reportPath, 'utf8'));
     } catch (e) {
         return { error: 'could not parse report: ' + e.message };
+    }
+    // Partial report path: hard exit intercepted by register's exit hook.
+    // Downgrade to inconclusive; downstream will emit exit code 2.
+    if (summary && summary.schema === 'lite-gc-partial/1') {
+        return {
+            summary: summary.partialSummary,
+            partial: {
+                reason: summary.reason,
+                exitCode: summary.exitCode,
+                capturedAt: summary.capturedAt
+            }
+        };
     }
     return { summary };
 }
@@ -143,6 +160,8 @@ function main() {
     // Set up temp dir for report files
     const tmpDir = mkdtempSync(join(tmpdir(), 'lite-gc-gate-'));
     const summaries = [];
+    let anyPartial = false;                                 // G16.5: any rep hit process.exit
+    const partialInfo = [];
     try {
         for (let i = 0; i < args.reps; i++) {
             const r = runOnce(scriptPath, tmpDir, i);
@@ -151,6 +170,10 @@ function main() {
                 process.exit(3);
             }
             summaries.push(r.summary);
+            if (r.partial) {
+                anyPartial = true;
+                partialInfo.push({ rep: i, reason: r.partial.reason, exitCode: r.partial.exitCode });
+            }
         }
     } finally {
         // Cleanup temp files
@@ -185,6 +208,20 @@ function main() {
         report = gateReps(summaries, rules, options);
     } else {
         report = checkNoGc(summaries[0], rules);
+    }
+
+    // G16.5: if any rep hit process.exit before beforeExit could settle, force
+    // the final verdict to inconclusive. A hard exit means the measurement
+    // window was truncated -- pass/fail on truncated data would be misleading.
+    // Downgrading here (rather than exit-code-3'ing back in runOnce) lets the
+    // operator SEE the partial-report data and diagnose, and CI still gets a
+    // distinguishable exit code (2, not 3).
+    if (anyPartial) {
+        report = Object.assign({}, report, {
+            verdict: 'inconclusive',
+            reason: 'partial_report',
+            partial: partialInfo
+        });
     }
 
     emit(report, args);

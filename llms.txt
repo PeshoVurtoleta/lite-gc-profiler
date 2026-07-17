@@ -1,20 +1,25 @@
-# @zakkster/lite-gc-profiler v1.2.0
+# @zakkster/lite-gc-profiler v1.3.1
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
 in Chrome, accurate opt-in measureUserAgentSpecificMemory (`uasm`)
 also in Chrome under cross-origin isolation, frame-anomaly fallback
 elsewhere. Three-state gate verdicts (pass/fail/inconclusive), phases,
-nesting regions, differential and rep-aware gating, baselines with
-fingerprinting, CLI, node:test helper, explain mode via node:inspector
-heap sampling. Single-file browser surface; node-only subpaths for
-register/test-helpers/explain and the lite-gc-gate CLI.
+nesting regions, differential and rep-aware gating, per-op primitives
+(measureOps/assertOps/compareOps) for hot-path gating, baselines with
+fingerprinting, CLI with partial-report handling for hard exits,
+node:test helper, explain mode via node:inspector heap sampling.
+Single-file browser surface; node-only subpaths for register/
+test-helpers/explain and the lite-gc-gate CLI.
 
 ## Entry points
 
 - `@zakkster/lite-gc-profiler` (browser-safe, main): `GcProfiler`,
   `checkNoGc`, `assertNoGc`, `compareGc`, `assertCompare`,
-  `aggregateGc`, `gateReps`, `assertReps`, `captureFingerprint`,
+  `aggregateGc`, `gateReps`, `assertReps`,
+  `measureOps`, `checkOps`, `assertOps`,
+  `compareOps`, `assertCompareOps`,
+  `captureFingerprint`,
   `createBaseline`, `checkAgainstBaseline`, `assertAgainstBaseline`,
   `formatConsole`, `formatJson`, `formatMarkdown`,
   `formatGithubAnnotations`, `GcBudgetError`, `GcInconclusiveError`,

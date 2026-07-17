@@ -1,5 +1,18 @@
 # @zakkster/lite-gc-profiler
 
+[![npm version](https://img.shields.io/npm/v/@zakkster/lite-gc-profiler.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+![Zero-GC](https://img.shields.io/badge/Zero--GC-Hot%20path-00C853?style=for-the-badge&logo=leaf&logoColor=white)
+[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-gc-profiler?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-gc-profiler)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
+[![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
+[![types](https://img.shields.io/badge/types-included-3178c6)](./index.d.ts)
+
+
 Zero-dependency GC and heap profiler. It exists to make the **zero-GC claim
 falsifiable** rather than asserted.
 
@@ -425,6 +438,96 @@ assertReps(reps, { maxMajor: 0, maxPauseMs: 4 }, {
 
 **Mixed sources across reps -> inconclusive** with `reason: 'mixed_sources'`.
 
+## Per-op measurement: hot-path primitives
+
+`measureOps`, `assertOps`, and `compareOps` are the shape you want when the
+thing being gated is a *single operation* -- a signal notification, a keyed-
+selector call, a hot-loop tick -- not a whole test file. Same verdict
+discipline as the whole-window gate; per-op scale.
+
+```js
+import { measureOps, assertOps, compareOps } from '@zakkster/lite-gc-profiler';
+
+// Measure: how many bytes per notify?
+const result = measureOps((i) => signal.set(i), { ops: 10_000, warmup: 500 });
+// result.bytesPerOp, result.opsPerSec, result.summary (full profiler summary)
+```
+
+`fn(i)` gets the iteration index. Sync only in v1.3.0 -- async per-op
+accounting is ambiguous because microtasks interleave allocations across
+iterations. Internal `phase()` boundaries quarantine warmup allocations
+from steady-phase gating; `bytesPerOp` is derived from the steady heap
+delta alone.
+
+### Gating a per-op limit
+
+```js
+// Throws GcBudgetError if steady-phase bytes-per-notify exceeds 0.
+assertOps(
+  (i) => signal.set(i),
+  { maxBytesPerOp: 0 },
+  { ops: 10_000, warmup: 500 }
+);
+```
+
+Four rule names:
+
+- `maxBytesPerOp` -- heap growth divided by ops
+- `maxMajorsPerKOp` -- major collections per 1000 ops
+- `maxMinorsPerKOp` -- minor collections per 1000 ops
+- `maxPauseMsPerOp` -- total pause milliseconds per op
+
+Verifiability follows the same matrix as whole-window rules -- the memory
+rules need a memory channel (`needsHeap`/`needsUasm`); the event-kind rules
+need `source: 'gc'` (node). All four appear in the exported `VERDICT_MATRIX`
+with all four source columns.
+
+Throughput is intentionally reported in the result but not gated. Benchmark
+harnesses have opinions on `opsPerSec`; this package stays in the "prove
+zero-GC per op" lane. If you want to fail CI on throughput regressions,
+use `compareOps` with `maxExtra*PerOp` limits below.
+
+### Noise floor: choosing `ops` for `maxBytesPerOp: 0`
+
+`bytesPerOp` on node has a small residual noise floor from V8's own
+loop-bookkeeping (feedback vectors, tier-up allocations, incremental
+marking) -- roughly 500-1200 bytes per loop regardless of `ops`. The
+per-op floor scales as `noise / ops`:
+
+| `ops` | Approx floor  | Suggested `maxBytesPerOp` |
+| ---   | ---           | ---                       |
+| 10K+  | < 0.15 B/op   | `0` (reliable)            |
+| 1K+   | < 1.5 B/op    | `2` (recommended)         |
+| <500  | > 3 B/op      | not recommended for `0`   |
+
+The v1.3.0 hardening cancels the sampling infrastructure's own
+`process.memoryUsage()` allocation via paired-call cancellation, but V8's
+residual bookkeeping is orthogonal and can't be eliminated in userland.
+Prefer `ops >= 10_000` for strict zero-alloc claims.
+
+### Comparing two implementations
+
+```js
+// Primitive form: two results, one report.
+const control   = measureOps(oldImpl, { ops: 10_000, warmup: 500 });
+const candidate = measureOps(newImpl, { ops: 10_000, warmup: 500 });
+const report = compareOps(control, candidate, { maxExtraBytesPerOp: 0 });
+// verdict: 'pass' | 'fail' | 'inconclusive'
+```
+
+Convenience form runs `measureOps` twice for you with matched opts:
+
+```js
+compareOps(oldImpl, newImpl, { maxExtraBytesPerOp: 0 }, { ops: 10_000, warmup: 500 });
+```
+
+Source mismatch between control and candidate yields `inconclusive` with
+`reason: 'source_mismatch'` -- comparing node measurements against Chrome
+measurements is never meaningful, and the gate says so instead of pretending.
+
+`assertCompareOps` throws in the same way as `assertOps` -- one call for
+CI, no result-handling boilerplate.
+
 ## Baseline lock: guarding against silent regressions
 
 CI ergonomics: capture a known-good aggregate once, commit it as JSON, gate
@@ -517,10 +620,14 @@ lite-gc-gate run bench/hot.mjs --reps 20 --baseline gc-baseline.json --update-ba
 lite-gc-gate run bench/hot.mjs --reps 20 --baseline gc-baseline.json --format github
 ```
 
-**Limitation.** If the target script calls `process.exit()` explicitly, the
-preload's `beforeExit` hook is skipped and no report is written. The CLI
-reports "target did not write report" and exits 3. Refactor targets to
-return from top-level rather than exiting eagerly.
+**`process.exit()` handling (v1.3.0+).** If the target script calls
+`process.exit()` before `beforeExit` can settle, the register preload's
+sync exit handler writes a *partial* report (`schema: 'lite-gc-partial/1'`).
+The CLI reads it, downgrades verdict to `inconclusive` with
+`reason: 'partial_report'`, and emits exit code `2` (inconclusive) rather
+than `3` (infrastructure error). CI can distinguish "target hard-exited,
+measurement is truncated" from "harness genuinely broken." Reports carry
+a `partial` field with per-rep exit codes for debugging.
 
 ## Test integration: node:test
 

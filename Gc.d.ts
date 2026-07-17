@@ -1,4 +1,4 @@
-export const VERSION: '1.2.0';
+export const VERSION: '1.3.1';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -559,3 +559,145 @@ export function formatMarkdown(report: GcReport): string;
 
 /** GitHub Actions workflow annotations (::error::/::warning::/::notice::). */
 export function formatGithubAnnotations(report: GcReport): string;
+
+// ---- per-op primitives (Batch 6, G14/G15/G16) ----
+
+/**
+ * Function signature accepted by measureOps and its convenience forms.
+ * `i` is the iteration index (0-based). Return value is ignored.
+ */
+export type MeasureOpsFn = (i: number) => unknown;
+
+/**
+ * Rule set for per-op gating.
+ *   maxBytesPerOp     -- max bytes allocated per iteration (heap delta / ops)
+ *   maxMajorsPerKOp   -- max major GCs per 1000 ops
+ *   maxMinorsPerKOp   -- max minor GCs per 1000 ops
+ *   maxPauseMsPerOp   -- max total pause milliseconds per op (totalMs / ops)
+ * All optional; only rules present are checked.
+ */
+export interface OpsRules {
+    maxBytesPerOp?: number;
+    maxMajorsPerKOp?: number;
+    maxMinorsPerKOp?: number;
+    maxPauseMsPerOp?: number;
+}
+
+/**
+ * Delta rules for compareOps -- how much the candidate is allowed to exceed
+ * the control on each per-op metric.
+ */
+export interface CompareOpsRules {
+    maxExtraBytesPerOp?: number;
+    maxExtraMajorsPerKOp?: number;
+    maxExtraMinorsPerKOp?: number;
+    maxExtraPauseMsPerOp?: number;
+}
+
+/**
+ * Options for measureOps and its convenience forms (assertOps, compareOps).
+ * assertOps/compareOps additionally accept `allowInconclusive`.
+ */
+export interface MeasureOpsOptions {
+    /** Steady-phase iteration count. Required, must be a positive integer. */
+    ops: number;
+    /** Warmup iteration count. Default 0. Excluded from bytesPerOp/opsPerSec. */
+    warmup?: number;
+    /** GcProfiler source override. Default 'auto'. */
+    source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
+    /** GcProfiler pause-ring capacity. Default 256. */
+    capacity?: number;
+    /** For assert*Ops only: skip throw on inconclusive. */
+    allowInconclusive?: boolean;
+}
+
+/**
+ * A measureOps result. `bytesPerOp` is null when the source cannot provide a
+ * memory signal (source='none'); otherwise it's the steady-phase heap delta
+ * divided by ops.
+ */
+export interface MeasureOpsResult {
+    schema: 'lite-gc-ops/1';
+    ops: number;
+    warmupOps: number;
+    elapsedMs: number;
+    opsPerSec: number;
+    bytesPerOp: number | null;
+    source: GcSource;
+    summary: GcSummary;
+}
+
+/** Per-op gate report; use assertOps to throw instead. */
+export interface OpsGateResult {
+    kind: 'ops';
+    verdict: 'pass' | 'fail' | 'inconclusive';
+    checked: Partial<Record<keyof OpsRules, boolean>>;
+    violations: Array<{ metric: string; limit: number; actual: number; reason: string }>;
+    ok: boolean;
+    ops: number;
+    opsPerSec: number;
+    bytesPerOp: number | null;
+    source: GcSource;
+    summary: GcSummary;
+}
+
+/** compareOps report shape. */
+export interface CompareOpsResult {
+    kind: 'compareOps';
+    verdict: 'pass' | 'fail' | 'inconclusive';
+    reason?: 'source_mismatch';
+    checked: Partial<Record<keyof CompareOpsRules, boolean>>;
+    violations: Array<{ metric: string; limit: number; actual: number; reason: string }>;
+    ok: boolean;
+    control: MeasureOpsResult;
+    candidate: MeasureOpsResult;
+}
+
+/**
+ * Run `fn(i)` `opts.ops` times with an optional `opts.warmup` prelude and
+ * return per-op measurements plus the underlying summary. Sync-only in
+ * v1.3.0; async functions have ambiguous per-op accounting.
+ */
+export function measureOps(fn: MeasureOpsFn, opts: MeasureOpsOptions): MeasureOpsResult;
+
+/**
+ * Gate a measureOps result against per-op rules. Returns the report; use
+ * assertOps to throw on non-pass verdicts.
+ */
+export function checkOps(result: MeasureOpsResult, rules?: OpsRules): OpsGateResult;
+
+/**
+ * Measure and gate in one call. Throws GcBudgetError on fail,
+ * GcInconclusiveError on inconclusive (unless opts.allowInconclusive).
+ */
+export function assertOps(fn: MeasureOpsFn, rules: OpsRules, opts: MeasureOpsOptions): OpsGateResult;
+
+/**
+ * Compare two measureOps results. Convenience form accepts two functions
+ * with matched `opts` -- runs measureOps internally. Source mismatch between
+ * control and candidate yields inconclusive with reason 'source_mismatch'.
+ */
+export function compareOps(
+    control: MeasureOpsResult,
+    candidate: MeasureOpsResult,
+    rules?: CompareOpsRules
+): CompareOpsResult;
+export function compareOps(
+    controlFn: MeasureOpsFn,
+    candidateFn: MeasureOpsFn,
+    rules: CompareOpsRules,
+    opts: MeasureOpsOptions
+): CompareOpsResult;
+
+/** Assert form of compareOps. Same throw semantics as assertOps. */
+export function assertCompareOps(
+    control: MeasureOpsResult,
+    candidate: MeasureOpsResult,
+    rules?: CompareOpsRules
+): CompareOpsResult;
+export function assertCompareOps(
+    controlFn: MeasureOpsFn,
+    candidateFn: MeasureOpsFn,
+    rules: CompareOpsRules,
+    opts: MeasureOpsOptions
+): CompareOpsResult;

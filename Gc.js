@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.1';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -728,7 +728,14 @@ const VERDICT_MATRIX = {
     maxMinor:     { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxPauseMs:   { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxTotalMs:   { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
-    maxAllocRate: { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' }
+    maxAllocRate: { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' },
+    // Per-op rules added in v1.3.0 (Batch 6, G14/G15). Verifiability mirrors
+    // the whole-window rules: bytes-per-op needs a memory channel, event-kind
+    // rates need 'gc' source. Semantics documented in assertOps().
+    maxBytesPerOp:    { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' },
+    maxMajorsPerKOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxMinorsPerKOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxPauseMsPerOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' }
 };
 
 function isCheckable(rule, source, summary) {
@@ -1703,6 +1710,417 @@ function formatGithubAnnotations(report) {
     return lines.join('\n');
 }
 
+// =============================================================================
+// PER-OP PRIMITIVES (Batch 6, G14/G15/G16)
+// =============================================================================
+// measureOps: run a sync function N times with an optional warmup phase, then
+// return a normalized result carrying opsPerSec, bytesPerOp, and the internal
+// profiler's steady-phase gc/heap/uasm stats.
+//
+// Design notes (D7-D10):
+// - Sync-only. Async functions have ambiguous per-op accounting because
+//   microtasks interleave allocations across iterations; a queued job may
+//   allocate against iteration N while iteration N+1 has already started.
+//   If real async demand appears, that's a separate design in v1.4+.
+// - fn(i) signature. Matches alien-signals, js-reactivity-benchmark, and the
+//   internal @zakkster/lite-* bench harnesses. No context object, no options
+//   bag -- callers close over what they need.
+// - Uses existing phase() machinery (G2) with two named phases: 'warmup' and
+//   'steady'. Warmup allocations are visible in the summary but explicitly
+//   quarantined from steady-phase gating. Bytes-per-op is derived from the
+//   steady phase alone.
+// - bytesPerOp comes from HEAP growth in the steady phase. Heap is always
+//   available in Chrome (source='heap' or 'uasm' opt-in) and available in
+//   node via explicit sampleHeap(now, process.memoryUsage().heapUsed) --
+//   which measureOps performs at phase boundaries. On source='none'
+//   (Firefox/Safari without perf.memory) bytesPerOp is null.
+// - On source='uasm', the sync-only constraint means we cannot await
+//   sampleUasm() at phase boundaries; heap sampling is used for bytesPerOp
+//   regardless of primary source. The uasm channel is still reflected in
+//   the summary if the user pre-sampled outside; measureOps itself does not
+//   sample it.
+
+const OPS_SCHEMA = 'lite-gc-ops/1';
+
+/**
+ * Run `fn(i)` `opts.ops` times (preceded by `opts.warmup` iterations) and
+ * return per-op measurements plus the underlying summary. Sync-only in
+ * v1.3.0; async functions have ambiguous per-op accounting.
+ *
+ * @param {(i: number) => any} fn        Sync function to measure. Return value ignored.
+ * @param {object} opts
+ * @param {number} opts.ops              Steady-phase iteration count. Required, must be > 0.
+ * @param {number} [opts.warmup=0]       Warmup iteration count. Runs before steady; excluded from bytesPerOp/opsPerSec.
+ * @param {'auto'|'gc'|'heap'|'uasm'|'none'} [opts.source='auto']
+ *                                       Passed to the internal GcProfiler.
+ * @param {number} [opts.capacity=256]   GcProfiler pause-ring capacity.
+ * @returns {{
+ *   schema: 'lite-gc-ops/1',
+ *   ops: number, warmupOps: number,
+ *   elapsedMs: number, opsPerSec: number,
+ *   bytesPerOp: number | null,
+ *   source: GcSource,
+ *   summary: GcSummary
+ * }}
+ *
+ * ## Noise floor guidance
+ *
+ * On node, `bytesPerOp` has a small residual noise floor from V8's own
+ * loop-bookkeeping (feedback vectors, tier-up allocations, incremental
+ * marking activity). This is ORTHOGONAL to the sampling infrastructure --
+ * v1.3.1's paired-call cancellation eliminates the `process.memoryUsage()`
+ * self-cost, but V8's residual is not something a userland API can remove.
+ *
+ * Empirical shape: ~500-1200 bytes of residual per loop, regardless of ops
+ * count. So per-op, the floor scales as `noise / ops`:
+ *
+ * - `ops >= 10_000` -> floor < 0.15 bytes/op; strict `maxBytesPerOp: 0` gates
+ *   reliable.
+ * - `ops >= 1_000`  -> floor < 1.5 bytes/op; `maxBytesPerOp: 2` recommended.
+ * - `ops < 500`     -> floor > 3 bytes/op; not recommended for strict gates.
+ *
+ * For per-op zero-alloc claims, prefer `ops >= 10_000`.
+ */
+function measureOps(fn, opts) {
+    if (typeof fn !== 'function') throw new TypeError('measureOps: fn must be a function');
+    if (!opts || typeof opts !== 'object') throw new TypeError('measureOps: opts is required');
+    const ops = opts.ops;
+    const warmup = opts.warmup === undefined ? 0 : opts.warmup;
+    if (!Number.isFinite(ops) || ops <= 0 || (ops | 0) !== ops) {
+        throw new RangeError('measureOps: opts.ops must be a positive integer');
+    }
+    if (!Number.isFinite(warmup) || warmup < 0 || (warmup | 0) !== warmup) {
+        throw new RangeError('measureOps: opts.warmup must be a non-negative integer');
+    }
+
+    const gc = new GcProfiler(opts.capacity || 256, { source: opts.source || 'auto' });
+    gc.start();
+
+    // Read node's process.memoryUsage() when we're on the gc source (node),
+    // since perf.memory doesn't exist there. In Chrome (heap/uasm/none) the
+    // sampleHeap() call reads perf.memory directly if we don't pass a bytes
+    // arg. This closure isolates the difference so the phase loop stays clean.
+    // When the profiler's source is 'none' we explicitly skip sampling so
+    // bytesPerOp ends up null -- respecting the caller's intent to simulate
+    // a memory-unaware environment even when a memory API is technically
+    // available on this runtime.
+    //
+    // Self-noise cancellation (v1.3.1 hardening, D-item pre-1.4): on node,
+    // process.memoryUsage() allocates ~200 bytes per call (a small object
+    // with six numeric fields). Naively bracketing the steady phase with
+    // one call at each boundary folds the end-call's allocation into the
+    // delta and inflates bytesPerOp by ~200/ops -- enough to fail a strict
+    // maxBytesPerOp:0 gate on a legitimately clean workload. Fix: take a
+    // second memoryUsage() call immediately after the first at each boundary.
+    // Consecutive calls allocate the same shape of small object, so their
+    // delta estimates the per-call self-cost. Subtracting gives the
+    // pre-sampling heap value.
+    //
+    // Chrome/browser: performance.memory.usedJSHeapSize is a property read
+    // on a singleton, not a method call. Zero-alloc, no cancellation needed.
+    const source = gc.source;
+    const isNode = typeof process !== 'undefined' && process.memoryUsage;
+    const canSampleMemory = source !== 'none';
+    // Returns { t, used } for a phase boundary. On sources without memory
+    // sampling, used is -1. On node, applies paired-call self-noise
+    // cancellation with a safety clamp: if the second-call delta lands
+    // outside a plausible range for a small-object allocation (0..8192
+    // bytes), a scavenge or unrelated activity fired between the two
+    // calls and the estimate is unreliable -- fall back to the raw value
+    // rather than over-correcting.
+    const SELF_NOISE_MAX = 8192;
+    function sampleBoundary() {
+        const t = typeof performance !== 'undefined' ? performance.now() : 0;
+        if (!canSampleMemory) return { t, used: -1 };
+        if (isNode) {
+            const raw = process.memoryUsage().heapUsed;
+            gc.sampleHeap(t, raw);
+            const raw2 = process.memoryUsage().heapUsed;
+            const noiseEstimate = raw2 - raw;
+            const used = (noiseEstimate > 0 && noiseEstimate < SELF_NOISE_MAX)
+                ? raw - noiseEstimate
+                : raw;
+            return { t, used };
+        }
+        gc.sampleHeap(t);
+        return { t, used: _readHeapUsedFor(gc) };
+    }
+
+    // WARMUP phase. Always mark the phase boundary (even when warmup=0) so
+    // the summary.phases shape is stable and downstream consumers can rely on
+    // both keys being present.
+    gc.phase('warmup');
+    sampleBoundary();                                    // warmup boundary; used value not needed
+    for (let i = 0; i < warmup; i++) fn(i);
+
+    // STEADY phase -- what gets gated.
+    gc.phase('steady');
+    const startBoundary = sampleBoundary();
+    const steadyStartT = startBoundary.t;
+    const steadyStartUsed = startBoundary.used;
+    for (let i = 0; i < ops; i++) fn(i);
+    const endBoundary = sampleBoundary();
+    const steadyEndT = endBoundary.t;
+    const steadyEndUsed = endBoundary.used;
+
+    gc.stop();
+    const summary = gc.summary();
+
+    const elapsedMs = steadyEndT - steadyStartT;
+    const opsPerSec = elapsedMs > 0 ? (ops * 1000) / elapsedMs : 0;
+
+    // bytesPerOp: derive from raw heap deltas across the steady phase. Using
+    // the delta (not summary.heap.allocBytes which is cumulative across the
+    // whole window) keeps warmup allocation out of the per-op number even
+    // when the profiler's window-wide accumulators reflect both phases.
+    let bytesPerOp = null;
+    if (steadyStartUsed >= 0 && steadyEndUsed >= 0 && ops > 0) {
+        const delta = steadyEndUsed - steadyStartUsed;
+        // Negative deltas mean GC ran during steady and freed more than we
+        // allocated on this window. That's honest for bytesPerOp -- report 0
+        // rather than a negative number that would break threshold math.
+        bytesPerOp = delta > 0 ? delta / ops : 0;
+    }
+
+    return {
+        schema: OPS_SCHEMA,
+        ops, warmupOps: warmup,
+        elapsedMs,
+        opsPerSec,
+        bytesPerOp,
+        source: summary.source,
+        summary
+    };
+}
+
+// Read the profiler's most recent heap sample. Returns -1 when no channel
+// exposes it (source='none'). Used to bracket the steady phase for the
+// bytes-per-op delta.
+function _readHeapUsedFor(gc) {
+    // The profiler stores the latest sample in _heapPrev; a private read is
+    // fine here since both this helper and the profiler live in the same file.
+    return gc._heapPrev >= 0 ? gc._heapPrev : -1;
+}
+
+// Per-op verifiability probe. Mirrors isCheckable but reads from a measureOps
+// result -- which has its own shape (has a `summary` field, no top-level heap
+// or uasm blocks).
+function _isCheckableOps(rule, result) {
+    const source = result.source;
+    const row = VERDICT_MATRIX[rule];
+    if (!row) return false;
+    const state = row[source];
+    if (state === 'yes') return true;
+    if (state === 'no') return false;
+    if (state === 'needsHeap') {
+        // Per-op verifiability requires bytesPerOp be derivable, which means
+        // at least a start+end heap sample was captured. bytesPerOp !== null
+        // is the signal we need; a zero value is still verifiable.
+        return result.bytesPerOp !== null;
+    }
+    if (state === 'needsUasm') {
+        return result.summary && result.summary.uasm && result.summary.uasm.samples >= 2;
+    }
+    return false;
+}
+
+// Extract the actual per-op number for a rule from a measureOps result.
+function _actualPerOp(rule, result) {
+    if (rule === 'maxBytesPerOp')   return result.bytesPerOp;
+    // Steady phase counters live under summary.phases.steady.gc when phase()
+    // was used (which measureOps always does). Fall back to window-wide gc
+    // if for any reason the steady phase snapshot is missing.
+    const steady = result.summary && result.summary.phases && result.summary.phases.steady;
+    const g = steady ? steady.gc : result.summary.gc;
+    if (rule === 'maxMajorsPerKOp')  return result.ops > 0 ? (g.major * 1000) / result.ops : 0;
+    if (rule === 'maxMinorsPerKOp')  return result.ops > 0 ? (g.minor * 1000) / result.ops : 0;
+    if (rule === 'maxPauseMsPerOp')  return result.ops > 0 ? g.totalMs / result.ops : 0;
+    return 0;
+}
+
+// Human-readable metric name for a per-op rule (used in violation reasons).
+function _perOpMetricName(rule) {
+    if (rule === 'maxBytesPerOp')   return 'bytesPerOp';
+    if (rule === 'maxMajorsPerKOp') return 'majorsPerKOp';
+    if (rule === 'maxMinorsPerKOp') return 'minorsPerKOp';
+    if (rule === 'maxPauseMsPerOp') return 'pauseMsPerOp';
+    return rule;
+}
+
+const OPS_RULES = ['maxBytesPerOp', 'maxMajorsPerKOp', 'maxMinorsPerKOp', 'maxPauseMsPerOp'];
+
+/**
+ * Gate a measureOps result against per-op rules. Verdict semantics identical
+ * to checkNoGc: fail > inconclusive > pass. Returns a report; use assertOps
+ * to throw instead.
+ *
+ * @param {ReturnType<measureOps>} result  A measureOps result object.
+ * @param {object} rules                    Any subset of OPS_RULES.
+ */
+function checkOps(result, rules) {
+    if (!result || result.schema !== OPS_SCHEMA) {
+        throw new TypeError('checkOps: result must be a measureOps() result (schema lite-gc-ops/1)');
+    }
+    const r = rules || {};
+    const violations = [];
+    const checked = {};
+    let anyUnchecked = false;
+
+    for (const rule of OPS_RULES) {
+        if (r[rule] === undefined) continue;
+        const ok = _isCheckableOps(rule, result);
+        checked[rule] = ok;
+        if (!ok) { anyUnchecked = true; continue; }
+        const actual = _actualPerOp(rule, result);
+        if (actual > r[rule]) {
+            violations.push({
+                metric: _perOpMetricName(rule),
+                limit: r[rule],
+                actual,
+                reason: _perOpMetricName(rule) + ' ' + actual.toFixed(3) + ' > ' + r[rule].toFixed(3) + ' over ' + result.ops + ' ops'
+            });
+        }
+    }
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (anyUnchecked) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        kind: 'ops',
+        verdict,
+        checked,
+        violations,
+        ok: verdict === 'pass',                     // v1.0.0-shape convenience
+        ops: result.ops,
+        opsPerSec: result.opsPerSec,
+        bytesPerOp: result.bytesPerOp,
+        source: result.source,
+        summary: result.summary
+    };
+}
+
+/**
+ * Convenience: measure and gate in one call. Throws GcBudgetError on fail,
+ * GcInconclusiveError on inconclusive (unless options.allowInconclusive).
+ *
+ * @param {(i: number) => any} fn
+ * @param {object} rules
+ * @param {object} opts     Same as measureOps opts, plus optional allowInconclusive.
+ */
+function assertOps(fn, rules, opts) {
+    const result = measureOps(fn, opts);
+    const report = checkOps(result, rules);
+    if (report.verdict === 'fail') {
+        throw new GcBudgetError(report);
+    }
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
+// Delta rule names -- mirror maxExtra* on compareGc.
+const COMPARE_OPS_RULES = {
+    maxExtraBytesPerOp:   'maxBytesPerOp',
+    maxExtraMajorsPerKOp: 'maxMajorsPerKOp',
+    maxExtraMinorsPerKOp: 'maxMinorsPerKOp',
+    maxExtraPauseMsPerOp: 'maxPauseMsPerOp'
+};
+
+/**
+ * Compare two measureOps results. Rule shape: maxExtra*PerOp -- the maximum
+ * allowed delta of candidate over control.
+ *
+ * Convenience form: compareOps(controlFn, candidateFn, rules, opts) --
+ * detected via typeof of the first argument. Runs measureOps twice with
+ * matched opts, then compares. The primitive form (two results) is preferred
+ * for scripted benchmarks where users want to keep the raw results around.
+ *
+ * Source mismatch between control and candidate -> inconclusive with
+ * reason: 'source_mismatch'. Consistent with compareGc.
+ */
+function compareOps(controlOrFn, candidateOrFn, rules, opts) {
+    // Convenience form: two functions -> measure both with matched opts.
+    if (typeof controlOrFn === 'function' && typeof candidateOrFn === 'function') {
+        const control = measureOps(controlOrFn, opts);
+        const candidate = measureOps(candidateOrFn, opts);
+        return _compareOpsResults(control, candidate, rules);
+    }
+    // Primitive form: two results.
+    return _compareOpsResults(controlOrFn, candidateOrFn, rules);
+}
+
+function _compareOpsResults(control, candidate, rules) {
+    if (!control || control.schema !== OPS_SCHEMA) {
+        throw new TypeError('compareOps: control must be a measureOps() result');
+    }
+    if (!candidate || candidate.schema !== OPS_SCHEMA) {
+        throw new TypeError('compareOps: candidate must be a measureOps() result');
+    }
+    if (control.source !== candidate.source) {
+        return {
+            kind: 'compareOps',
+            verdict: 'inconclusive',
+            reason: 'source_mismatch',
+            checked: {}, violations: [],
+            ok: false,
+            control, candidate
+        };
+    }
+    const r = rules || {};
+    const violations = [];
+    const checked = {};
+    let anyUnchecked = false;
+
+    for (const deltaRule in COMPARE_OPS_RULES) {
+        if (r[deltaRule] === undefined) continue;
+        const baseRule = COMPARE_OPS_RULES[deltaRule];
+        const ok = _isCheckableOps(baseRule, control) && _isCheckableOps(baseRule, candidate);
+        checked[deltaRule] = ok;
+        if (!ok) { anyUnchecked = true; continue; }
+        const cActual = _actualPerOp(baseRule, candidate);
+        const ctlActual = _actualPerOp(baseRule, control);
+        const delta = cActual - ctlActual;
+        if (delta > r[deltaRule]) {
+            violations.push({
+                metric: _perOpMetricName(baseRule) + '.delta',
+                limit: r[deltaRule],
+                actual: delta,
+                reason: 'extra ' + _perOpMetricName(baseRule) + ': ' + delta.toFixed(3) + ' > ' + r[deltaRule].toFixed(3)
+            });
+        }
+    }
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (anyUnchecked) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        kind: 'compareOps',
+        verdict,
+        checked, violations,
+        ok: verdict === 'pass',
+        control, candidate
+    };
+}
+
+/**
+ * Assert form of compareOps. Same throw semantics as assertOps.
+ */
+function assertCompareOps(controlOrFn, candidateOrFn, rules, opts) {
+    const report = compareOps(controlOrFn, candidateOrFn, rules, opts);
+    if (report.verdict === 'fail') {
+        throw new GcBudgetError(report);
+    }
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
 export {
     VERSION,
     GcProfiler,
@@ -1711,6 +2129,9 @@ export {
     aggregateGc, gateReps, assertReps,
     captureFingerprint, createBaseline, checkAgainstBaseline, assertAgainstBaseline,
     formatConsole, formatJson, formatMarkdown, formatGithubAnnotations,
+    // Batch 6 (v1.3.0) -- per-op primitives.
+    measureOps, checkOps, assertOps,
+    compareOps, assertCompareOps,
     GcBudgetError, GcInconclusiveError,
     GC_DEFAULT_RULES, GC_DEFAULT_DIFFERENTIAL_RULES, REP_POLICY_DEFAULTS,
     VERDICT_MATRIX,

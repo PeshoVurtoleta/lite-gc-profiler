@@ -1,3 +1,84 @@
+# v1.3.1 migration notes
+
+Hardening patch; **no breaking changes**. Existing v1.3.0 code, baselines,
+and CI configurations keep working unchanged.
+
+## Behavior change: `measureOps.bytesPerOp` is measurably smaller
+
+The paired-call self-noise cancellation added in `measureOps` subtracts
+~240 bytes of `process.memoryUsage()` overhead at the steady-end
+boundary. In v1.3.0 that was folded into the delta, inflating
+`bytesPerOp` by ~240/ops. In v1.3.1 the reported value is more accurate.
+
+**If you were setting `maxBytesPerOp: X` where X was tuned to compensate
+for the pre-cancellation noise**, your gate now has more headroom.
+Nothing breaks -- clean workloads pass more decisively. But if you want
+tighter bounds now that the reported value is truer, you can lower X.
+
+Recommended `maxBytesPerOp` thresholds by `ops` count are documented in
+the README per-op section. Short version: at `ops >= 10_000`, strict
+`maxBytesPerOp: 0` is now reliable for genuinely allocation-free
+workloads.
+
+## No API changes
+
+All exports and signatures unchanged from v1.3.0.
+
+# v1.3.0 migration notes
+
+Additive release; **no breaking changes**. Existing v1.2.0 code, baselines,
+and CI configurations keep working unchanged.
+
+## New surface
+
+- `measureOps(fn, opts)` -- sync per-op measurement primitive. Options:
+  `{ ops, warmup?, source?, capacity? }`. Returns `{ schema: 'lite-gc-ops/1',
+  ops, warmupOps, elapsedMs, opsPerSec, bytesPerOp, source, summary }`.
+- `checkOps(result, rules)` -- gate a measureOps result.
+- `assertOps(fn, rules, opts)` -- measure + gate + throw in one call.
+- `compareOps(control, candidate, rules)` -- primitive form; also accepts
+  two functions with a matched `opts` object.
+- `assertCompareOps(...)` -- assert form of compareOps.
+- Four new rule names: `maxBytesPerOp`, `maxMajorsPerKOp`, `maxMinorsPerKOp`,
+  `maxPauseMsPerOp`. Delta names: `maxExtra*PerOp`.
+
+## VERDICT_MATRIX growth
+
+Four new rows for the per-op rules, each with all four source columns
+(`gc`, `heap`, `uasm`, `none`). Tools that render or filter the matrix by
+column should pick up the new rows automatically; tools that hard-coded
+the rule list must add the four names.
+
+## CLI: process.exit now surfaces as inconclusive, not infrastructure error
+
+Before v1.3.0, a target that called `process.exit()` before `beforeExit`
+could run resulted in "target did not write report" and exit code 3
+(infrastructure error). In v1.3.0 the register preload installs a sync
+`exit` handler that writes a partial report; the CLI reads that and emits
+exit code 2 (inconclusive) with `reason: 'partial_report'`.
+
+CI configurations that treated exit code 3 as "infrastructure broken, retry"
+will now see exit 2 for the same scenarios. If you want the old behavior,
+gate CI on `--allow-inconclusive` policies as usual -- exit 2 already meant
+"can't verify" and now also covers "target hard-exited."
+
+Reports carry a new `partial` field when this path fires:
+
+    { partial: [{ rep: 0, reason: 'process_exit', exitCode: 0 }] }
+
+Report shape is otherwise unchanged.
+
+## For downstream tools reading reports
+
+Two new schemas may appear in files:
+- `'lite-gc-ops/1'` -- measureOps result. Contains a full `summary` field with
+  the existing `'lite-gc/1'` shape.
+- `'lite-gc-partial/1'` -- partial report from the register exit handler.
+  Contains `partialSummary` with the existing `'lite-gc/1'` shape.
+
+Tools that dispatch on `schema` should add branches for these; tools that
+read `partialSummary.gc/heap/uasm/phases` continue to work as before.
+
 # v1.2.0 migration notes
 
 Additive release; **no breaking changes**. Existing v1.1.0 code and

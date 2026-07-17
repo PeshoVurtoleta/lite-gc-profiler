@@ -1,5 +1,179 @@
 # Changelog
 
+## 1.3.0
+
+Hardening patch. Closes one of two sharp edges the Fable-brainstormed
+forward roadmap flagged for pre-Wave-1 (H2 stays as v1.3.1 material for
+when uasm gating is first exercised on real Chrome hardware).
+
+### H1 (adjusted) -- `measureOps` self-noise cancellation
+
+`process.memoryUsage()` on node allocates a small object (~240 bytes)
+per call. In v1.3.0 that allocation was folded into the steady-phase
+delta at the end boundary, inflating `bytesPerOp` by ~240 / ops. Small
+enough to be invisible on real workloads, large enough to fail a strict
+`maxBytesPerOp: 0` gate on a legitimately clean workload at low ops
+counts.
+
+Fix: **paired-call cancellation**. At each phase boundary, take a
+second `process.memoryUsage()` call immediately after the first. The
+delta between the two approximates one call's own allocation cost --
+consecutive calls hit the same code path with the same hidden class,
+so their allocation costs match within a byte or two on stable V8.
+Subtract to get the pre-sampling heap value. Clamped to a plausible
+range (0..8192 bytes) so a mid-loop scavenge between the paired calls
+falls back to the raw value gracefully rather than over-correcting.
+
+Chrome/browser unaffected -- `performance.memory.usedJSHeapSize` is a
+property read on a singleton, zero allocation, no cancellation needed.
+
+### Noise-floor documentation
+
+The paired-call fix eliminates the sampling infrastructure's own
+allocation contribution, but V8 has its own residual noise from
+loop-bookkeeping (feedback vectors, tier-up allocations, incremental
+marking) -- roughly 500-1200 bytes per loop regardless of ops. That's
+orthogonal to the sampling fix and can't be removed in userland.
+
+Added noise-floor guidance to the `measureOps` JSDoc and the README
+per-op section. Rule of thumb: strict `maxBytesPerOp: 0` gating wants
+`ops >= 10_000` where V8's residual dilutes below 0.15 bytes/op.
+
+### G14.5 axis-C scenario added
+
+`test/torture/g14-5-ops.test.mjs` now includes an axis-C scenario that
+pins both claims: (a) paired-call cancellation is active (regression
+protection if the fix ever gets removed), (b) V8's residual noise
+stays under 1 byte/op at 10K ops on the reference runtime. Multi-
+attempt best-of, since V8 occasionally does incremental marking mid-
+loop and spikes the delta for that specific run.
+
+### Testing
+
+    npm test
+
+317 tests, 317 pass. Adds one G14.5 axis-C scenario; previous 316
+unchanged.
+
+### Non-fix note (deferred to future patch)
+
+The forward-roadmap H1 also proposed a bounded-time reporting path
+(replace O(N log N) sort with an is-sorted fast pass for the common
+near-ordered case). Deferred: not exercised in v1.3.0's typical usage
+patterns, and the sort cost at default `capacity: 256` is
+sub-millisecond. Revisit if a Wave adopter hits the large-capacity
+report-time cliff.
+
+Batch 6 -- per-op primitives (`measureOps`, `assertOps`, `compareOps`) plus
+the `process.exit` partial-report path in the CLI. This is the release that
+turns the profiler from "gate a whole test run" into "gate a signal
+notification, a keyed-selector call, a hot-loop tick" -- the shape reactive
+framework benches have been hand-rolling for years.
+
+Non-breaking. Additive throughout. Existing v1.2.0 code and baselines keep
+working unchanged.
+
+### G14 -- `measureOps(fn, opts)`
+
+Sync-only in v1.3.0 (D7). Async per-op semantics are ambiguous because
+microtasks interleave allocations across iterations; if real demand appears,
+async support is a separate design in v1.4+.
+
+    import { measureOps } from '@zakkster/lite-gc-profiler';
+
+    const result = measureOps((i) => notify(i), { ops: 10_000, warmup: 500 });
+    // -> { schema: 'lite-gc-ops/1', ops, warmupOps, elapsedMs, opsPerSec,
+    //      bytesPerOp, source, summary }
+
+Internals use the existing `phase()` machinery (G2) with two named phases,
+`warmup` and `steady`. Warmup allocations are visible in `summary.phases.warmup`
+but explicitly quarantined from steady-phase gating; `bytesPerOp` is derived
+from the steady heap delta alone. On node the internal profiler samples via
+`process.memoryUsage().heapUsed` at phase boundaries; on Chrome it reads
+`performance.memory` through `sampleHeap()`. When source is `'none'`
+(Firefox/Safari, or explicit opt-out), sampling is skipped and `bytesPerOp`
+is `null`.
+
+`fn(i)` signature (D8) matches alien-signals bench, js-reactivity-benchmark,
+and the internal `@zakkster/lite-*` bench harnesses.
+
+### G15 -- `assertOps(fn, rules, opts)` + `checkOps(result, rules)`
+
+Four rule names, verifiability documented in `VERDICT_MATRIX`:
+
+    maxBytesPerOp     -- needs a memory channel; verifiable when heap or uasm has samples
+    maxMajorsPerKOp   -- source='gc' only (Node V8 event kinds)
+    maxMinorsPerKOp   -- source='gc' only
+    maxPauseMsPerOp   -- source='gc' only
+
+`assertOps` throws `GcBudgetError` on fail, `GcInconclusiveError` on
+inconclusive (unless `opts.allowInconclusive`). Rule scope is per-op only
+(D10) -- throughput (`opsPerSec`) is reported but never gated, keeping
+this package in the "prove zero-GC per op" lane. Benchmark harnesses
+have opinions on throughput; the gate stays neutral.
+
+### G16 -- `compareOps(control, candidate, rules)`
+
+Primitive form (D9): two `measureOps` results, one report. Same shape as
+`compareGc` -- source mismatch yields inconclusive with
+`reason: 'source_mismatch'`. Convenience form
+`compareOps(controlFn, candidateFn, rules, opts)` calls `measureOps` twice
+internally with matched opts, then compares. `assertCompareOps` throws in
+the same way as `assertOps`.
+
+Delta rule names mirror `maxExtra*` on `compareGc`:
+
+    maxExtraBytesPerOp
+    maxExtraMajorsPerKOp
+    maxExtraMinorsPerKOp
+    maxExtraPauseMsPerOp
+
+### G16.5 -- CLI partial-report path
+
+Register preload now installs a `process.on('exit')` sync handler alongside
+the existing `beforeExit` async one. If the target calls `process.exit()`,
+the exit handler writes a partial report:
+
+    { schema: 'lite-gc-partial/1', complete: false, reason: 'process_exit',
+      exitCode, partialSummary, capturedAt }
+
+CLI reads that schema, downgrades verdict to `inconclusive` with
+`reason: 'partial_report'`, and emits exit code 2 (inconclusive) instead of
+exit code 3 (infrastructure error). Before v1.3.0, a hard `process.exit()`
+from an integrated script was indistinguishable from a broken harness at CI.
+
+### G14.5 torture
+
+10 scenarios in `test/torture/g14-5-ops.test.mjs`. Axis A (3): `source='none'`
++ `maxBytesPerOp` inconclusive; `source='heap'` kind-per-op-rules inconclusive;
+compareOps source mismatch inconclusive. Axis B (3): 10x bytes/op candidate
+fails compareOps; leaky steady is not shielded by clean warmup; **complementary
+pin** -- heavy warmup + clean steady MUST pass strict steady rule (proves
+`phase()` boundary really quarantines warmup). Axis C (2): identical noop
+workloads compare with delta 0; measureOps itself induces no majors on a noop
+workload (per-op harness perturbation bound). Axis D (2): result shape stable
+across sources with `bytesPerOp` null when un-derivable; compareOps verdict
+matches per-metric manual computation.
+
+Plus 3 CLI integration scenarios in `test/18-partial-report.test.mjs`:
+`process.exit(0)` yields exit 2 + partial reason; `process.exit(1)` also
+yields exit 2 (not exit 3); clean run without any `process.exit` writes a
+complete report with no partial marker (additive-changes-stay-additive pin
+for the register preload).
+
+### Testing
+
+    npm test
+
+316 tests, 316 pass. Adds 29 standard-case per-op tests, 10 G14.5 torture
+scenarios, 3 G16.5 CLI integration scenarios; previous 274 unchanged.
+
+### File additions
+
+* `test/17-measure-ops.test.mjs`
+* `test/torture/g14-5-ops.test.mjs`
+* `test/18-partial-report.test.mjs`
+
 ## 1.2.0
 
 Batch 5 -- the browser second source. Chrome now has a precise-when-you-can-

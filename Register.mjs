@@ -23,7 +23,8 @@ const outPath = process.env.LITE_GC_GATE_REPORT_PATH;
 // beforeExit is the right hook: it fires when the loop is about to drain but
 // still allows async work. process.on('exit') is synchronous and cannot await
 // settle. If the target calls process.exit() explicitly, beforeExit is skipped
-// -- that's an accepted limitation, documented in the README.
+// -- v1.3.0 catches that case via a sync exit handler that writes a *partial*
+// report the CLI downgrades to inconclusive instead of infrastructure error.
 let hookRan = false;
 process.on('beforeExit', () => {
     if (hookRan) return;
@@ -40,6 +41,31 @@ process.on('beforeExit', () => {
             }
         }
     });
+});
+
+// G16.5: fallback handler for process.exit() bypass. Sync-only (exit hook
+// cannot await), so no settle() -- we grab whatever state the profiler has.
+// Skips silently if beforeExit already wrote a full report. Emits schema
+// 'lite-gc-partial/1' so the CLI can distinguish complete vs partial and
+// downgrade exit code appropriately.
+process.on('exit', (code) => {
+    if (hookRan) return;                                    // beforeExit handled it
+    if (!outPath) return;                                   // no report path -> nothing to write
+    try {
+        gc.stop();
+        const partialSummary = gc.summary({ _capturedBy: 'lite-gc-gate/register-exit' });
+        const partial = {
+            schema: 'lite-gc-partial/1',
+            complete: false,
+            reason: 'process_exit',
+            exitCode: code,
+            partialSummary,
+            capturedAt: new Date().toISOString()
+        };
+        writeFileSync(outPath, JSON.stringify(partial));
+    } catch (e) {
+        process.stderr.write('lite-gc-gate: failed to write partial report on exit: ' + e.message + '\n');
+    }
 });
 
 // Also expose the profiler on a well-known global so target scripts can call
