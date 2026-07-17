@@ -500,10 +500,11 @@ per-op floor scales as `noise / ops`:
 | 1K+   | < 1.5 B/op    | `2` (recommended)         |
 | <500  | > 3 B/op      | not recommended for `0`   |
 
-The v1.3.0 hardening cancels the sampling infrastructure's own
-`process.memoryUsage()` allocation via paired-call cancellation, but V8's
-residual bookkeeping is orthogonal and can't be eliminated in userland.
-Prefer `ops >= 10_000` for strict zero-alloc claims.
+V8's residual bookkeeping is orthogonal to the sampling infrastructure
+and can't be eliminated in userland. For strict zero-alloc claims,
+prefer `ops >= 10_000`, or use `stabilize: true` (see the Cold CI
+section above) to reduce sensitivity to transient allocation and V8
+timing.
 
 ### Comparing two implementations
 
@@ -527,6 +528,64 @@ measurements is never meaningful, and the gate says so instead of pretending.
 
 `assertCompareOps` throws in the same way as `assertOps` -- one call for
 CI, no result-handling boilerplate.
+
+### Cold CI: use `stabilize: true`
+
+Warm-workload measurement (what `measureOps` does by default) is the right
+answer when the code under test has already run in the process -- typical
+of bench harnesses, integration suites, and interactive dev loops. In a
+**cold CI shard** -- where the first call to `assertCompareOps` is
+literally the first time V8 has seen these paths -- two effects can
+collapse a legitimate leak signal to zero:
+
+- JIT tier-up allocation churn inflates the control's `bytesPerOp`,
+  narrowing the delta between control and candidate below the gate
+  threshold.
+- A one-off major GC mid steady-loop compacts `heapUsed` below the
+  start-boundary sample, making the reported delta non-positive. Since
+  `bytesPerOp` clamps negative to zero, the retained candidate's leak
+  disappears from the report.
+
+Neither is a bug in the primitive -- both are "bytesPerOp may be 0 if GC
+ran," the library's documented contract. But the contract has a
+uncomfortable gap for cold-CI callers, which is precisely where
+`assertCompareOps` is designed to be called.
+
+**`stabilize: true`** closes the gap. It forces a full GC at each
+steady-phase boundary, so `bytesPerOp` reflects the **surviving-allocation
+delta** (retention) rather than transient allocation:
+
+```js
+assertCompareOps(
+    control, candidate,
+    { maxExtraBytesPerOp: 20 },
+    { ops: 1000, warmup: 100, stabilize: true }
+);
+```
+
+Requires `node --expose-gc`; throws `RangeError` at measurement time
+otherwise with actionable guidance ("run: node --expose-gc ..."). The
+forced-GC events are attributed to a separate `stabilize` phase in the
+summary so they don't inflate `steady`-phase counters.
+
+**When to use it:**
+
+- Cold-CI shards running per-op gates as their first workload.
+- Any zero-allocation claim where you care about **retention** ("my
+  signal notification retains zero bytes") rather than transient churn.
+- `assertCompareOps` in package tests where the answer should be
+  deterministic regardless of test-run order.
+
+**When to skip it:**
+
+- Warmed workloads where you already have deterministic behavior.
+- Runtimes without `--expose-gc` (browser measurements, sandboxed CI).
+- Gates that mix `maxBytesPerOp` with `maxMajorsPerKOp` -- stabilize's
+  forced fulls arrive asynchronously via perf_hooks and typically after
+  `measureOps` returns, so the `stabilize.gc.major` summary counter is
+  unreliable. Use `stabilize:true` for retention gating, `stabilize:false`
+  for GC-event-count gating; picking either separately is honest and
+  correct.
 
 ## Baseline lock: guarding against silent regressions
 

@@ -1,115 +1,107 @@
 # Changelog
 
-## 1.3.0
-
-Test-stability patch, no runtime code changes. The v1.3.0 test suite had
-fail-path scenarios that leaned on `new Uint8Array(N)` for heap growth
-signal. That was fragile: `Uint8Array`'s N-byte backing buffer lands in
-external ArrayBuffer memory, invisible to `process.memoryUsage().heapUsed`
--- only the ~80-byte wrapper counts. Exact wrapper size varies across V8
-versions, and on Node 26 with Apple Silicon (M-series) V8 packs it tightly
-enough that some tests fell below their fail thresholds and produced false
-negatives.
-
-Reported by Zahary on M4 Pro / Node 26 -- one test in
-`test/17-measure-ops.test.mjs`:
-`assertCompareOps: convenience form throws GcBudgetError on delta failure`.
-
-### Fix
-
-All fail-path tests in `test/17-measure-ops.test.mjs` and
-`test/torture/g14-5-ops.test.mjs` now use plain object literals for their
-allocation signal:
-
-    { a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 }
-
-Plain objects land fully in JS heap and show as ~100 bytes/op
-deterministically across V8 versions. Thresholds recalibrated with 5-10x
-safety margin above V8's residual noise floor.
-
-The mirror pin test in G14.5 axis-B (heavy warmup + clean steady) got a
-small semantic tightening: it now uses a best-of-5 pattern and asserts
-`bytesPerOp < 100`, acknowledging that V8's incremental marker keeps
-working through the warmup-allocated ~400KB during steady, adding ~20-100
-bytes/op of pure V8 bookkeeping. The pin's real invariant -- that the
-phase quarantine reduces warmup's ~2000-bytes/warmup-op contribution by
-20x when it bleeds into steady -- is stated explicitly in the comment.
-
-### No runtime changes
-
-Every export, function, signature, and behavior is byte-identical to
-v1.3.1. Only test files and a version string.
-
-### Testing
-
-    npm test
-
-317 tests, 317 pass. 5-run stability check clean on the reference
-sandbox. Should pass reliably on Node 22+ across major V8 builds.
-
 ## 1.3.1
 
-Hardening patch. Closes one of two sharp edges the Fable-brainstormed
-forward roadmap flagged for pre-Wave-1 (H2 stays as v1.3.1 material for
-when uasm gating is first exercised on real Chrome hardware).
+Wave 1 CI hardening. One user-facing addition: `stabilize: true` on
+`measureOps` and its convenience forms (`assertOps`, `compareOps`,
+`assertCompareOps`). Zero behavior change for existing v1.3.0 callers who
+don't opt in.
 
-### H1 (adjusted) -- `measureOps` self-noise cancellation
+### The gap this closes
 
-`process.memoryUsage()` on node allocates a small object (~240 bytes)
-per call. In v1.3.0 that allocation was folded into the steady-phase
-delta at the end boundary, inflating `bytesPerOp` by ~240 / ops. Small
-enough to be invisible on real workloads, large enough to fail a strict
-`maxBytesPerOp: 0` gate on a legitimately clean workload at low ops
-counts.
+`assertCompareOps` is designed to be called in cold CI shards. But
+"cold" plus "compare" plus per-op memory sampling has two failure modes
+that can collapse a legitimate leak signal to zero:
 
-Fix: **paired-call cancellation**. At each phase boundary, take a
-second `process.memoryUsage()` call immediately after the first. The
-delta between the two approximates one call's own allocation cost --
-consecutive calls hit the same code path with the same hidden class,
-so their allocation costs match within a byte or two on stable V8.
-Subtract to get the pre-sampling heap value. Clamped to a plausible
-range (0..8192 bytes) so a mid-loop scavenge between the paired calls
-falls back to the raw value gracefully rather than over-correcting.
+1. JIT tier-up allocation churn inflates the control's `bytesPerOp`,
+   narrowing the delta between control and candidate.
+2. A one-off major GC mid-steady compacts `heapUsed` below the
+   start-boundary sample. The reported delta goes non-positive; since
+   `bytesPerOp` clamps negative to zero, the retained candidate's leak
+   disappears from the report.
 
-Chrome/browser unaffected -- `performance.memory.usedJSHeapSize` is a
-property read on a singleton, zero allocation, no cancellation needed.
+Neither is a bug in the primitive -- both are "bytesPerOp may be 0 if GC
+ran," the library's documented contract. But that contract has an
+uncomfortable gap for cold-CI callers, which is precisely where
+`assertCompareOps` is designed to be called.
 
-### Noise-floor documentation
+### `stabilize: true`
 
-The paired-call fix eliminates the sampling infrastructure's own
-allocation contribution, but V8 has its own residual noise from
-loop-bookkeeping (feedback vectors, tier-up allocations, incremental
-marking) -- roughly 500-1200 bytes per loop regardless of ops. That's
-orthogonal to the sampling fix and can't be removed in userland.
+Opt-in on `MeasureOpsOptions`. When set:
 
-Added noise-floor guidance to the `measureOps` JSDoc and the README
-per-op section. Rule of thumb: strict `maxBytesPerOp: 0` gating wants
-`ops >= 10_000` where V8's residual dilutes below 0.15 bytes/op.
+- Forces a full GC (`globalThis.gc()`) at each steady-phase boundary,
+  so `bytesPerOp` reflects the **surviving-allocation delta**
+  (retention) rather than transient allocation.
+- Adds a `stabilize` phase to `summary.phases` for shape stability.
+- Requires `node --expose-gc`; throws `RangeError` at measurement time
+  otherwise with actionable guidance (the error message names the
+  `--expose-gc` flag explicitly).
 
-### G14.5 axis-C scenario added
+Applied through the convenience forms via `opts` inheritance -- one
+option, propagates to both measurements in `compareOps` /
+`assertCompareOps`:
 
-`test/torture/g14-5-ops.test.mjs` now includes an axis-C scenario that
-pins both claims: (a) paired-call cancellation is active (regression
-protection if the fix ever gets removed), (b) V8's residual noise
-stays under 1 byte/op at 10K ops on the reference runtime. Multi-
-attempt best-of, since V8 occasionally does incremental marking mid-
-loop and spikes the delta for that specific run.
+    assertCompareOps(
+        control, candidate,
+        { maxExtraBytesPerOp: 20 },
+        { ops: 1000, warmup: 100, stabilize: true }
+    );
 
-### Testing
+### Honest limitation (documented)
 
-    npm test
+The forced-GC events arrive via `perf_hooks` asynchronously, typically
+after `measureOps` has returned. So the `summary.phases.stabilize.gc.*`
+counters are unreliable and **users should not gate on them.** The
+recommended pattern is: use `stabilize: true` for retention gating
+(`maxBytesPerOp`, `maxExtraBytesPerOp`), and use `stabilize: false` for
+GC-event-count gating (`maxMajorsPerKOp`, `maxPauseMsPerOp`). Both
+are honest and correct on their own axes.
 
-317 tests, 317 pass. Adds one G14.5 axis-C scenario; previous 316
-unchanged.
+If demand appears for a stabilize path that also captures the forced-GC
+events -- for combined byte + event-count gating -- that's an async
+follow-up (`measureOpsAsync` or `settle:true`), a separate design pass.
 
-### Non-fix note (deferred to future patch)
+### Rules matrix, source columns, phases
 
-The forward-roadmap H1 also proposed a bounded-time reporting path
-(replace O(N log N) sort with an is-sorted fast pass for the common
-near-ordered case). Deferred: not exercised in v1.3.0's typical usage
-patterns, and the sort cost at default `capacity: 256` is
-sub-millisecond. Revisit if a Wave adopter hits the large-capacity
-report-time cliff.
+No change. `stabilize:true` doesn't add rules, doesn't add sources, and
+doesn't change the shape of `summary.phases.steady`. The new
+`summary.phases.stabilize` sub-summary is additive and only appears
+when `stabilize:true`.
+
+### Torture
+
+`test/torture/g14-6-stabilize.test.mjs` -- 8 scenarios covering four
+axes:
+
+- **Axis A** (adversarial): guard fires before fn runs; strict-boolean
+  gate (truthy `1`/`'x'`/`{}` don't accidentally enable); error message
+  names `--expose-gc` explicitly.
+- **Axis B** (signal-under-noise): 100 B/op retained leak survives
+  stabilize's forced GC; transient allocation collapses below 50 B/op.
+- **Axis C** (perturbation bound): stabilize on a noop workload stays
+  under 5 B/op -- the mode adds no user-visible per-op cost.
+- **Axis D** (self-consistency): **ecosystem pin** -- cold-run
+  `assertCompareOps` + stabilize produces the same verdict as warm-run
+  + stabilize. This is the invariant that makes stabilize worth
+  existing. Also: shape-stability (`stabilize` phase existence tracks
+  the opt-in in both directions).
+
+### Compatibility
+
+Fully additive. Existing v1.3.0 code -- including all baselines and
+gates -- behaves byte-identically. `stabilize` is `false` by default;
+runtimes without `--expose-gc` remain fully supported for anything not
+explicitly opting in.
+
+Node 20+ (unchanged). Chrome/browser: `stabilize:true` throws
+`RangeError` since `globalThis.gc` is unavailable; use warmed-workload
+measurement instead.
+
+### Copyright
+
+Zahary Shinikchiev. MIT.
+
+## 1.3.0
 
 Batch 6 -- per-op primitives (`measureOps`, `assertOps`, `compareOps`) plus
 the `process.exit` partial-report path in the CLI. This is the release that

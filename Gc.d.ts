@@ -1,4 +1,4 @@
-export const VERSION: '1.3.2';
+export const VERSION: '1.3.1';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -607,6 +607,14 @@ export interface MeasureOpsOptions {
     source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
     /** GcProfiler pause-ring capacity. Default 256. */
     capacity?: number;
+    /**
+     * Force a full GC at each steady-phase boundary so `bytesPerOp` reflects
+     * the surviving-allocation delta (retention) rather than transient
+     * allocation. Requires node --expose-gc; throws RangeError otherwise.
+     * Adds a `stabilize` phase to the summary shape. Recommended for
+     * cold-CI zero-alloc gates; see README for guidance. Default false.
+     */
+    stabilize?: boolean;
     /** For assert*Ops only: skip throw on inconclusive. */
     allowInconclusive?: boolean;
 }

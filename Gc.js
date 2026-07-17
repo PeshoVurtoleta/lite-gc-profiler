@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.3.2';
+const VERSION = '1.3.1';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -1754,6 +1754,15 @@ const OPS_SCHEMA = 'lite-gc-ops/1';
  * @param {'auto'|'gc'|'heap'|'uasm'|'none'} [opts.source='auto']
  *                                       Passed to the internal GcProfiler.
  * @param {number} [opts.capacity=256]   GcProfiler pause-ring capacity.
+ * @param {boolean} [opts.stabilize=false]
+ *                                       Force a full GC at each steady-phase boundary so
+ *                                       `bytesPerOp` reflects the surviving-allocation
+ *                                       delta rather than transient allocation. Requires
+ *                                       node --expose-gc; throws RangeError otherwise.
+ *                                       The forced-GC events are attributed to a
+ *                                       separate `stabilize` phase in the summary so
+ *                                       they don't inflate steady-phase gate rules.
+ *                                       See README for cold-CI use case.
  * @returns {{
  *   schema: 'lite-gc-ops/1',
  *   ops: number, warmupOps: number,
@@ -1762,24 +1771,6 @@ const OPS_SCHEMA = 'lite-gc-ops/1';
  *   source: GcSource,
  *   summary: GcSummary
  * }}
- *
- * ## Noise floor guidance
- *
- * On node, `bytesPerOp` has a small residual noise floor from V8's own
- * loop-bookkeeping (feedback vectors, tier-up allocations, incremental
- * marking activity). This is ORTHOGONAL to the sampling infrastructure --
- * v1.3.1's paired-call cancellation eliminates the `process.memoryUsage()`
- * self-cost, but V8's residual is not something a userland API can remove.
- *
- * Empirical shape: ~500-1200 bytes of residual per loop, regardless of ops
- * count. So per-op, the floor scales as `noise / ops`:
- *
- * - `ops >= 10_000` -> floor < 0.15 bytes/op; strict `maxBytesPerOp: 0` gates
- *   reliable.
- * - `ops >= 1_000`  -> floor < 1.5 bytes/op; `maxBytesPerOp: 2` recommended.
- * - `ops < 500`     -> floor > 3 bytes/op; not recommended for strict gates.
- *
- * For per-op zero-alloc claims, prefer `ops >= 10_000`.
  */
 function measureOps(fn, opts) {
     if (typeof fn !== 'function') throw new TypeError('measureOps: fn must be a function');
@@ -1791,6 +1782,20 @@ function measureOps(fn, opts) {
     }
     if (!Number.isFinite(warmup) || warmup < 0 || (warmup | 0) !== warmup) {
         throw new RangeError('measureOps: opts.warmup must be a non-negative integer');
+    }
+    // Stabilize mode: force full GC at each steady-phase boundary so
+    // bytesPerOp reflects surviving-allocation delta (retention) rather than
+    // transient allocation. Requires globalThis.gc, which node exposes only
+    // under --expose-gc. Throwing at measurement time (not construction)
+    // keeps the guard on the CI path where it matters, and lets code that
+    // never opts in stay portable to runtimes without --expose-gc.
+    const stabilize = opts.stabilize === true;
+    if (stabilize && typeof globalThis.gc !== 'function') {
+        throw new RangeError(
+            'measureOps: opts.stabilize:true requires node --expose-gc ' +
+            '(globalThis.gc must be a function). Run: node --expose-gc ... ' +
+            'or drop stabilize for warmed-workload measurement.'
+        );
     }
 
     const gc = new GcProfiler(opts.capacity || 256, { source: opts.source || 'auto' });
@@ -1804,42 +1809,15 @@ function measureOps(fn, opts) {
     // bytesPerOp ends up null -- respecting the caller's intent to simulate
     // a memory-unaware environment even when a memory API is technically
     // available on this runtime.
-    //
-    // Self-noise cancellation (v1.3.1 hardening, D-item pre-1.4): on node,
-    // process.memoryUsage() allocates ~200 bytes per call (a small object
-    // with six numeric fields). Naively bracketing the steady phase with
-    // one call at each boundary folds the end-call's allocation into the
-    // delta and inflates bytesPerOp by ~200/ops -- enough to fail a strict
-    // maxBytesPerOp:0 gate on a legitimately clean workload. Fix: take a
-    // second memoryUsage() call immediately after the first at each boundary.
-    // Consecutive calls allocate the same shape of small object, so their
-    // delta estimates the per-call self-cost. Subtracting gives the
-    // pre-sampling heap value.
-    //
-    // Chrome/browser: performance.memory.usedJSHeapSize is a property read
-    // on a singleton, not a method call. Zero-alloc, no cancellation needed.
     const source = gc.source;
     const isNode = typeof process !== 'undefined' && process.memoryUsage;
     const canSampleMemory = source !== 'none';
-    // Returns { t, used } for a phase boundary. On sources without memory
-    // sampling, used is -1. On node, applies paired-call self-noise
-    // cancellation with a safety clamp: if the second-call delta lands
-    // outside a plausible range for a small-object allocation (0..8192
-    // bytes), a scavenge or unrelated activity fired between the two
-    // calls and the estimate is unreliable -- fall back to the raw value
-    // rather than over-correcting.
-    const SELF_NOISE_MAX = 8192;
     function sampleBoundary() {
         const t = typeof performance !== 'undefined' ? performance.now() : 0;
         if (!canSampleMemory) return { t, used: -1 };
         if (isNode) {
-            const raw = process.memoryUsage().heapUsed;
-            gc.sampleHeap(t, raw);
-            const raw2 = process.memoryUsage().heapUsed;
-            const noiseEstimate = raw2 - raw;
-            const used = (noiseEstimate > 0 && noiseEstimate < SELF_NOISE_MAX)
-                ? raw - noiseEstimate
-                : raw;
+            const used = process.memoryUsage().heapUsed;
+            gc.sampleHeap(t, used);
             return { t, used };
         }
         gc.sampleHeap(t);
@@ -1853,12 +1831,33 @@ function measureOps(fn, opts) {
     sampleBoundary();                                    // warmup boundary; used value not needed
     for (let i = 0; i < warmup; i++) fn(i);
 
+    // STABILIZE (pre-steady): if opted in, force a full GC before the
+    // steady-start sample so retention analysis starts from a compacted
+    // heap. Attributes the forced-GC event to the 'stabilize' phase, keeping
+    // 'steady' clean for gate rules.
+    if (stabilize) {
+        gc.phase('stabilize');
+        globalThis.gc();
+    }
+
     // STEADY phase -- what gets gated.
     gc.phase('steady');
     const startBoundary = sampleBoundary();
     const steadyStartT = startBoundary.t;
     const steadyStartUsed = startBoundary.used;
     for (let i = 0; i < ops; i++) fn(i);
+
+    // STABILIZE (post-steady): force GC before the end-sample so the delta
+    // reflects surviving retention, not transient allocation. Re-enters the
+    // stabilize phase; events accumulate under it. Then re-enter steady so
+    // the end-boundary sample's own accounting stays in steady (it doesn't
+    // emit GC events but the phase boundary keeps the shape consistent).
+    if (stabilize) {
+        gc.phase('stabilize');
+        globalThis.gc();
+        gc.phase('steady');
+    }
+
     const endBoundary = sampleBoundary();
     const steadyEndT = endBoundary.t;
     const steadyEndUsed = endBoundary.used;

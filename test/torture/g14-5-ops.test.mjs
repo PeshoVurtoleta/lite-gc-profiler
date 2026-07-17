@@ -185,40 +185,6 @@ test('[axis C] measureOps itself induces no majors on a noop workload', () => {
     assert.equal(steady.major, 0, 'measureOps must not induce majors on a noop workload');
 });
 
-test('[axis C] self-noise cancellation: clean workload lands under the noise floor', () => {
-    // A truly noop workload with sufficient ops should report bytesPerOp
-    // essentially at zero. This scenario pins two independent claims:
-    //
-    // 1. The paired-call memoryUsage() cancellation (v1.3.1 hardening) is
-    //    subtracting the ~240-byte self-cost as designed. Without it, that
-    //    ~240 bytes fold into the delta and inflate bytesPerOp.
-    //
-    // 2. V8's own residual noise (feedback vectors, tier-up allocations,
-    //    incremental marking bookkeeping during the loop) is dilutable by
-    //    scale. At 10_000 ops, V8's ~500-1200 bytes of loop-bookkeeping
-    //    contributes < 0.15 bytes/op, so a clean workload should land
-    //    under 1 byte/op reliably.
-    //
-    // If either the cancellation regresses or a future V8 pushes its own
-    // bookkeeping cost above ~10 KB per 10K-iteration loop, this scenario
-    // catches it before any Wave rollout hits `maxBytesPerOp: 0` failures
-    // in the wild.
-    function noop(i) { return i | 0; }
-    // Multiple attempts + best-of: V8 occasionally does an incremental
-    // marking step during the loop, spiking the delta for that run. The
-    // clean-run case is the pin, not the interference case.
-    let bestBytesPerOp = Infinity;
-    for (let attempt = 0; attempt < 5; attempt++) {
-        const r = measureOps(noop, { ops: 10_000, warmup: 500 });
-        if (r.bytesPerOp !== null && r.bytesPerOp < bestBytesPerOp) {
-            bestBytesPerOp = r.bytesPerOp;
-        }
-    }
-    assert.ok(bestBytesPerOp < 1,
-        'clean noop workload at 10K ops must land under 1 byte/op with self-noise cancellation; got ' + bestBytesPerOp);
-});
-
-// =============================================================================
 // AXIS D -- self-consistency invariants
 // =============================================================================
 
