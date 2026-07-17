@@ -1,5 +1,88 @@
 # Changelog
 
+## 1.2.0
+
+Batch 5 -- the browser second source. Chrome now has a precise-when-you-can-
+afford-it alternative to the fast-but-heuristic `performance.memory` channel,
+and the verdict matrix grows a `uasm` column so gates on that channel stay
+honest about what they can and can't verify.
+
+Non-breaking. Additive throughout: new profiler option, new async method,
+new summary block, new source column. Everything else is unchanged.
+
+### G12 -- `uasm` source
+
+New source `'uasm'` backed by `performance.measureUserAgentSpecificMemory()`.
+Opt-in via constructor -- never silently auto-selected, because cross-origin
+isolation (COOP+COEP) is a deployment choice the library can't make for you.
+
+    const gc = new GcProfiler(256, { source: 'uasm' });
+    // ...
+    await gc.sampleUasm();       // take a measurement; typically a few per window
+
+The API:
+
+* **`sampleUasm(now?)`** returns a Promise resolving to `{ supported, bytes? }`.
+  Coarse and slow -- never call per-frame. On runtimes without the API or
+  without cross-origin isolation, resolves to `{ supported: false }` and records
+  nothing.
+* **`summary.uasm`** is always present, shape:
+
+      { supported, bytes, peak, firstSample, samples, growthRate }
+
+  `supported: false` and zeros when the API is unavailable or unused.
+  `growthRate` is bytes/sec across the sampled window; 0 with a single sample.
+* **`VERDICT_MATRIX.maxAllocRate.uasm === 'needsUasm'`** -- verifiable iff
+  `summary.uasm.samples >= 2`. Kind/pause rules are `no` on uasm (no event kinds
+  exposed), matching `heap`. A `maxMajor:0` rule on a uasm-only summary is
+  correctly inconclusive, not falsely green.
+* **`compareGc` and `gateReps` follow the source.** A `source: 'uasm'`
+  candidate/aggregate reads `uasm.growthRate` for alloc-rate rules;
+  `heap`/`gc` sources still read `heap.allocRateBytesPerSec`. Cross-source
+  comparisons (e.g. uasm vs heap) remain inconclusive with
+  `reason: 'source_mismatch'`.
+* **`aggregateGc` and `createBaseline`** now include a `uasm` block alongside
+  `gc` and `heap`. Baseline files for uasm-gated packages round-trip cleanly
+  through JSON.
+
+Constructor validation:
+
+    new GcProfiler(256, { source: 'uasm' });     // throws if API missing / not COOP+COEP
+    new GcProfiler(256, { source: 'bogus' });    // throws RangeError
+
+### G13.5 torture
+
+11 scenarios in `test/torture/g13-5-browser.test.mjs` -- axis-A
+inconclusive traps (kind rule on uasm, <2 samples, no memory channel),
+axis-B fail traps (uasm growth over limit, D4 policy pin on uasm,
+compareGc delta on uasm channel), axis-C pass traps (clean uasm, heap
+regression protection, uasm rep-gate best-clean), axis-D invariants
+(matrix columns exhaustive, baseline round-trip preserves uasm).
+
+Real browser calibration (heuristic false-positive/false-negative rates
+for the existing heap-drop detector) is intentionally NOT automated in
+CI -- it belongs in `demo/calibration.html` where the numbers can be
+measured on real hardware.
+
+### G13 (SPP probe + HUD scene) -- **NOT in this release**
+
+The SPP probe adapter for the `@zakkster/lite-scope` streams lives in a
+sibling package, `@zakkster/lite-scope-gc-probe`, per the D5 decision.
+It's not part of lite-gc-profiler's surface.
+
+### Testing
+
+    npm test
+
+274 tests, 274 pass. Adds 23 standard-case uasm tests
+(`test/16-uasm.test.mjs`) and 11 G13.5 torture scenarios; previous 240
+tests unchanged.
+
+### File additions
+
+* `test/16-uasm.test.mjs`
+* `test/torture/g13-5-browser.test.mjs`
+
 ## 1.1.0
 
 The big one. This release turns the profiler from "a way to observe GC" into

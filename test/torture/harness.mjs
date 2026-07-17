@@ -81,15 +81,19 @@ export function makeSummary(source, over) {
         source,
         supported: source !== 'none',
         gc: { count: 0, totalMs: 0, maxMs: 0, avgMs: 0, p99Ms: 0, minor: 0, major: 0, incremental: 0, weakcb: 0 },
-        heap: { supported: source !== 'none', used: 0, peak: 0, firstSample: 0, samples: 0, allocBytes: 0, allocRateBytesPerSec: 0, gcDrops: 0, freedBytes: 0 },
+        heap: { supported: source !== 'none' && source !== 'uasm', used: 0, peak: 0, firstSample: 0, samples: 0, allocBytes: 0, allocRateBytesPerSec: 0, gcDrops: 0, freedBytes: 0 },
+        uasm: { supported: source === 'uasm', bytes: 0, peak: 0, firstSample: 0, samples: 0, growthRate: 0 },
         frames: { count: 0, long: 0 },
-        phases: {}
+        phases: {},
+        byRegion: {}
     };
     if (over) {
         if (over.gc) Object.assign(s.gc, over.gc);
         if (over.heap) Object.assign(s.heap, over.heap);
+        if (over.uasm) Object.assign(s.uasm, over.uasm);
         if (over.frames) Object.assign(s.frames, over.frames);
         if (over.phases) s.phases = over.phases;
+        if (over.byRegion) s.byRegion = over.byRegion;
     }
     return s;
 }

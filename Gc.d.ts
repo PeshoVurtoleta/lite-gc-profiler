@@ -1,11 +1,11 @@
-export const VERSION: '1.1.0';
+export const VERSION: '1.2.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
 export const GC_INCREMENTAL: 8;
 export const GC_WEAKCB: 16;
 
-export type GcSource = 'gc' | 'heap' | 'none';
+export type GcSource = 'gc' | 'heap' | 'uasm' | 'none';
 
 /** Three-state gate verdict. See VERDICT_MATRIX for verifiability by (rule, source). */
 export type GcVerdict = 'pass' | 'fail' | 'inconclusive';
@@ -71,13 +71,41 @@ export interface PhaseSnapshot {
     gc: PhaseGcStat;
 }
 
+/**
+ * UASM stats block (G12). Populated by sampleUasm() calls; always present in
+ * summary output. `supported: false` and zeros when the API is unavailable
+ * OR when it is available but the user never called sampleUasm().
+ *
+ * measureUserAgentSpecificMemory() is Chrome's accurate but async memory API.
+ * Requires cross-origin isolation (COOP+COEP headers). Coarse and slow --
+ * not for per-frame use. Typical use is a few times per measurement window
+ * (start, mid, end) to capture growth rate.
+ */
+export interface UasmStat {
+    supported: boolean;
+    /** Most recent measurement (bytes). */
+    bytes: number;
+    /** Highest measurement seen (bytes). */
+    peak: number;
+    /** First measurement (bytes) -- for growth-rate baselining. */
+    firstSample: number;
+    /** Number of successful samples. */
+    samples: number;
+    /** Bytes/sec across the sampled window; 0 when samples < 2. */
+    growthRate: number;
+}
+
 export interface GcSummary {
     schema: 'lite-gc/1';
-    /** Live signal: 'gc' (precise, node), 'heap' (Chrome heuristic), or 'none'. */
+    /**
+     * Live signal: 'gc' (precise, node), 'heap' (Chrome heuristic),
+     * 'uasm' (Chrome accurate, opt-in via constructor), or 'none'.
+     */
     source: GcSource;
     supported: boolean;
     gc: GcStat;
     heap: HeapStat;
+    uasm: UasmStat;
     frames: { count: number; long: number };
     /**
      * Per-phase snapshots. Empty object when no phase() calls happened. A phase
@@ -103,6 +131,14 @@ export interface GcProfilerOptions {
     heap?: boolean;
     /** Attach the GC observer immediately. Default false. */
     autoStart?: boolean;
+    /**
+     * Explicit source override. Default 'auto' -- detect: gc on node, heap on
+     * Chrome, none otherwise. Set to 'uasm' to use
+     * performance.measureUserAgentSpecificMemory as the primary gate channel
+     * (throws if the API is unavailable or the page is not cross-origin-
+     * isolated).
+     */
+    source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
 }
 
 export interface SettleOptions {
@@ -186,6 +222,17 @@ export class GcProfiler {
      * Zero-allocation; a no-op if neither a figure nor performance.memory is available.
      */
     sampleHeap(now?: number, usedBytes?: number): this;
+
+    /**
+     * Take a UASM measurement via performance.measureUserAgentSpecificMemory().
+     * Returns a Promise; the measurement is async and can take tens of ms.
+     *
+     * On runtimes without the API (or without cross-origin isolation), no-ops
+     * and returns a resolved Promise with { supported: false }. Coarse and
+     * slow: never call per-frame. Typical use is a few times per measurement
+     * window (start, mid, end) to capture growth rate.
+     */
+    sampleUasm(now?: number): Promise<{ supported: boolean; bytes?: number }>;
 
     /** Record a frame duration for the long-frame anomaly heuristic (any environment). */
     markFrame(frameMs: number): this;

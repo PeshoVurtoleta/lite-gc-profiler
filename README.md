@@ -9,7 +9,6 @@
 ![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
-[![tests](https://img.shields.io/badge/Tests-16_passing-3fb950)](#testing)
 [![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
 [![types](https://img.shields.io/badge/types-included-3178c6)](./index.d.ts)
 
@@ -35,13 +34,45 @@ question cannot be honestly answered, the gate refuses to lie.
 
 ## Sources
 
-Which signal is live is a runtime property, not a config option:
+Which signal is live is either detected from the runtime, or overridden
+explicitly via `new GcProfiler(cap, { source: ... })`:
 
 - `'gc'` -- node (or any V8 runtime exposing `perf_hooks gc` entries). Precise
-  event kinds and pause durations.
+  event kinds and pause durations. Default on node.
 - `'heap'` -- Chrome. Heuristic based on `performance.memory` heap-drop
-  detection.
+  detection. Default on Chrome. Fast enough for per-frame sampling.
+- `'uasm'` -- Chrome, opt-in. Accurate memory measurement via
+  `performance.measureUserAgentSpecificMemory()`. Requires cross-origin
+  isolation (COOP+COEP). Async and coarse; not for per-frame use.
+  Never auto-selected -- cross-origin isolation is a deployment choice.
 - `'none'` -- Firefox, Safari. Frame-anomaly detection only.
+
+### Opting into `uasm`
+
+```
+const gc = new GcProfiler(256, { source: 'uasm' });
+
+// Take a few measurements across the workload:
+await gc.sampleUasm();
+runHotLoop();
+await gc.sampleUasm();
+runHotLoop();
+await gc.sampleUasm();
+
+// Now summary.uasm.growthRate is bytes/sec across that window,
+// and the gate can verify it:
+assertNoGc(gc.summary(), { maxAllocRate: 1 * 1024 * 1024 });
+```
+
+Throws `RangeError` on construction if the API is unavailable or the page is
+not cross-origin-isolated. `summary.uasm` is always present, whether or not
+you opted in -- shape:
+
+```
+{ supported, bytes, peak, firstSample, samples, growthRate }
+```
+
+`growthRate` is 0 with a single sample; needs two points for a delta.
 
 ## Subpaths
 
@@ -262,18 +293,20 @@ Rules: `maxMajor` (default 0), `maxMinor`, `maxPauseMs`, `maxTotalMs`, `maxAlloc
 
 Which rules each source can actually verify:
 
-| rule            | `gc` (node) | `heap` (Chrome) | `none` (Firefox/Safari) |
-| --------------- | :---------: | :-------------: | :---------------------: |
-| `maxMajor`      |     yes     |       no        |           no            |
-| `maxMinor`      |     yes     |       no        |           no            |
-| `maxPauseMs`    |     yes     |       no        |           no            |
-| `maxTotalMs`    |     yes     |       no        |           no            |
-| `maxAllocRate`  | needs heap  |   needs heap    |           no            |
+| rule            | `gc` (node) | `heap` (Chrome) | `uasm` (Chrome, opt-in) | `none` (Firefox/Safari) |
+| --------------- | :---------: | :-------------: | :---------------------: | :---------------------: |
+| `maxMajor`      |     yes     |       no        |           no            |           no            |
+| `maxMinor`      |     yes     |       no        |           no            |           no            |
+| `maxPauseMs`    |     yes     |       no        |           no            |           no            |
+| `maxTotalMs`    |     yes     |       no        |           no            |           no            |
+| `maxAllocRate`  | needs heap  |   needs heap    |       needs uasm        |           no            |
 
-"needs heap" means the rule is verifiable iff `summary.heap.samples >= 2`
-(computing a rate requires at least two heap samples). Feed samples with
-`gc.sampleHeap(now, process.memoryUsage().heapUsed)` in node, or let the
-browser path sample `performance.memory` automatically.
+"needs heap" means the rule is verifiable iff `summary.heap.samples >= 2`.
+"needs uasm" means the rule is verifiable iff `summary.uasm.samples >= 2`
+(computing a growth rate requires at least two measurements). Feed samples
+with `gc.sampleHeap(now, process.memoryUsage().heapUsed)` in node, let the
+browser path sample `performance.memory` automatically for `heap`, or call
+`await gc.sampleUasm()` a few times per window for `uasm`.
 
 The matrix is exported as `VERDICT_MATRIX` for tools that want to render it
 or filter rules to the current source.
