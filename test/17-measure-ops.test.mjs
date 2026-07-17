@@ -266,6 +266,18 @@ test('assertCompareOps: convenience form throws GcBudgetError on delta failure',
         sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
         return i;
     }
+    // Warm V8 before the asserted measurement. Cold -- when this is the first
+    // measureOps call in the process (e.g. run in isolation via
+    // --test-name-pattern, or as the first bench in a CI shard) -- the initial
+    // measurement pays JIT tier-up allocation churn, which inflates the noop
+    // control's bytesPerOp, and can trip a one-off major GC mid-steady-loop that
+    // compacts heapUsed below the steady-start sample, collapsing the retained
+    // candidate delta to 0 (bytesPerOp clamps negative deltas to 0 by design).
+    // Net delta then goes non-positive and no GcBudgetError is thrown. Both
+    // effects vanish once the paths are hot, so measure hot -- standard bench
+    // hygiene, and it makes the assertion order-independent.
+    measureOps(control, { ops: 500, warmup: 50 });
+    measureOps(candidate, { ops: 500, warmup: 50 });
     assert.throws(
         () => assertCompareOps(control, candidate, { maxExtraBytesPerOp: 20 }, { ops: 500, warmup: 50 }),
         GcBudgetError
