@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@zakkster/lite-gc-profiler -- heuristic calibration</title>
+<style>
+  :root {
+    --bg: #030b0a;
+    --bg: oklch(0.14 0.02 170);
+    --fg: #7ff7c8;
+    --fg: oklch(0.87 0.18 165);
+    --dim: #3a9976;
+    --dim: oklch(0.55 0.13 165);
+    --deep: #052318;
+    --deep: oklch(0.22 0.04 170);
+    --grid: #0b2620;
+    --grid: oklch(0.20 0.03 170);
+    --warn: #ffbf5c;
+    --warn: oklch(0.82 0.16 75);
+    --err: #ff7096;
+    --err: oklch(0.72 0.20 10);
+    --ok: #7ff7c8;
+    --ok: oklch(0.87 0.18 165);
+    --font: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    min-height: 100dvh;
+    background-image:
+      repeating-linear-gradient(0deg,  transparent 0, transparent 1.5rem, var(--grid) 1.5rem, var(--grid) calc(1.5rem + 1px)),
+      repeating-linear-gradient(90deg, transparent 0, transparent 1.5rem, var(--grid) 1.5rem, var(--grid) calc(1.5rem + 1px));
+  }
+  header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--dim); background: var(--bg); }
+  header h1 { margin: 0 0 0.35rem 0; font-size: 1rem; font-weight: normal; letter-spacing: 0.05em; }
+  header p { margin: 0; color: var(--dim); font-size: 0.75rem; max-width: 60rem; }
+  header code { background: var(--deep); padding: 0.05rem 0.35rem; border: 1px solid var(--grid); }
+
+  nav#tabs { display: flex; gap: 0.5rem; padding: 0.5rem 1.25rem; border-bottom: 1px solid var(--dim); flex-wrap: wrap; background: var(--bg); }
+  nav#tabs button {
+    background: transparent;
+    border: 1px solid var(--dim);
+    color: var(--dim);
+    padding: 0.35rem 0.85rem;
+    font-family: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+    letter-spacing: 0.08em;
+    text-transform: lowercase;
+  }
+  nav#tabs button.active { color: var(--fg); border-color: var(--fg); }
+  @media (hover: hover) {
+    nav#tabs button:not(.active):hover { color: var(--fg); border-color: var(--fg); }
+  }
+
+  #cap-banner {
+    padding: 0.5rem 1.25rem;
+    border-bottom: 1px solid var(--dim);
+    font-size: 0.7rem;
+    color: var(--dim);
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    background: var(--bg);
+  }
+  #cap-banner .k { color: var(--dim); }
+  #cap-banner .v { color: var(--fg); }
+  #cap-banner .v.off { color: var(--warn); }
+
+  main { padding: 1.25rem; display: grid; gap: 1.25rem; }
+  section.scene { display: none; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+  section.scene.active { display: grid; }
+  section.scene.wide { grid-template-columns: 1fr; }
+  @media (max-width: 780px) {
+    section.scene, section.scene.wide { grid-template-columns: 1fr; }
+    .panel.log-panel { grid-column: 1; }
+  }
+
+  .panel {
+    border: 1px solid var(--dim);
+    padding: 0.85rem 1rem;
+    background: var(--bg);
+  }
+  .panel h2 {
+    margin: 0 0 0.65rem 0;
+    font-size: 0.7rem;
+    font-weight: normal;
+    color: var(--dim);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  .panel.log-panel { grid-column: 1 / -1; }
+  .panel.diagram svg { width: 100%; height: auto; display: block; max-height: 16rem; }
+  .panel.diagram :is(circle, rect).state-node { fill: var(--deep); stroke: var(--dim); stroke-width: 1; }
+  .panel.diagram :is(circle, rect).state-node.active { fill: var(--fg); stroke: var(--fg); }
+  .panel.diagram :is(circle, rect).state-node.warn   { fill: var(--warn); stroke: var(--warn); }
+  /* Labels get a --deep-colored outline via paint-order:stroke-fill so the
+     extreme letters ("observing" barely fits inside r=36 and its O/G ride the
+     circle's --dim stroke line) don't blend into the stroke's darker green.
+     The outline is dark enough to separate from either --dim (inactive) or
+     --fg (active) rims. */
+  .panel.diagram text {
+    fill: var(--fg);
+    font-family: var(--font);
+    font-size: 0.75rem;
+    text-anchor: middle;
+    dominant-baseline: middle;
+    paint-order: stroke fill;
+    stroke: var(--deep);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+  /* setDiagram toggles .active on every [data-state] element -- including
+     text -- so we can invert the text fill directly. Without this, labels
+     on active circles are green-on-green and unreadable. On active nodes
+     the halo becomes counterproductive (dark ring around dark letters
+     against green fill), so drop the outline there. */
+  .panel.diagram text.active { fill: var(--bg); stroke: var(--fg); }
+  .panel.diagram text.warn   { fill: var(--bg); stroke: var(--warn); }
+  .panel.diagram path { stroke: var(--dim); fill: none; stroke-width: 1; }
+  .panel.diagram path.arrow { stroke: var(--fg); }
+
+  .metrics { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1.25rem; font-size: 0.75rem; margin: 0; }
+  .metrics dt { color: var(--dim); }
+  .metrics dd { margin: 0; color: var(--fg); font-variant-numeric: tabular-nums; }
+  .metrics dd.warn { color: var(--warn); }
+  .metrics dd.err  { color: var(--err); }
+  .metrics dd.ok   { color: var(--ok); }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.75rem; align-items: center; }
+  .controls button {
+    background: transparent;
+    border: 1px solid var(--fg);
+    color: var(--fg);
+    padding: 0.35rem 0.85rem;
+    font-family: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+    letter-spacing: 0.08em;
+    text-transform: lowercase;
+  }
+  .controls button:disabled { opacity: 0.35; cursor: not-allowed; border-color: var(--dim); color: var(--dim); }
+  @media (hover: hover) {
+    .controls button:not(:disabled):hover { background: var(--fg); color: var(--bg); }
+  }
+  .controls label { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--dim); font-size: 0.7rem; }
+  .controls input[type=range] { accent-color: var(--fg); width: 8rem; }
+
+  .log {
+    height: 15rem;
+    overflow: auto;
+    padding: 0.6rem 0.75rem;
+    background: var(--deep);
+    border: 1px solid var(--grid);
+    font-size: 0.7rem;
+    color: var(--fg);
+    white-space: pre;
+    scrollbar-width: thin;
+    line-height: 1.4;
+  }
+  .log .row.dim  { color: var(--dim); }
+  .log .row.warn { color: var(--warn); }
+  .log .row.err  { color: var(--err); }
+  .log .row.ok   { color: var(--ok); }
+
+  table.report { border-collapse: collapse; width: 100%; font-size: 0.75rem; margin-top: 0.5rem; }
+  table.report th, table.report td { border: 1px solid var(--grid); padding: 0.4rem 0.65rem; text-align: left; font-variant-numeric: tabular-nums; }
+  table.report th { color: var(--dim); font-weight: normal; letter-spacing: 0.05em; background: var(--deep); }
+  table.report td.hdr { color: var(--dim); }
+  table.report td .badge { display: inline-block; padding: 0 0.35rem; margin-left: 0.5rem; border: 1px solid; font-size: 0.65rem; }
+  table.report td .badge.ok   { color: var(--ok);   border-color: var(--ok); }
+  table.report td .badge.warn { color: var(--warn); border-color: var(--warn); }
+  table.report td .badge.err  { color: var(--err);  border-color: var(--err); }
+  table.report td .badge.na   { color: var(--dim);  border-color: var(--dim); }
+  table.report tr.section td { color: var(--dim); background: var(--deep); letter-spacing: 0.05em; }
+
+  pre.copy {
+    margin: 0.75rem 0 0 0;
+    padding: 0.75rem;
+    background: var(--deep);
+    border: 1px solid var(--grid);
+    font-size: 0.7rem;
+    color: var(--fg);
+    overflow-x: auto;
+    max-height: 20rem;
+    white-space: pre;
+  }
+
+  footer { padding: 1rem 1.25rem; color: var(--dim); font-size: 0.7rem; border-top: 1px solid var(--dim); background: var(--bg); }
+  footer .k { color: var(--dim); }
+  footer .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+  /* Stack panels single-column below ~50rem so controls stay tappable on
+     phones and narrow developer sidebars, and the log panel doesn't get
+     squeezed into an unreadable half-width. */
+  @media (max-width: 50rem) {
+    section.scene.active { grid-template-columns: 1fr; }
+    header h1 { font-size: 0.9rem; }
+    #cap-banner { flex-direction: column; gap: 0.35rem; }
+    main { padding: 0.75rem; }
+    .panel { padding: 0.65rem 0.75rem; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>@zakkster/lite-gc-profiler -- heuristic calibration</h1>
+  <p>Measures the Chrome <code>performance.memory</code> heap-drop heuristic's <b>spurious-drop rate</b> on pooled workloads (should be near zero) and <b>detection rate</b> on leaky workloads (should be positive and stable). Ground truth via <code>performance.measureUserAgentSpecificMemory</code> when cross-origin isolation is available. Open in Chrome.</p>
+</header>
+
+<nav id="tabs">
+  <button data-scene="baseline" class="active">baseline</button>
+  <button data-scene="pooled">pooled</button>
+  <button data-scene="leaky">leaky</button>
+  <button data-scene="report">report</button>
+</nav>
+
+<div id="cap-banner">
+  <span><span class="k">source:</span> <span class="v" id="cap-source">-</span></span>
+  <span><span class="k">performance.memory:</span> <span class="v" id="cap-heap">-</span></span>
+  <span><span class="k">measureUserAgentSpecificMemory:</span> <span class="v" id="cap-uasm">-</span></span>
+  <span><span class="k">crossOriginIsolated:</span> <span class="v" id="cap-coi">-</span></span>
+</div>
+
+<main>
+
+<!-- BASELINE -->
+<section id="scene-baseline" class="scene active">
+  <div class="panel diagram">
+    <h2>state</h2>
+    <svg viewBox="0 0 400 160" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Baseline scene state machine: idle to observing to done">
+      <defs><marker id="arrow-b" viewBox="0 0 6 6" refX="6" refY="3" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="currentColor" stroke="none" /></marker></defs>
+      <g id="diag-baseline">
+        <g><circle class="state-node" data-state="idle" cx="60"  cy="80" r="36" /><text data-state="idle" x="60"  y="80">idle</text></g>
+        <g><circle class="state-node" data-state="obs"  cx="200" cy="80" r="36" /><text data-state="obs"  x="200" y="80">observing</text></g>
+        <g><circle class="state-node" data-state="done" cx="340" cy="80" r="36" /><text data-state="done" x="340" y="80">done</text></g>
+        <path class="arrow" d="M96 80 L164 80" marker-end="url(#arrow-b)" />
+        <path class="arrow" d="M236 80 L304 80" marker-end="url(#arrow-b)" />
+      </g>
+    </svg>
+    <p style="font-size:0.7rem;color:var(--dim);margin:0.5rem 0 0 0">Idle observer for the configured window. Any <code>gcDrops</code> counted here are the machine's spurious floor.</p>
+  </div>
+
+  <div class="panel">
+    <h2>controls / telemetry</h2>
+    <dl class="metrics">
+      <dt>window</dt>          <dd id="m-baseline-win">30 s</dd>
+      <dt>elapsed</dt>          <dd id="m-baseline-elapsed">0.00 s</dd>
+      <dt>frames</dt>           <dd id="m-baseline-frames">0</dd>
+      <dt>gcDrops</dt>          <dd id="m-baseline-drops">0</dd>
+      <dt>heap peak</dt>        <dd id="m-baseline-peak">0 MB</dd>
+      <dt>uasm samples</dt>     <dd id="m-baseline-uasm">0</dd>
+      <dt>uasm growth</dt>      <dd id="m-baseline-uasmg">-</dd>
+      <dt>spurious rate</dt>    <dd id="m-baseline-rate">-</dd>
+    </dl>
+    <div class="controls">
+      <label>window <input type="range" id="ctl-baseline-win" min="5" max="60" step="5" value="30" /></label>
+      <button id="btn-baseline-start">start</button>
+      <button id="btn-baseline-stop" disabled>stop</button>
+      <button id="btn-baseline-reset">reset</button>
+    </div>
+  </div>
+
+  <div class="panel log-panel">
+    <h2>log</h2>
+    <div class="log" id="log-baseline"></div>
+  </div>
+</section>
+
+<!-- POOLED -->
+<section id="scene-pooled" class="scene">
+  <div class="panel diagram">
+    <h2>state</h2>
+    <svg viewBox="0 0 400 160" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pooled scene state machine: idle to pooled to done">
+      <defs><marker id="arrow-p" viewBox="0 0 6 6" refX="6" refY="3" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="currentColor" stroke="none" /></marker></defs>
+      <g id="diag-pooled">
+        <g><circle class="state-node" data-state="idle" cx="60"  cy="80" r="36" /><text data-state="idle" x="60"  y="80">idle</text></g>
+        <g><circle class="state-node" data-state="obs"  cx="200" cy="80" r="36" /><text data-state="obs"  x="200" y="80">pooled</text></g>
+        <g><circle class="state-node" data-state="done" cx="340" cy="80" r="36" /><text data-state="done" x="340" y="80">done</text></g>
+        <path class="arrow" d="M96 80 L164 80" marker-end="url(#arrow-p)" />
+        <path class="arrow" d="M236 80 L304 80" marker-end="url(#arrow-p)" />
+      </g>
+    </svg>
+    <p style="font-size:0.7rem;color:var(--dim);margin:0.5rem 0 0 0">Ring-buffered <code>Uint32Array</code> pool, one write per frame, no allocations after warmup. Any <code>gcDrops</code> counted are false positives.</p>
+  </div>
+
+  <div class="panel">
+    <h2>controls / telemetry</h2>
+    <dl class="metrics">
+      <dt>window</dt>          <dd id="m-pooled-win">30 s</dd>
+      <dt>elapsed</dt>          <dd id="m-pooled-elapsed">0.00 s</dd>
+      <dt>frames</dt>           <dd id="m-pooled-frames">0</dd>
+      <dt>writes/frame</dt>     <dd id="m-pooled-writes">64</dd>
+      <dt>gcDrops (heuristic)</dt><dd id="m-pooled-drops">0</dd>
+      <dt>heap peak</dt>        <dd id="m-pooled-peak">0 MB</dd>
+      <dt>uasm bytes @ start</dt><dd id="m-pooled-us">-</dd>
+      <dt>uasm bytes @ end</dt> <dd id="m-pooled-ue">-</dd>
+      <dt>uasm net</dt>         <dd id="m-pooled-un">-</dd>
+      <dt>spurious rate</dt>    <dd id="m-pooled-rate">-</dd>
+    </dl>
+    <div class="controls">
+      <label>window <input type="range" id="ctl-pooled-win"    min="5"  max="60"  step="5" value="30" /></label>
+      <label>writes <input type="range" id="ctl-pooled-writes" min="16" max="512" step="16" value="64" /></label>
+      <button id="btn-pooled-start">start</button>
+      <button id="btn-pooled-stop" disabled>stop</button>
+      <button id="btn-pooled-reset">reset</button>
+    </div>
+  </div>
+
+  <div class="panel log-panel">
+    <h2>log</h2>
+    <div class="log" id="log-pooled"></div>
+  </div>
+</section>
+
+<!-- LEAKY -->
+<section id="scene-leaky" class="scene">
+  <div class="panel diagram">
+    <h2>state</h2>
+    <svg viewBox="0 0 400 160" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Leaky scene state machine: idle to alloc to release, cycling until done">
+      <defs><marker id="arrow-l" viewBox="0 0 6 6" refX="6" refY="3" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="currentColor" stroke="none" /></marker></defs>
+      <g id="diag-leaky">
+        <g><circle class="state-node" data-state="idle"    cx="60"  cy="80" r="36" /><text data-state="idle"    x="60"  y="80">idle</text></g>
+        <g><circle class="state-node" data-state="alloc"   cx="180" cy="80" r="36" /><text data-state="alloc"   x="180" y="80">alloc</text></g>
+        <g><circle class="state-node" data-state="release" cx="300" cy="80" r="36" /><text data-state="release" x="300" y="80">release</text></g>
+        <g><circle class="state-node" data-state="done"    cx="200" cy="140" r="20" /><text data-state="done"    x="200" y="140" style="font-size:0.65rem">done</text></g>
+        <path class="arrow" d="M96 80 L144 80"  marker-end="url(#arrow-l)" />
+        <path class="arrow" d="M216 80 L264 80" marker-end="url(#arrow-l)" />
+        <path class="arrow" d="M300 116 Q240 130 200 122" marker-end="url(#arrow-l)" />
+      </g>
+    </svg>
+    <p style="font-size:0.7rem;color:var(--dim);margin:0.5rem 0 0 0">Allocates <code>Uint32Array</code> of ~<span id="cfg-leaky-size">4</span> KB per frame; retains for N frames then releases the batch. Every release is a candidate GC event.</p>
+  </div>
+
+  <div class="panel">
+    <h2>controls / telemetry</h2>
+    <dl class="metrics">
+      <dt>window</dt>              <dd id="m-leaky-win">30 s</dd>
+      <dt>elapsed</dt>              <dd id="m-leaky-elapsed">0.00 s</dd>
+      <dt>frames</dt>               <dd id="m-leaky-frames">0</dd>
+      <dt>release events</dt>       <dd id="m-leaky-rel">0</dd>
+      <dt>bytes retained (peak)</dt><dd id="m-leaky-ret">0 KB</dd>
+      <dt>gcDrops (heuristic)</dt>  <dd id="m-leaky-drops">0</dd>
+      <dt>heap peak</dt>            <dd id="m-leaky-peak">0 MB</dd>
+      <dt>uasm bytes @ start</dt>   <dd id="m-leaky-us">-</dd>
+      <dt>uasm bytes @ end</dt>     <dd id="m-leaky-ue">-</dd>
+      <dt>detection rate</dt>       <dd id="m-leaky-rate">-</dd>
+    </dl>
+    <div class="controls">
+      <label>window <input type="range" id="ctl-leaky-win"    min="5"  max="60"  step="5" value="30" /></label>
+      <label>retain <input type="range" id="ctl-leaky-retain" min="15" max="240" step="15" value="60" /></label>
+      <button id="btn-leaky-start">start</button>
+      <button id="btn-leaky-stop" disabled>stop</button>
+      <button id="btn-leaky-reset">reset</button>
+    </div>
+  </div>
+
+  <div class="panel log-panel">
+    <h2>log</h2>
+    <div class="log" id="log-leaky"></div>
+  </div>
+</section>
+
+<!-- REPORT -->
+<section id="scene-report" class="scene wide">
+  <div class="panel">
+    <h2>calibration report</h2>
+    <p style="font-size:0.7rem;color:var(--dim);margin:0 0 0.5rem 0">
+      Numbers reflect one run per scene. Re-run scenes for tighter estimates. The <code>uasm</code> column is ground truth when cross-origin isolation is available; otherwise the profiler-only column stands alone.
+    </p>
+    <table class="report" id="report-table">
+      <thead><tr><th>scene</th><th>duration</th><th>heuristic <code>gcDrops</code></th><th>rate</th><th>uasm net (bytes)</th><th>verdict</th></tr></thead>
+      <tbody id="report-body">
+        <tr><td colspan="6" style="color:var(--dim)">Run baseline, pooled, and leaky scenes to populate.</td></tr>
+      </tbody>
+    </table>
+    <div class="controls">
+      <button id="btn-copy-md">copy README fragment</button>
+      <button id="btn-copy-json">copy JSON</button>
+      <button id="btn-reset-all">reset all</button>
+    </div>
+    <pre class="copy" id="report-preview">(select a copy action)</pre>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div><span class="k">machine:</span> <span class="v" id="fp-line">-</span></div>
+  <div style="margin-top:0.35rem"><span class="k">profiler:</span> <span class="v">@zakkster/lite-gc-profiler v<span id="fp-ver">-</span></span></div>
+  <div style="margin-top:0.35rem;font-size:0.65rem">Copyright &copy; Zahary Shinikchiev &middot; single-file demo, no build step</div>
+</footer>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-gc-profiler": "https://esm.sh/@zakkster/lite-gc-profiler@1.2.0"
+  }
+}
+</script>
+
+<script type="module">
+import { GcProfiler, captureFingerprint, VERSION } from '@zakkster/lite-gc-profiler';
+
+// ---- constants (precomputed, referenced from hot paths) ----
+// Two update cadences: elapsed alone updates every 4 frames (cheap textContent
+// write, no summary() call, no ring iteration) so the time reads smoothly at
+// ~15Hz on 60fps displays / ~30Hz on 120Hz ProMotion. The heavier summary-
+// backed metrics stay throttled to every 16 frames (~4-8Hz) so they don't
+// dominate the frame budget or pressure the very allocator we're measuring.
+const ELAPSED_MASK = 3;
+const FRAME_MASK = 15;
+const RING_BITS = 10;
+const RING_SIZE = 1 << RING_BITS;
+const RING_MASK = RING_SIZE - 1;
+const SLOT_WORDS = 1024;                    // Uint32Array(1024) = 4 KB slot
+const SLOT_BYTES = SLOT_WORDS * 4;
+const MB = 1024 * 1024;
+const KB = 1024;
+
+// ---- capability probe ----
+const HAS_HEAP = typeof performance !== 'undefined' && !!performance.memory
+              && typeof performance.memory.usedJSHeapSize === 'number';
+const HAS_UASM_API = typeof performance !== 'undefined'
+                  && typeof performance.measureUserAgentSpecificMemory === 'function';
+const COI = typeof globalThis !== 'undefined' && globalThis.crossOriginIsolated === true;
+const CAN_UASM = HAS_UASM_API && COI;
+
+// ---- cached DOM refs (all at init, no lookups in hot paths) ----
+const $tabs   = document.querySelectorAll('nav#tabs button');
+const $scenes = document.querySelectorAll('section.scene');
+
+const $capSource = document.getElementById('cap-source');
+const $capHeap   = document.getElementById('cap-heap');
+const $capUasm   = document.getElementById('cap-uasm');
+const $capCoi    = document.getElementById('cap-coi');
+const $fpLine    = document.getElementById('fp-line');
+const $fpVer     = document.getElementById('fp-ver');
+
+const $reportBody    = document.getElementById('report-body');
+const $reportPreview = document.getElementById('report-preview');
+
+// per-scene metric nodes, grouped for locality
+const $bl = {
+    diag: document.getElementById('diag-baseline'),
+    win: document.getElementById('m-baseline-win'),
+    elapsed: document.getElementById('m-baseline-elapsed'),
+    frames: document.getElementById('m-baseline-frames'),
+    drops: document.getElementById('m-baseline-drops'),
+    peak: document.getElementById('m-baseline-peak'),
+    uasm: document.getElementById('m-baseline-uasm'),
+    uasmg: document.getElementById('m-baseline-uasmg'),
+    rate: document.getElementById('m-baseline-rate'),
+    winCtl: document.getElementById('ctl-baseline-win'),
+    log: document.getElementById('log-baseline'),
+    btnStart: document.getElementById('btn-baseline-start'),
+    btnStop: document.getElementById('btn-baseline-stop'),
+    btnReset: document.getElementById('btn-baseline-reset')
+};
+const $po = {
+    diag: document.getElementById('diag-pooled'),
+    win: document.getElementById('m-pooled-win'),
+    elapsed: document.getElementById('m-pooled-elapsed'),
+    frames: document.getElementById('m-pooled-frames'),
+    writes: document.getElementById('m-pooled-writes'),
+    drops: document.getElementById('m-pooled-drops'),
+    peak: document.getElementById('m-pooled-peak'),
+    us: document.getElementById('m-pooled-us'),
+    ue: document.getElementById('m-pooled-ue'),
+    un: document.getElementById('m-pooled-un'),
+    rate: document.getElementById('m-pooled-rate'),
+    winCtl: document.getElementById('ctl-pooled-win'),
+    writesCtl: document.getElementById('ctl-pooled-writes'),
+    log: document.getElementById('log-pooled'),
+    btnStart: document.getElementById('btn-pooled-start'),
+    btnStop: document.getElementById('btn-pooled-stop'),
+    btnReset: document.getElementById('btn-pooled-reset')
+};
+const $le = {
+    diag: document.getElementById('diag-leaky'),
+    cfgSize: document.getElementById('cfg-leaky-size'),
+    win: document.getElementById('m-leaky-win'),
+    elapsed: document.getElementById('m-leaky-elapsed'),
+    frames: document.getElementById('m-leaky-frames'),
+    rel: document.getElementById('m-leaky-rel'),
+    ret: document.getElementById('m-leaky-ret'),
+    drops: document.getElementById('m-leaky-drops'),
+    peak: document.getElementById('m-leaky-peak'),
+    us: document.getElementById('m-leaky-us'),
+    ue: document.getElementById('m-leaky-ue'),
+    rate: document.getElementById('m-leaky-rate'),
+    winCtl: document.getElementById('ctl-leaky-win'),
+    retainCtl: document.getElementById('ctl-leaky-retain'),
+    log: document.getElementById('log-leaky'),
+    btnStart: document.getElementById('btn-leaky-start'),
+    btnStop: document.getElementById('btn-leaky-stop'),
+    btnReset: document.getElementById('btn-leaky-reset')
+};
+
+// ---- populate capability banner + machine fingerprint ----
+$capSource.textContent = HAS_HEAP ? 'heap' : 'none';
+$capHeap.textContent   = HAS_HEAP    ? 'yes' : 'no';
+$capUasm.textContent   = HAS_UASM_API ? 'yes' : 'no';
+$capCoi.textContent    = COI ? 'yes' : 'no';
+if (!HAS_HEAP)   $capHeap.classList.add('off');
+if (!HAS_UASM_API) $capUasm.classList.add('off');
+if (!COI)        $capCoi.classList.add('off');
+$fpVer.textContent = VERSION;
+{
+    const fp = captureFingerprint();
+    $fpLine.textContent = (fp.platform || '?') + ' ' + (fp.arch || '?')
+        + ' | v8 ' + (fp.v8 || '?')
+        + ' | node ' + (fp.node || 'browser')
+        + ' | ua ' + (typeof navigator !== 'undefined' ? navigator.userAgent : '?').slice(0, 80);
+}
+$le.cfgSize.textContent = (SLOT_BYTES / KB).toFixed(0);
+
+// ---- tab switching ----
+for (const btn of $tabs) {
+    btn.addEventListener('pointerdown', () => {
+        const target = btn.dataset.scene;
+        for (const b of $tabs) b.classList.toggle('active', b.dataset.scene === target);
+        for (const s of $scenes) s.classList.toggle('active', s.id === 'scene-' + target);
+        if (target === 'report') renderReport();
+    });
+}
+
+// ---- diagram state helpers ----
+// Cache each diagram's node lists at init so the per-frame setDiagram calls
+// in the leaky scene don't allocate a NodeList every tick.
+const DIAG_CACHE = new WeakMap();
+function cacheDiagram(root) { DIAG_CACHE.set(root, Array.from(root.querySelectorAll('[data-state]'))); }
+function setDiagram(root, activeState) {
+    const nodes = DIAG_CACHE.get(root);
+    if (!nodes) return;
+    for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        n.classList.toggle('active', n.dataset.state === activeState);
+    }
+}
+cacheDiagram($bl.diag); cacheDiagram($po.diag); cacheDiagram($le.diag);
+setDiagram($bl.diag, 'idle');
+setDiagram($po.diag, 'idle');
+setDiagram($le.diag, 'idle');
+
+// ---- log helpers (zero-alloc friendly: use textContent append, no innerHTML) ----
+// Capped at LOG_MAX rows to prevent DOM buildup during long calibration runs;
+// unbounded appendChild triggers layout thrash and eventual GC that would
+// contaminate the very heuristic we're calibrating.
+const LOG_MAX = 100;
+function logRow(node, cls, text) {
+    while (node.childElementCount >= LOG_MAX) node.removeChild(node.firstElementChild);
+    const row = document.createElement('div');
+    row.className = 'row ' + (cls || '');
+    row.textContent = text;
+    node.appendChild(row);
+    node.scrollTop = node.scrollHeight;
+}
+
+// ---- results store, consumed by the report ----
+const RESULTS = { baseline: null, pooled: null, leaky: null };
+
+// =============================================================================
+// BASELINE SCENE
+// =============================================================================
+const BL_STATE = { running: false, gc: null, startedAt: 0, windowMs: 30_000, uasmSamples: [] };
+
+$bl.winCtl.addEventListener('input', () => {
+    const s = +$bl.winCtl.value;
+    BL_STATE.windowMs = s * 1000;
+    $bl.win.textContent = s + ' s';
+});
+$bl.btnReset.addEventListener('pointerdown', resetBaseline);
+$bl.btnStop.addEventListener('pointerdown',  () => { stopBaseline('user stop'); });
+$bl.btnStart.addEventListener('pointerdown', startBaseline);
+
+function resetBaseline() {
+    if (BL_STATE.gc) {
+        try { BL_STATE.gc.destroy(); }
+        catch (e) { logRow($bl.log, 'err', '[reset:err] ' + (e && e.message ? e.message : String(e))); }
+        BL_STATE.gc = null;
+    }
+    BL_STATE.running = false; BL_STATE.uasmSamples.length = 0;
+    BL_STATE.uasmInFlight = false;              // clear any stale in-flight guard from a prior run
+    $bl.elapsed.textContent = '0.00 s';
+    $bl.frames.textContent = '0';
+    $bl.drops.textContent = '0';
+    $bl.peak.textContent = '0 MB';
+    $bl.uasm.textContent = '0';
+    $bl.uasmg.textContent = '-';
+    $bl.rate.textContent = '-';
+    $bl.rate.className = '';
+    setDiagram($bl.diag, 'idle');
+    $bl.btnStart.disabled = false; $bl.btnStop.disabled = true;
+    logRow($bl.log, 'dim', '[reset]');
+}
+
+async function startBaseline() {
+    resetBaseline();
+    BL_STATE.gc = new GcProfiler(256);          // browser: source becomes 'heap' or 'none'
+    BL_STATE.gc.start();
+    BL_STATE.running = true;
+    BL_STATE.startedAt = performance.now();
+    setDiagram($bl.diag, 'obs');
+    $bl.btnStart.disabled = true; $bl.btnStop.disabled = false;
+    logRow($bl.log, 'ok', '[start] window=' + (BL_STATE.windowMs / 1000).toFixed(0) + 's, source=' + BL_STATE.gc.source);
+    if (CAN_UASM) {
+        const r = await BL_STATE.gc.sampleUasm();
+        if (r.supported) BL_STATE.uasmSamples.push(r.bytes);
+    }
+    requestAnimationFrame(baselineTick);
+}
+
+let BL_FRAMES = 0;                              // module-scope counters (no per-frame const alloc)
+function baselineTick(now) {
+    if (!BL_STATE.running) return;
+    BL_FRAMES++;
+    // sample heap opportunistically -- this is what feeds the gcDrops heuristic
+    BL_STATE.gc.sampleHeap(now);
+    BL_STATE.gc.markFrame(0);                   // baseline: no work, mark 0-ms frames
+    const elapsed = now - BL_STATE.startedAt;
+    // Elapsed on its own faster cadence for a smooth display.
+    if ((BL_FRAMES & ELAPSED_MASK) === 0) $bl.elapsed.textContent = (elapsed / 1000).toFixed(2) + ' s';
+    // Full telemetry (summary-backed) throttled coarser.
+    if ((BL_FRAMES & FRAME_MASK) === 0) updateBaselineTelemetry(elapsed);
+    if (elapsed >= BL_STATE.windowMs) {
+        stopBaseline('window complete');
+        return;
+    }
+    // Fire-and-forget uasm mid-run. Never await in the tick body --
+    // measureUserAgentSpecificMemory can take multi-second time (Chrome may
+    // force a GC to measure), which would drop hundreds of frames from the
+    // baseline window and skew every derived metric.
+    if (CAN_UASM && !BL_STATE.uasmInFlight && BL_STATE.uasmSamples.length < 3
+        && elapsed > (BL_STATE.uasmSamples.length * BL_STATE.windowMs / 3)) {
+        BL_STATE.uasmInFlight = true;
+        BL_STATE.gc.sampleUasm(now).then((r) => {
+            if (r.supported) BL_STATE.uasmSamples.push(r.bytes);
+            BL_STATE.uasmInFlight = false;
+        }, () => { BL_STATE.uasmInFlight = false; });
+    }
+    requestAnimationFrame(baselineTick);
+}
+
+function updateBaselineTelemetry(elapsed) {
+    const s = BL_STATE.gc.summary();
+    // elapsed handled per-ELAPSED_MASK in the tick for smoother updates
+    $bl.frames.textContent  = BL_FRAMES.toString();
+    $bl.drops.textContent   = s.heap.gcDrops.toString();
+    $bl.peak.textContent    = (s.heap.peak / MB).toFixed(2) + ' MB';
+    $bl.uasm.textContent    = s.uasm.samples.toString();
+    if (s.uasm.samples >= 2) $bl.uasmg.textContent = (s.uasm.growthRate / KB).toFixed(2) + ' KB/s';
+}
+
+async function stopBaseline(reason) {
+    if (!BL_STATE.running) return;
+    BL_STATE.running = false;
+    BL_STATE.gc.stop();
+    // Snap the elapsed reading to the true final value. The tick-throttled
+    // ELAPSED_MASK writes stop up to ~67ms before the exit fires, so without
+    // this the field would freeze at ~29.95s while the window actually ran
+    // the full 30s+. Making the final read match reality also confirms to
+    // the user that the scene completed the requested window.
+    const elapsedSec = (performance.now() - BL_STATE.startedAt) / 1000;
+    $bl.elapsed.textContent = elapsedSec.toFixed(2) + ' s';
+    // Immediate UI feedback: the run is over as far as the user is concerned,
+    // even if the final uasm sample takes seconds to resolve. Everything that
+    // depends on the final sample lands after the await below.
+    setDiagram($bl.diag, 'done');
+    $bl.btnStart.disabled = false; $bl.btnStop.disabled = true;
+    if (CAN_UASM) {
+        try {
+            const r = await BL_STATE.gc.sampleUasm();
+            if (r.supported) BL_STATE.uasmSamples.push(r.bytes);
+        } catch (e) {
+            logRow($bl.log, 'warn', '[uasm:err] ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+    const s = BL_STATE.gc.summary();
+    const rate = elapsedSec > 0 ? s.heap.gcDrops / elapsedSec : 0;
+    $bl.rate.textContent = rate.toFixed(3) + ' drops/s';
+    $bl.rate.className = rate < 0.01 ? 'ok' : (rate < 0.1 ? 'warn' : 'err');
+    RESULTS.baseline = {
+        scene: 'baseline',
+        durationSec: elapsedSec,
+        gcDrops: s.heap.gcDrops,
+        frames: BL_FRAMES,
+        heapPeakBytes: s.heap.peak,
+        uasmSamples: BL_STATE.uasmSamples.slice(),
+        uasmNetBytes: BL_STATE.uasmSamples.length >= 2 ? (BL_STATE.uasmSamples[BL_STATE.uasmSamples.length - 1] - BL_STATE.uasmSamples[0]) : null,
+        spuriousRatePerSec: rate
+    };
+    logRow($bl.log, 'ok', '[stop:' + reason + '] drops=' + s.heap.gcDrops + ' rate=' + rate.toFixed(3) + '/s' + (RESULTS.baseline.uasmNetBytes !== null ? ' uasmNet=' + RESULTS.baseline.uasmNetBytes + 'B' : ''));
+    BL_FRAMES = 0;
+}
+
+// =============================================================================
+// POOLED SCENE
+// =============================================================================
+// Pre-allocated Uint32Array pool (allocated once at scene init, reused forever)
+const POOL = new Array(RING_SIZE);
+for (let i = 0; i < RING_SIZE; i++) POOL[i] = new Uint32Array(SLOT_WORDS);
+
+const PO_STATE = { running: false, gc: null, startedAt: 0, windowMs: 30_000, writesPerFrame: 64, uasmStart: null, uasmEnd: null };
+let PO_FRAMES = 0;
+let PO_CURSOR = 0;                              // ring position, module-scope to avoid per-frame stack alloc
+
+$po.winCtl.addEventListener('input', () => {
+    const s = +$po.winCtl.value;
+    PO_STATE.windowMs = s * 1000;
+    $po.win.textContent = s + ' s';
+});
+$po.writesCtl.addEventListener('input', () => {
+    const w = +$po.writesCtl.value;
+    PO_STATE.writesPerFrame = w;
+    $po.writes.textContent = w.toString();
+});
+$po.btnReset.addEventListener('pointerdown', resetPooled);
+$po.btnStop.addEventListener('pointerdown',  () => { stopPooled('user stop'); });
+$po.btnStart.addEventListener('pointerdown', startPooled);
+
+function resetPooled() {
+    if (PO_STATE.gc) {
+        try { PO_STATE.gc.destroy(); }
+        catch (e) { logRow($po.log, 'err', '[reset:err] ' + (e && e.message ? e.message : String(e))); }
+        PO_STATE.gc = null;
+    }
+    PO_STATE.running = false; PO_STATE.uasmStart = null; PO_STATE.uasmEnd = null;
+    $po.elapsed.textContent = '0.00 s';
+    $po.frames.textContent = '0';
+    $po.drops.textContent = '0';
+    $po.peak.textContent = '0 MB';
+    $po.us.textContent = '-'; $po.ue.textContent = '-'; $po.un.textContent = '-';
+    $po.rate.textContent = '-'; $po.rate.className = '';
+    setDiagram($po.diag, 'idle');
+    $po.btnStart.disabled = false; $po.btnStop.disabled = true;
+    logRow($po.log, 'dim', '[reset] pool=' + RING_SIZE + ' slots x ' + SLOT_BYTES + 'B = ' + ((RING_SIZE * SLOT_BYTES) / MB).toFixed(1) + ' MB pre-allocated');
+}
+
+async function startPooled() {
+    resetPooled();
+    PO_STATE.gc = new GcProfiler(256);
+    PO_STATE.gc.start();
+    PO_STATE.running = true;
+    PO_STATE.startedAt = performance.now();
+    setDiagram($po.diag, 'obs');
+    $po.btnStart.disabled = true; $po.btnStop.disabled = false;
+    logRow($po.log, 'ok', '[start] window=' + (PO_STATE.windowMs / 1000).toFixed(0) + 's, writes/frame=' + PO_STATE.writesPerFrame);
+    if (CAN_UASM) {
+        const r = await PO_STATE.gc.sampleUasm();
+        if (r.supported) { PO_STATE.uasmStart = r.bytes; $po.us.textContent = fmtBytes(r.bytes); }
+    }
+    requestAnimationFrame(pooledTick);
+}
+
+function pooledTick(now) {
+    if (!PO_STATE.running) return;
+    PO_FRAMES++;
+    // hot path: writes into pre-allocated ring, zero allocation
+    const writes = PO_STATE.writesPerFrame;
+    for (let w = 0; w < writes; w++) {
+        const slot = POOL[PO_CURSOR & RING_MASK];
+        // touch a few words so V8 doesn't optimize this away entirely
+        slot[0] = PO_CURSOR;
+        slot[SLOT_WORDS - 1] = PO_CURSOR ^ 0x9e3779b9;
+        PO_CURSOR = (PO_CURSOR + 1) | 0;
+    }
+    PO_STATE.gc.sampleHeap(now);
+    PO_STATE.gc.markFrame(0);
+    const elapsed = now - PO_STATE.startedAt;
+    if ((PO_FRAMES & ELAPSED_MASK) === 0) $po.elapsed.textContent = (elapsed / 1000).toFixed(2) + ' s';
+    if ((PO_FRAMES & FRAME_MASK) === 0) updatePooledTelemetry(elapsed);
+    if (elapsed >= PO_STATE.windowMs) { stopPooled('window complete'); return; }
+    requestAnimationFrame(pooledTick);
+}
+
+function updatePooledTelemetry(elapsed) {
+    const s = PO_STATE.gc.summary();
+    // elapsed handled per-ELAPSED_MASK in the tick
+    $po.frames.textContent  = PO_FRAMES.toString();
+    $po.drops.textContent   = s.heap.gcDrops.toString();
+    $po.peak.textContent    = (s.heap.peak / MB).toFixed(2) + ' MB';
+}
+
+async function stopPooled(reason) {
+    if (!PO_STATE.running) return;
+    PO_STATE.running = false;
+    PO_STATE.gc.stop();
+    const elapsedSec = (performance.now() - PO_STATE.startedAt) / 1000;
+    $po.elapsed.textContent = elapsedSec.toFixed(2) + ' s';
+    setDiagram($po.diag, 'done');
+    $po.btnStart.disabled = false; $po.btnStop.disabled = true;
+    if (CAN_UASM) {
+        try {
+            const r = await PO_STATE.gc.sampleUasm();
+            if (r.supported) { PO_STATE.uasmEnd = r.bytes; $po.ue.textContent = fmtBytes(r.bytes); }
+        } catch (e) {
+            logRow($po.log, 'warn', '[uasm:err] ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+    const s = PO_STATE.gc.summary();
+    const rate = elapsedSec > 0 ? s.heap.gcDrops / elapsedSec : 0;
+    $po.rate.textContent = rate.toFixed(3) + ' drops/s';
+    // pooled work should show near-zero drops; any drops are false positives
+    $po.rate.className = rate < 0.01 ? 'ok' : (rate < 0.05 ? 'warn' : 'err');
+    if (PO_STATE.uasmStart !== null && PO_STATE.uasmEnd !== null) {
+        $po.un.textContent = fmtBytes(PO_STATE.uasmEnd - PO_STATE.uasmStart);
+    }
+    RESULTS.pooled = {
+        scene: 'pooled',
+        durationSec: elapsedSec,
+        gcDrops: s.heap.gcDrops,
+        frames: PO_FRAMES,
+        writesPerFrame: PO_STATE.writesPerFrame,
+        heapPeakBytes: s.heap.peak,
+        uasmStartBytes: PO_STATE.uasmStart,
+        uasmEndBytes: PO_STATE.uasmEnd,
+        uasmNetBytes: (PO_STATE.uasmStart !== null && PO_STATE.uasmEnd !== null) ? (PO_STATE.uasmEnd - PO_STATE.uasmStart) : null,
+        spuriousRatePerSec: rate
+    };
+    logRow($po.log, 'ok', '[stop:' + reason + '] drops=' + s.heap.gcDrops + ' rate=' + rate.toFixed(3) + '/s');
+    PO_FRAMES = 0;
+}
+
+// =============================================================================
+// LEAKY SCENE
+// =============================================================================
+// The one scene that DOES allocate on purpose: each frame produces one fresh
+// Uint32Array. The retained pool below is pre-sized to the slider's ceiling
+// so the JS array itself never grows -- otherwise V8's power-of-two
+// backing-store expansion (0->2->4->...->256) would fold hidden reallocations
+// into the workload and pollute the measurement.
+const LE_MAX_RETAIN = 240;                          // matches ctl-leaky-retain slider max
+const LE_RETAINED = new Array(LE_MAX_RETAIN);       // slot store; entries are Uint32Array | null
+const LE_STATE = { running: false, gc: null, startedAt: 0, windowMs: 30_000, retainFrames: 60, retainedIdx: 0, releaseEvents: 0, peakRetained: 0, uasmStart: null, uasmEnd: null };
+let LE_FRAMES = 0;
+
+$le.winCtl.addEventListener('input', () => {
+    const s = +$le.winCtl.value;
+    LE_STATE.windowMs = s * 1000;
+    $le.win.textContent = s + ' s';
+});
+$le.retainCtl.addEventListener('input', () => {
+    LE_STATE.retainFrames = +$le.retainCtl.value;
+});
+$le.btnReset.addEventListener('pointerdown', resetLeaky);
+$le.btnStop.addEventListener('pointerdown',  () => { stopLeaky('user stop'); });
+$le.btnStart.addEventListener('pointerdown', startLeaky);
+
+function resetLeaky() {
+    if (LE_STATE.gc) {
+        try { LE_STATE.gc.destroy(); }
+        catch (e) { logRow($le.log, 'err', '[reset:err] ' + (e && e.message ? e.message : String(e))); }
+        LE_STATE.gc = null;
+    }
+    LE_STATE.running = false;
+    // null out any retained slots so previous-run refs are freed
+    for (let i = 0; i < LE_MAX_RETAIN; i++) LE_RETAINED[i] = null;
+    LE_STATE.retainedIdx = 0;
+    LE_STATE.releaseEvents = 0;
+    LE_STATE.peakRetained = 0;
+    LE_STATE.uasmStart = null; LE_STATE.uasmEnd = null;
+    $le.elapsed.textContent = '0.00 s';
+    $le.frames.textContent = '0';
+    $le.rel.textContent = '0';
+    $le.ret.textContent = '0 KB';
+    $le.drops.textContent = '0';
+    $le.peak.textContent = '0 MB';
+    $le.us.textContent = '-'; $le.ue.textContent = '-';
+    $le.rate.textContent = '-'; $le.rate.className = '';
+    setDiagram($le.diag, 'idle');
+    $le.btnStart.disabled = false; $le.btnStop.disabled = true;
+    logRow($le.log, 'dim', '[reset] slot=' + SLOT_BYTES + 'B, release every ' + LE_STATE.retainFrames + ' frames');
+}
+
+async function startLeaky() {
+    resetLeaky();
+    LE_STATE.gc = new GcProfiler(256);
+    LE_STATE.gc.start();
+    LE_STATE.running = true;
+    LE_STATE.startedAt = performance.now();
+    setDiagram($le.diag, 'alloc');
+    $le.btnStart.disabled = true; $le.btnStop.disabled = false;
+    logRow($le.log, 'ok', '[start] window=' + (LE_STATE.windowMs / 1000).toFixed(0) + 's, retain=' + LE_STATE.retainFrames + ' frames');
+    if (CAN_UASM) {
+        const r = await LE_STATE.gc.sampleUasm();
+        if (r.supported) { LE_STATE.uasmStart = r.bytes; $le.us.textContent = fmtBytes(r.bytes); }
+    }
+    requestAnimationFrame(leakyTick);
+}
+
+function leakyTick(now) {
+    if (!LE_STATE.running) return;
+    LE_FRAMES++;
+    // Allocate + retain: this is the workload under test. Pool store is
+    // pre-allocated so the only allocation on the hot path is the intended
+    // Uint32Array; no hidden JS-array-growth reallocations get folded in.
+    // Clamp to LE_MAX_RETAIN just in case the slider ceiling is ever raised
+    // without touching the pool size.
+    if (LE_STATE.retainedIdx < LE_MAX_RETAIN) {
+        const arr = new Uint32Array(SLOT_WORDS);
+        arr[0] = LE_FRAMES;                     // touch so V8 keeps it
+        LE_RETAINED[LE_STATE.retainedIdx++] = arr;
+        if (LE_STATE.retainedIdx > LE_STATE.peakRetained) LE_STATE.peakRetained = LE_STATE.retainedIdx;
+    }
+    // release event: drop refs so GC can collect
+    if (LE_STATE.retainedIdx >= LE_STATE.retainFrames) {
+        for (let i = 0; i < LE_STATE.retainedIdx; i++) LE_RETAINED[i] = null;
+        LE_STATE.retainedIdx = 0;
+        LE_STATE.releaseEvents++;
+        setDiagram($le.diag, 'release');
+    } else if (LE_STATE.retainedIdx === 1) {
+        // only toggle back to 'alloc' on the first frame of a new cycle
+        setDiagram($le.diag, 'alloc');
+    }
+    LE_STATE.gc.sampleHeap(now);
+    LE_STATE.gc.markFrame(0);
+    const elapsed = now - LE_STATE.startedAt;
+    if ((LE_FRAMES & ELAPSED_MASK) === 0) $le.elapsed.textContent = (elapsed / 1000).toFixed(2) + ' s';
+    if ((LE_FRAMES & FRAME_MASK) === 0) updateLeakyTelemetry(elapsed);
+    if (elapsed >= LE_STATE.windowMs) { stopLeaky('window complete'); return; }
+    requestAnimationFrame(leakyTick);
+}
+
+function updateLeakyTelemetry(elapsed) {
+    const s = LE_STATE.gc.summary();
+    // elapsed handled per-ELAPSED_MASK in the tick
+    $le.frames.textContent  = LE_FRAMES.toString();
+    $le.rel.textContent     = LE_STATE.releaseEvents.toString();
+    $le.ret.textContent     = ((LE_STATE.peakRetained * SLOT_BYTES) / KB).toFixed(0) + ' KB';
+    $le.drops.textContent   = s.heap.gcDrops.toString();
+    $le.peak.textContent    = (s.heap.peak / MB).toFixed(2) + ' MB';
+}
+
+async function stopLeaky(reason) {
+    if (!LE_STATE.running) return;
+    LE_STATE.running = false;
+    LE_STATE.gc.stop();
+    const elapsedSec = (performance.now() - LE_STATE.startedAt) / 1000;
+    $le.elapsed.textContent = elapsedSec.toFixed(2) + ' s';
+    // Drop everything in the pool so GC can collect the last cycle's arrays.
+    for (let i = 0; i < LE_STATE.retainedIdx; i++) LE_RETAINED[i] = null;
+    LE_STATE.retainedIdx = 0;
+    setDiagram($le.diag, 'done');
+    $le.btnStart.disabled = false; $le.btnStop.disabled = true;
+    if (CAN_UASM) {
+        try {
+            const r = await LE_STATE.gc.sampleUasm();
+            if (r.supported) { LE_STATE.uasmEnd = r.bytes; $le.ue.textContent = fmtBytes(r.bytes); }
+        } catch (e) {
+            logRow($le.log, 'warn', '[uasm:err] ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+    const s = LE_STATE.gc.summary();
+    // detection rate: heuristic drops observed vs release events triggered.
+    // Values around 1.0 mean "the heuristic sees roughly one drop per release,"
+    // 0.0 means "the heuristic never fires despite forced releases." In
+    // practice this measures how conservative the heap-drop heuristic is.
+    const detection = LE_STATE.releaseEvents > 0 ? s.heap.gcDrops / LE_STATE.releaseEvents : 0;
+    $le.rate.textContent = detection.toFixed(3) + ' drops/release';
+    $le.rate.className = detection >= 0.5 ? 'ok' : (detection >= 0.2 ? 'warn' : 'err');
+    RESULTS.leaky = {
+        scene: 'leaky',
+        durationSec: elapsedSec,
+        gcDrops: s.heap.gcDrops,
+        frames: LE_FRAMES,
+        releaseEvents: LE_STATE.releaseEvents,
+        retainFrames: LE_STATE.retainFrames,
+        peakRetainedBytes: LE_STATE.peakRetained * SLOT_BYTES,
+        heapPeakBytes: s.heap.peak,
+        uasmStartBytes: LE_STATE.uasmStart,
+        uasmEndBytes: LE_STATE.uasmEnd,
+        uasmNetBytes: (LE_STATE.uasmStart !== null && LE_STATE.uasmEnd !== null) ? (LE_STATE.uasmEnd - LE_STATE.uasmStart) : null,
+        detectionRate: detection
+    };
+    logRow($le.log, 'ok', '[stop:' + reason + '] drops=' + s.heap.gcDrops + ' releases=' + LE_STATE.releaseEvents + ' detection=' + detection.toFixed(3));
+    LE_FRAMES = 0;
+}
+
+// =============================================================================
+// REPORT
+// =============================================================================
+function fmtBytes(n) {
+    if (n === null || n === undefined) return '-';
+    const abs = Math.abs(n);
+    if (abs < 1024) return n + ' B';
+    if (abs < 1024 * 1024) return (n / 1024).toFixed(2) + ' KB';
+    return (n / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function verdictBadge(kind) {
+    if (kind === 'ok')   return '<span class="badge ok">ok</span>';
+    if (kind === 'warn') return '<span class="badge warn">warn</span>';
+    if (kind === 'err')  return '<span class="badge err">high</span>';
+    return '<span class="badge na">n/a</span>';
+}
+
+function renderReport() {
+    const rows = [];
+    const bl = RESULTS.baseline, po = RESULTS.pooled, le = RESULTS.leaky;
+    // Header row
+    if (!bl && !po && !le) {
+        $reportBody.innerHTML = '<tr><td colspan="6" style="color:var(--dim)">Run baseline, pooled, and leaky scenes to populate.</td></tr>';
+        return;
+    }
+    rows.push('<tr class="section"><td colspan="6">spurious-drop channel (should be near zero)</td></tr>');
+    rows.push(baselineRow(bl));
+    rows.push(pooledRow(po));
+    rows.push('<tr class="section"><td colspan="6">detection channel (should be positive on known-leaky workload)</td></tr>');
+    rows.push(leakyRow(le));
+    $reportBody.innerHTML = rows.join('');
+}
+
+function baselineRow(r) {
+    if (!r) return '<tr><td>baseline</td><td colspan="5" style="color:var(--dim)">not run</td></tr>';
+    const kind = r.spuriousRatePerSec < 0.01 ? 'ok' : (r.spuriousRatePerSec < 0.1 ? 'warn' : 'err');
+    return '<tr><td>baseline (idle)</td>'
+        + '<td>' + r.durationSec.toFixed(1) + ' s</td>'
+        + '<td>' + r.gcDrops + '</td>'
+        + '<td>' + r.spuriousRatePerSec.toFixed(3) + ' /s</td>'
+        + '<td>' + (r.uasmNetBytes !== null ? fmtBytes(r.uasmNetBytes) : 'n/a') + '</td>'
+        + '<td>' + verdictBadge(kind) + '</td></tr>';
+}
+function pooledRow(r) {
+    if (!r) return '<tr><td>pooled</td><td colspan="5" style="color:var(--dim)">not run</td></tr>';
+    const kind = r.spuriousRatePerSec < 0.01 ? 'ok' : (r.spuriousRatePerSec < 0.05 ? 'warn' : 'err');
+    return '<tr><td>pooled (' + r.writesPerFrame + ' writes/frame)</td>'
+        + '<td>' + r.durationSec.toFixed(1) + ' s</td>'
+        + '<td>' + r.gcDrops + '</td>'
+        + '<td>' + r.spuriousRatePerSec.toFixed(3) + ' /s</td>'
+        + '<td>' + (r.uasmNetBytes !== null ? fmtBytes(r.uasmNetBytes) : 'n/a') + '</td>'
+        + '<td>' + verdictBadge(kind) + '</td></tr>';
+}
+function leakyRow(r) {
+    if (!r) return '<tr><td>leaky</td><td colspan="5" style="color:var(--dim)">not run</td></tr>';
+    const kind = r.detectionRate >= 0.5 ? 'ok' : (r.detectionRate >= 0.2 ? 'warn' : 'err');
+    return '<tr><td>leaky (release every ' + r.retainFrames + ' frames)</td>'
+        + '<td>' + r.durationSec.toFixed(1) + ' s</td>'
+        + '<td>' + r.gcDrops + ' / ' + r.releaseEvents + ' releases</td>'
+        + '<td>' + r.detectionRate.toFixed(3) + ' /release</td>'
+        + '<td>' + (r.uasmNetBytes !== null ? fmtBytes(r.uasmNetBytes) : 'n/a') + '</td>'
+        + '<td>' + verdictBadge(kind) + '</td></tr>';
+}
+
+document.getElementById('btn-copy-md').addEventListener('pointerdown', () => {
+    const md = buildMarkdown();
+    $reportPreview.textContent = md;
+    copyToClipboard(md);
+});
+document.getElementById('btn-copy-json').addEventListener('pointerdown', () => {
+    const json = JSON.stringify(buildJson(), null, 2);
+    $reportPreview.textContent = json;
+    copyToClipboard(json);
+});
+document.getElementById('btn-reset-all').addEventListener('pointerdown', () => {
+    RESULTS.baseline = null; RESULTS.pooled = null; RESULTS.leaky = null;
+    resetBaseline(); resetPooled(); resetLeaky();
+    renderReport();
+    $reportPreview.textContent = '(select a copy action)';
+});
+
+function buildJson() {
+    return {
+        version: VERSION,
+        capturedAt: new Date().toISOString(),
+        fingerprint: captureFingerprint(),
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
+        crossOriginIsolated: COI,
+        results: RESULTS
+    };
+}
+
+function buildMarkdown() {
+    const bl = RESULTS.baseline, po = RESULTS.pooled, le = RESULTS.leaky;
+    const rows = [];
+    rows.push('| workload | duration | heuristic drops | rate | uasm net |');
+    rows.push('| --- | --- | --- | --- | --- |');
+    if (bl) rows.push('| baseline (idle) | ' + bl.durationSec.toFixed(1) + ' s | ' + bl.gcDrops + ' | ' + bl.spuriousRatePerSec.toFixed(3) + ' /s | ' + (bl.uasmNetBytes !== null ? fmtBytes(bl.uasmNetBytes) : 'n/a') + ' |');
+    if (po) rows.push('| pooled (' + po.writesPerFrame + ' writes/frame) | ' + po.durationSec.toFixed(1) + ' s | ' + po.gcDrops + ' | ' + po.spuriousRatePerSec.toFixed(3) + ' /s | ' + (po.uasmNetBytes !== null ? fmtBytes(po.uasmNetBytes) : 'n/a') + ' |');
+    if (le) rows.push('| leaky (release every ' + le.retainFrames + ' frames) | ' + le.durationSec.toFixed(1) + ' s | ' + le.gcDrops + ' / ' + le.releaseEvents + ' releases | ' + le.detectionRate.toFixed(3) + ' /release | ' + (le.uasmNetBytes !== null ? fmtBytes(le.uasmNetBytes) : 'n/a') + ' |');
+    const fp = captureFingerprint();
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '?';
+    return '**@zakkster/lite-gc-profiler v' + VERSION + ' -- heuristic calibration on ' + (fp.platform || '?') + '/' + (fp.arch || '?') + '**\n\n'
+        + rows.join('\n') + '\n\n'
+        + '_UA: ' + ua + '_\n'
+        + '_crossOriginIsolated: ' + COI + ', measured ' + new Date().toISOString() + '_\n';
+}
+
+function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+    }
+}
+
+// initial report render (shows the "not run" placeholder rows)
+renderReport();
+</script>
+</body>
+</html>

@@ -28,7 +28,6 @@ function readHeapUsed() {
     }
     return -1;
 }
-
 const HEAP_SUPPORTED = readHeapUsed() >= 0;
 
 // Chrome's accurate but async memory measurement API. Requires cross-origin
@@ -41,11 +40,7 @@ const UASM_SUPPORTED = typeof performance !== 'undefined'
     && typeof globalThis !== 'undefined'
     && globalThis.crossOriginIsolated === true;
 
-function pow2(n) {
-    let p = 1;
-    while (p < n) p <<= 1;
-    return p < 1 ? 1 : p;
-}
+function pow2(n) { let p = 1; while (p < n) p <<= 1; return p < 1 ? 1 : p; }
 
 // Fixed capacities for the phase subsystem. Both throw on overflow rather than
 // silently drop -- silent overflow of a gating primitive is the class of bug G1
@@ -64,23 +59,11 @@ const MAX_REGION_INTERVALS = 2048;
 // Minimal in-place ring for the pause-duration percentile window.
 class DurationRing {
     constructor(cap) {
-        this.cap = pow2(cap);
-        this.mask = this.cap - 1;
-        this.buf = new Float64Array(this.cap);
-        this.head = 0;
-        this.len = 0;
+        this.cap = pow2(cap); this.mask = this.cap - 1;
+        this.buf = new Float64Array(this.cap); this.head = 0; this.len = 0;
     }
-
-    push(v) {
-        this.buf[this.head] = v;
-        this.head = (this.head + 1) & this.mask;
-        if (this.len < this.cap) this.len++;
-    }
-
-    clear() {
-        this.head = 0;
-        this.len = 0;
-    }
+    push(v) { this.buf[this.head] = v; this.head = (this.head + 1) & this.mask; if (this.len < this.cap) this.len++; }
+    clear() { this.head = 0; this.len = 0; }
 }
 
 // Nearest-rank percentile over the ring's valid values, using a preallocated scratch.
@@ -126,41 +109,24 @@ class GcProfiler {
         this._dur = new DurationRing(capacity);
         this._scratch = new Float64Array(this._dur.cap);
 
-        this._count = 0;
-        this._sumMs = 0;
-        this._maxMs = 0;
-        this._minor = 0;
-        this._major = 0;
-        this._incremental = 0;
-        this._weakcb = 0;
+        this._count = 0; this._sumMs = 0; this._maxMs = 0;
+        this._minor = 0; this._major = 0; this._incremental = 0; this._weakcb = 0;
 
         // heap sampling (browser, or explicit usedBytes elsewhere)
         this._heapActive = false;
-        this._heapPrev = -1;
-        this._heapPeak = 0;
-        this._heapFirst = -1;
-        this._heapSamples = 0;
-        this._allocBytes = 0;
-        this._gcDrops = 0;
-        this._freedBytes = 0;
-        this._tPrev = -1;
-        this._elapsedMs = 0;
+        this._heapPrev = -1; this._heapPeak = 0; this._heapFirst = -1; this._heapSamples = 0;
+        this._allocBytes = 0; this._gcDrops = 0; this._freedBytes = 0;
+        this._tPrev = -1; this._elapsedMs = 0;
 
         // uasm sampling (G12). Populated by sampleUasm() calls; independent
         // of heap sampling -- both can run concurrently on a cross-origin-
         // isolated Chrome page. Always present in summary; supported:false
         // and zeros when the API is unavailable.
-        this._uasmBytes = 0;
-        this._uasmPeak = 0;
-        this._uasmFirst = -1;
-        this._uasmSamples = 0;
-        this._uasmT0 = -1;
-        this._uasmTPrev = -1;
+        this._uasmBytes = 0; this._uasmPeak = 0; this._uasmFirst = -1; this._uasmSamples = 0;
+        this._uasmT0 = -1; this._uasmTPrev = -1;
 
         // frame anomaly heuristic
-        this._frames = 0;
-        this._longFrames = 0;
-        this._frameEwma = 0;
+        this._frames = 0; this._longFrames = 0; this._frameEwma = 0;
 
         // Phase attribution. Boundaries are (time, phaseIdx) pairs appended in
         // chronological order; a GC event with startTime t is bucketed into the
@@ -221,8 +187,7 @@ class GcProfiler {
         this._regionUnattrIncremental = 0;
         this._regionUnattrWeakcb = 0;
 
-        this._obs = null;
-        this._running = false;
+        this._obs = null; this._running = false;
         this._wantHeap = options.heap !== false;
         // Batch counter for settle(): incremented once per observer callback,
         // regardless of how many entries the batch contained. Settle uses it as
@@ -232,10 +197,7 @@ class GcProfiler {
         if (options.autoStart) this.start();
     }
 
-    get supported() {
-        return GC_SUPPORTED || HEAP_SUPPORTED || UASM_SUPPORTED;
-    }
-
+    get supported() { return GC_SUPPORTED || HEAP_SUPPORTED || UASM_SUPPORTED; }
     /**
      * Which signal is live: 'gc' (precise, node), 'heap' (Chrome heuristic),
      * 'uasm' (Chrome accurate, opt-in), or 'none'. Honors the explicit
@@ -245,30 +207,15 @@ class GcProfiler {
         if (this._source !== 'auto') return this._source;
         return GC_SUPPORTED ? 'gc' : (HEAP_SUPPORTED ? 'heap' : 'none');
     }
-
-    get running() {
-        return this._running;
-    }
-
-    get gcCount() {
-        return this._count;
-    }
-
-    get majorCount() {
-        return this._major;
-    }
-
-    get minorCount() {
-        return this._minor;
-    }
+    get running() { return this._running; }
+    get gcCount() { return this._count; }
+    get majorCount() { return this._major; }
+    get minorCount() { return this._minor; }
 
     /** Attach the perf_hooks GC observer (node). No-op where 'gc' entries are unsupported. */
     start() {
         if (this._running) return this;
-        if (!GC_SUPPORTED) {
-            this._running = true;
-            return this;
-        }   // heap/none: nothing to attach
+        if (!GC_SUPPORTED) { this._running = true; return this; }   // heap/none: nothing to attach
         const self = this;
         this._obs = new PerformanceObserver((list) => {
             const es = list.getEntries();
@@ -282,24 +229,20 @@ class GcProfiler {
             }
             self._batchCount++;
         });
-        this._obs.observe({entryTypes: ['gc']});
+        this._obs.observe({ entryTypes: ['gc'] });
         this._running = true;
         return this;
     }
 
     stop() {
-        if (this._obs) {
-            this._obs.disconnect();
-            this._obs = null;
-        }
+        if (this._obs) { this._obs.disconnect(); this._obs = null; }
         this._running = false;
         return this;
     }
 
     _record(kind, durationMs, startTime) {
         this._dur.push(durationMs);
-        this._count++;
-        this._sumMs += durationMs;
+        this._count++; this._sumMs += durationMs;
         if (durationMs > this._maxMs) this._maxMs = durationMs;
         if (kind === GC_MINOR) this._minor++;
         else if (kind === GC_MAJOR) this._major++;
@@ -313,10 +256,7 @@ class GcProfiler {
         if (this._boundaryCount > 0) {
             let phaseIdx = -1;
             for (let i = this._boundaryCount - 1; i >= 0; i--) {
-                if (this._boundaryTimes[i] <= startTime) {
-                    phaseIdx = this._boundaryPhases[i];
-                    break;
-                }
+                if (this._boundaryTimes[i] <= startTime) { phaseIdx = this._boundaryPhases[i]; break; }
             }
             if (phaseIdx >= 0) {
                 this._phaseCount[phaseIdx]++;
@@ -495,12 +435,12 @@ class GcProfiler {
      * @returns {Promise<{drained: boolean, waited: number}>}
      */
     settle(options) {
-        if (!this._obs) return Promise.resolve({drained: true, waited: 0});
+        if (!this._obs) return Promise.resolve({ drained: true, waited: 0 });
         const opts = options || {};
         const quietTicks = opts.quietTicks > 0 ? opts.quietTicks | 0 : 2;
         const maxWaitMs = opts.maxWaitMs > 0 ? +opts.maxWaitMs : 200;
         const self = this;
-        const now = (typeof performance !== 'undefined') ? performance : {now: Date.now};
+        const now = (typeof performance !== 'undefined') ? performance : { now: Date.now };
         const start = now.now();
         let quiet = 0;
         let lastCount = this._batchCount;
@@ -509,21 +449,14 @@ class GcProfiler {
                 const elapsed = now.now() - start;
                 if (self._batchCount === lastCount) {
                     quiet++;
-                    if (quiet >= quietTicks) {
-                        resolve({drained: true, waited: elapsed});
-                        return;
-                    }
+                    if (quiet >= quietTicks) { resolve({ drained: true, waited: elapsed }); return; }
                 } else {
                     quiet = 0;
                     lastCount = self._batchCount;
                 }
-                if (elapsed >= maxWaitMs) {
-                    resolve({drained: false, waited: elapsed});
-                    return;
-                }
+                if (elapsed >= maxWaitMs) { resolve({ drained: false, waited: elapsed }); return; }
                 setTimeout(tick, 0);
             }
-
             setTimeout(tick, 0);
         });
     }
@@ -548,25 +481,16 @@ class GcProfiler {
         const t = now === undefined ? (typeof performance !== 'undefined' ? performance.now() : 0) : now;
         this._heapActive = true;
         if (this._heapFirst < 0) {
-            this._heapFirst = used;
-            this._heapPeak = used;
-            this._heapPrev = used;
-            this._tPrev = t;
-            this._heapSamples = 1;
-            return this;
+            this._heapFirst = used; this._heapPeak = used; this._heapPrev = used;
+            this._tPrev = t; this._heapSamples = 1; return this;
         }
         const dUsed = used - this._heapPrev;
         const dt = t - this._tPrev;
         if (dUsed > 0) this._allocBytes += dUsed;
-        else if (dUsed < 0) {
-            this._gcDrops++;
-            this._freedBytes += -dUsed;
-        }
+        else if (dUsed < 0) { this._gcDrops++; this._freedBytes += -dUsed; }
         if (dt > 0) this._elapsedMs += dt;
         if (used > this._heapPeak) this._heapPeak = used;
-        this._heapPrev = used;
-        this._tPrev = t;
-        this._heapSamples++;
+        this._heapPrev = used; this._tPrev = t; this._heapSamples++;
         return this;
     }
 
@@ -585,7 +509,7 @@ class GcProfiler {
      * @returns {Promise<{supported: boolean, bytes?: number}>}
      */
     sampleUasm(now) {
-        if (!UASM_SUPPORTED) return Promise.resolve({supported: false});
+        if (!UASM_SUPPORTED) return Promise.resolve({ supported: false });
         const self = this;
         const t = now === undefined ? performance.now() : now;
         return performance.measureUserAgentSpecificMemory().then(function (result) {
@@ -598,7 +522,7 @@ class GcProfiler {
             self._uasmBytes = bytes;
             self._uasmTPrev = t;
             self._uasmSamples++;
-            return {supported: true, bytes};
+            return { supported: true, bytes };
         });
     }
 
@@ -662,7 +586,7 @@ class GcProfiler {
                 supported: UASM_SUPPORTED,
                 bytes: 0, peak: 0, firstSample: 0, samples: 0, growthRate: 0
             },
-            frames: {count: this._frames, long: this._longFrames},
+            frames: { count: this._frames, long: this._longFrames },
             // Per-phase gc stats. Empty object when no phase() calls happened.
             // avgMs is computed here from totalMs/count; p99Ms is omitted per phase
             // to avoid a duration ring per phase (would be ~64KB for 32 phases).
@@ -735,36 +659,19 @@ class GcProfiler {
 
     reset() {
         this._dur.clear();
-        this._count = 0;
-        this._sumMs = 0;
-        this._maxMs = 0;
-        this._minor = 0;
-        this._major = 0;
-        this._incremental = 0;
-        this._weakcb = 0;
+        this._count = 0; this._sumMs = 0; this._maxMs = 0;
+        this._minor = 0; this._major = 0; this._incremental = 0; this._weakcb = 0;
         this._heapActive = false;
-        this._heapPrev = -1;
-        this._heapPeak = 0;
-        this._heapFirst = -1;
-        this._heapSamples = 0;
+        this._heapPrev = -1; this._heapPeak = 0; this._heapFirst = -1; this._heapSamples = 0;
         // windowed accumulators: without these, allocBytes/elapsedMs/gcDrops leak
         // across windows and allocRateBytesPerSec reports a blend of old and new
-        this._allocBytes = 0;
-        this._gcDrops = 0;
-        this._freedBytes = 0;
-        this._tPrev = -1;
-        this._elapsedMs = 0;
+        this._allocBytes = 0; this._gcDrops = 0; this._freedBytes = 0;
+        this._tPrev = -1; this._elapsedMs = 0;
         // uasm accumulators are windowed too
-        this._uasmBytes = 0;
-        this._uasmPeak = 0;
-        this._uasmFirst = -1;
-        this._uasmSamples = 0;
-        this._uasmT0 = -1;
-        this._uasmTPrev = -1;
+        this._uasmBytes = 0; this._uasmPeak = 0; this._uasmFirst = -1; this._uasmSamples = 0;
+        this._uasmT0 = -1; this._uasmTPrev = -1;
         // the frame anomaly heuristic is windowed too
-        this._frames = 0;
-        this._longFrames = 0;
-        this._frameEwma = 0;
+        this._frames = 0; this._longFrames = 0; this._frameEwma = 0;
         // phase attribution is windowed as well: intern table drops so that a
         // reused name after reset gets a fresh index, and per-phase counters clear.
         this._phaseNames.length = 0;
@@ -803,16 +710,11 @@ class GcProfiler {
         this._regionUnattrWeakcb = 0;
     }
 
-    destroy() {
-        this.stop();
-        this._dur = null;
-        this._scratch = null;
-        return this;
-    }
+    destroy() { this.stop(); this._dur = null; this._scratch = null; return this; }
 }
 
 // ---- budget gate ----
-const GC_DEFAULT_RULES = {maxMajor: 0};   // any full-heap GC in the window is a failure
+const GC_DEFAULT_RULES = { maxMajor: 0 };   // any full-heap GC in the window is a failure
 
 // Verifiability matrix: for each rule, whether the given source can answer it.
 //   'yes'       -> always verifiable on this source
@@ -822,11 +724,11 @@ const GC_DEFAULT_RULES = {maxMajor: 0};   // any full-heap GC in the window is a
 // Kept as data, not code, so future sources extend by adding a column rather
 // than touching branches.
 const VERDICT_MATRIX = {
-    maxMajor: {gc: 'yes', heap: 'no', uasm: 'no', none: 'no'},
-    maxMinor: {gc: 'yes', heap: 'no', uasm: 'no', none: 'no'},
-    maxPauseMs: {gc: 'yes', heap: 'no', uasm: 'no', none: 'no'},
-    maxTotalMs: {gc: 'yes', heap: 'no', uasm: 'no', none: 'no'},
-    maxAllocRate: {gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no'}
+    maxMajor:     { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxMinor:     { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxPauseMs:   { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxTotalMs:   { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxAllocRate: { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' }
 };
 
 function isCheckable(rule, source, summary) {
@@ -866,45 +768,25 @@ function _evalRules(rules, gcStat, heapStat, summary, scope, checkFn, violations
         const ok = checkFn('maxMajor', source, summary);
         checked.maxMajor = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.major > rules.maxMajor) violations.push({
-            metric: prefix + 'major',
-            limit: rules.maxMajor,
-            actual: gcStat.major,
-            reason: (scope ? '[' + scope + '] ' : '') + gcStat.major + ' major GC(s) > ' + rules.maxMajor
-        });
+        else if (gcStat.major > rules.maxMajor) violations.push({ metric: prefix + 'major', limit: rules.maxMajor, actual: gcStat.major, reason: (scope ? '[' + scope + '] ' : '') + gcStat.major + ' major GC(s) > ' + rules.maxMajor });
     }
     if (rules.maxMinor !== undefined) {
         const ok = checkFn('maxMinor', source, summary);
         checked.maxMinor = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.minor > rules.maxMinor) violations.push({
-            metric: prefix + 'minor',
-            limit: rules.maxMinor,
-            actual: gcStat.minor,
-            reason: (scope ? '[' + scope + '] ' : '') + gcStat.minor + ' minor GC(s) > ' + rules.maxMinor
-        });
+        else if (gcStat.minor > rules.maxMinor) violations.push({ metric: prefix + 'minor', limit: rules.maxMinor, actual: gcStat.minor, reason: (scope ? '[' + scope + '] ' : '') + gcStat.minor + ' minor GC(s) > ' + rules.maxMinor });
     }
     if (rules.maxPauseMs !== undefined) {
         const ok = checkFn('maxPauseMs', source, summary);
         checked.maxPauseMs = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.maxMs > rules.maxPauseMs) violations.push({
-            metric: prefix + 'maxMs',
-            limit: rules.maxPauseMs,
-            actual: gcStat.maxMs,
-            reason: (scope ? '[' + scope + '] ' : '') + 'max GC pause ' + gcStat.maxMs.toFixed(3) + 'ms > ' + rules.maxPauseMs + 'ms'
-        });
+        else if (gcStat.maxMs > rules.maxPauseMs) violations.push({ metric: prefix + 'maxMs', limit: rules.maxPauseMs, actual: gcStat.maxMs, reason: (scope ? '[' + scope + '] ' : '') + 'max GC pause ' + gcStat.maxMs.toFixed(3) + 'ms > ' + rules.maxPauseMs + 'ms' });
     }
     if (rules.maxTotalMs !== undefined) {
         const ok = checkFn('maxTotalMs', source, summary);
         checked.maxTotalMs = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.totalMs > rules.maxTotalMs) violations.push({
-            metric: prefix + 'totalMs',
-            limit: rules.maxTotalMs,
-            actual: gcStat.totalMs,
-            reason: (scope ? '[' + scope + '] ' : '') + 'total GC ' + gcStat.totalMs.toFixed(3) + 'ms > ' + rules.maxTotalMs + 'ms'
-        });
+        else if (gcStat.totalMs > rules.maxTotalMs) violations.push({ metric: prefix + 'totalMs', limit: rules.maxTotalMs, actual: gcStat.totalMs, reason: (scope ? '[' + scope + '] ' : '') + 'total GC ' + gcStat.totalMs.toFixed(3) + 'ms > ' + rules.maxTotalMs + 'ms' });
     }
     if (rules.maxAllocRate !== undefined) {
         // Heap accounting is global-only in G2; per-phase alloc rate is unverifiable
@@ -918,12 +800,7 @@ function _evalRules(rules, gcStat, heapStat, summary, scope, checkFn, violations
             const rate = source === 'uasm'
                 ? (summary.uasm ? summary.uasm.growthRate : 0)
                 : (heapStat ? heapStat.allocRateBytesPerSec : 0);
-            if (rate > rules.maxAllocRate) violations.push({
-                metric: rateMetric,
-                limit: rules.maxAllocRate,
-                actual: rate,
-                reason: (scope ? '[' + scope + '] ' : '') + 'alloc rate ' + (rate / 1048576).toFixed(2) + 'MB/s > ' + (rules.maxAllocRate / 1048576).toFixed(2) + 'MB/s'
-            });
+            if (rate > rules.maxAllocRate) violations.push({ metric: rateMetric, limit: rules.maxAllocRate, actual: rate, reason: (scope ? '[' + scope + '] ' : '') + 'alloc rate ' + (rate / 1048576).toFixed(2) + 'MB/s > ' + (rules.maxAllocRate / 1048576).toFixed(2) + 'MB/s' });
         }
     }
     return anyUnchecked;
@@ -1011,7 +888,7 @@ function checkNoGc(summary, rules) {
     else if (anyUnchecked) verdict = 'inconclusive';
     else verdict = 'pass';
 
-    return {kind: 'gc', verdict, ok: verdict === 'pass', violations, checked, checkedByPhase, checkedByRegion, source};
+    return { kind: 'gc', verdict, ok: verdict === 'pass', violations, checked, checkedByPhase, checkedByRegion, source };
 }
 
 class GcBudgetError extends Error {
@@ -1089,7 +966,7 @@ const DIFFERENTIAL_RULE_TO_METRIC = {
     maxExtraAllocRate: 'maxAllocRate'
 };
 
-const GC_DEFAULT_DIFFERENTIAL_RULES = {maxExtraMajor: 0};
+const GC_DEFAULT_DIFFERENTIAL_RULES = { maxExtraMajor: 0 };
 
 /**
  * Compare a candidate summary against a control (pooled/noop) baseline.
@@ -1133,12 +1010,7 @@ function compareGc(control, candidate, rules) {
         if (!ok) anyUnchecked = true;
         else {
             const delta = candidate.gc.major - control.gc.major;
-            if (delta > r.maxExtraMajor) violations.push({
-                metric: 'gc.major.delta',
-                limit: r.maxExtraMajor,
-                actual: delta,
-                reason: 'extra major GC(s): ' + delta + ' > ' + r.maxExtraMajor
-            });
+            if (delta > r.maxExtraMajor) violations.push({ metric: 'gc.major.delta', limit: r.maxExtraMajor, actual: delta, reason: 'extra major GC(s): ' + delta + ' > ' + r.maxExtraMajor });
         }
     }
     if (r.maxExtraMinor !== undefined) {
@@ -1147,12 +1019,7 @@ function compareGc(control, candidate, rules) {
         if (!ok) anyUnchecked = true;
         else {
             const delta = candidate.gc.minor - control.gc.minor;
-            if (delta > r.maxExtraMinor) violations.push({
-                metric: 'gc.minor.delta',
-                limit: r.maxExtraMinor,
-                actual: delta,
-                reason: 'extra minor GC(s): ' + delta + ' > ' + r.maxExtraMinor
-            });
+            if (delta > r.maxExtraMinor) violations.push({ metric: 'gc.minor.delta', limit: r.maxExtraMinor, actual: delta, reason: 'extra minor GC(s): ' + delta + ' > ' + r.maxExtraMinor });
         }
     }
     if (r.maxExtraPauseMs !== undefined) {
@@ -1161,12 +1028,7 @@ function compareGc(control, candidate, rules) {
         if (!ok) anyUnchecked = true;
         else {
             const delta = candidate.gc.maxMs - control.gc.maxMs;
-            if (delta > r.maxExtraPauseMs) violations.push({
-                metric: 'gc.maxMs.delta',
-                limit: r.maxExtraPauseMs,
-                actual: delta,
-                reason: 'extra max pause: ' + delta.toFixed(3) + 'ms > ' + r.maxExtraPauseMs + 'ms'
-            });
+            if (delta > r.maxExtraPauseMs) violations.push({ metric: 'gc.maxMs.delta', limit: r.maxExtraPauseMs, actual: delta, reason: 'extra max pause: ' + delta.toFixed(3) + 'ms > ' + r.maxExtraPauseMs + 'ms' });
         }
     }
     if (r.maxExtraTotalMs !== undefined) {
@@ -1175,18 +1037,13 @@ function compareGc(control, candidate, rules) {
         if (!ok) anyUnchecked = true;
         else {
             const delta = candidate.gc.totalMs - control.gc.totalMs;
-            if (delta > r.maxExtraTotalMs) violations.push({
-                metric: 'gc.totalMs.delta',
-                limit: r.maxExtraTotalMs,
-                actual: delta,
-                reason: 'extra total pause: ' + delta.toFixed(3) + 'ms > ' + r.maxExtraTotalMs + 'ms'
-            });
+            if (delta > r.maxExtraTotalMs) violations.push({ metric: 'gc.totalMs.delta', limit: r.maxExtraTotalMs, actual: delta, reason: 'extra total pause: ' + delta.toFixed(3) + 'ms > ' + r.maxExtraTotalMs + 'ms' });
         }
     }
     if (r.maxExtraAllocRate !== undefined) {
         // Alloc rate needs samples on BOTH sides for a meaningful delta.
         const ok = isCheckable('maxAllocRate', source, candidate)
-            && isCheckable('maxAllocRate', source, control);
+                && isCheckable('maxAllocRate', source, control);
         checked.maxExtraAllocRate = ok;
         if (!ok) anyUnchecked = true;
         else {
@@ -1198,12 +1055,7 @@ function compareGc(control, candidate, rules) {
                 ? (control.uasm ? control.uasm.growthRate : 0)
                 : control.heap.allocRateBytesPerSec;
             const delta = cRate - ctlRate;
-            if (delta > r.maxExtraAllocRate) violations.push({
-                metric: (source === 'uasm' ? 'uasm.growthRate.delta' : 'heap.allocRateBytesPerSec.delta'),
-                limit: r.maxExtraAllocRate,
-                actual: delta,
-                reason: 'extra alloc rate: ' + (delta / 1048576).toFixed(2) + 'MB/s > ' + (r.maxExtraAllocRate / 1048576).toFixed(2) + 'MB/s'
-            });
+            if (delta > r.maxExtraAllocRate) violations.push({ metric: (source === 'uasm' ? 'uasm.growthRate.delta' : 'heap.allocRateBytesPerSec.delta'), limit: r.maxExtraAllocRate, actual: delta, reason: 'extra alloc rate: ' + (delta / 1048576).toFixed(2) + 'MB/s > ' + (r.maxExtraAllocRate / 1048576).toFixed(2) + 'MB/s' });
         }
     }
 
@@ -1212,16 +1064,7 @@ function compareGc(control, candidate, rules) {
     else if (anyUnchecked) verdict = 'inconclusive';
     else verdict = 'pass';
 
-    return {
-        kind: 'compare',
-        verdict,
-        ok: verdict === 'pass',
-        violations,
-        checked,
-        source,
-        controlSource,
-        candidateSource
-    };
+    return { kind: 'compare', verdict, ok: verdict === 'pass', violations, checked, source, controlSource, candidateSource };
 }
 
 /**
@@ -1264,10 +1107,7 @@ function _extract(summaries, path) {
     for (let i = 0; i < summaries.length; i++) {
         let v = summaries[i];
         for (let j = 0; j < parts.length; j++) {
-            if (v === undefined || v === null) {
-                v = 0;
-                break;
-            }
+            if (v === undefined || v === null) { v = 0; break; }
             v = v[parts[j]];
         }
         out[i] = typeof v === 'number' ? v : 0;
@@ -1276,14 +1116,14 @@ function _extract(summaries, path) {
 }
 
 function _stats(values) {
-    if (values.length === 0) return {min: 0, median: 0, max: 0, all: values};
+    if (values.length === 0) return { min: 0, median: 0, max: 0, all: values };
     // Copy and sort ascending to compute min/median/max; do not mutate caller's array.
     const sorted = values.slice().sort((a, b) => a - b);
     const n = sorted.length;
     const min = sorted[0];
     const max = sorted[n - 1];
     const median = (n & 1) ? sorted[(n - 1) >> 1] : (sorted[(n >> 1) - 1] + sorted[n >> 1]) / 2;
-    return {min, median, max, all: values};
+    return { min, median, max, all: values };
 }
 
 /**
@@ -1315,7 +1155,7 @@ function aggregateGc(summaries) {
     const uasm = {};
     for (const m of uasmMetrics) uasm[m] = _stats(_extract(summaries, 'uasm.' + m));
 
-    return {reps, sources, gc, heap, uasm, perRep: summaries};
+    return { reps, sources, gc, heap, uasm, perRep: summaries };
 }
 
 // Given a rule (e.g. maxMajor), an aggregate, a policy, and the underlying
@@ -1331,17 +1171,17 @@ function _applyPolicy(policy, statsBlock, ruleName, limit) {
     // 'median'     -> the median across reps must satisfy the rule.
     //   Rationale: the middle rep represents typical behavior.
     // 'quorum-N'   -> at least N reps must individually satisfy the rule.
-    if (policy === 'best-clean') return {actual: statsBlock.min, ok: statsBlock.min <= limit};
-    if (policy === 'all-clean') return {actual: statsBlock.max, ok: statsBlock.max <= limit};
-    if (policy === 'median') return {actual: statsBlock.median, ok: statsBlock.median <= limit};
+    if (policy === 'best-clean') return { actual: statsBlock.min, ok: statsBlock.min <= limit };
+    if (policy === 'all-clean')  return { actual: statsBlock.max, ok: statsBlock.max <= limit };
+    if (policy === 'median')     return { actual: statsBlock.median, ok: statsBlock.median <= limit };
     if (typeof policy === 'string' && policy.indexOf('quorum-') === 0) {
         const need = parseInt(policy.slice(7), 10);
-        if (!(need > 0)) return {actual: 0, ok: false, error: 'invalid quorum policy: ' + policy};
+        if (!(need > 0)) return { actual: 0, ok: false, error: 'invalid quorum policy: ' + policy };
         let passing = 0;
         for (let i = 0; i < statsBlock.all.length; i++) if (statsBlock.all[i] <= limit) passing++;
-        return {actual: passing, ok: passing >= need};
+        return { actual: passing, ok: passing >= need };
     }
-    return {actual: 0, ok: false, error: 'unknown policy: ' + policy};
+    return { actual: 0, ok: false, error: 'unknown policy: ' + policy };
 }
 
 const RULE_TO_STATS_PATH = {
@@ -1402,9 +1242,9 @@ function gateReps(summaries, rules, options) {
     // sample counts may vary, so use the max samples across reps).
     const heapProbe = {
         source,
-        heap: {samples: agg.heap.samples.max},
+        heap: { samples: agg.heap.samples.max },
         // uasm samples also needed for source='uasm' verifiability check
-        uasm: {samples: agg.uasm ? agg.uasm.samples.max : 0}
+        uasm: { samples: agg.uasm ? agg.uasm.samples.max : 0 }
     };
 
     // Source-parameterized rule paths: maxAllocRate reads uasm.growthRate on
@@ -1427,10 +1267,7 @@ function gateReps(summaries, rules, options) {
         // Verifiability: same matrix as single-summary gating.
         const canCheck = isCheckable(ruleName, source, heapProbe);
         checked[ruleName] = canCheck;
-        if (!canCheck) {
-            anyUnchecked = true;
-            continue;
-        }
+        if (!canCheck) { anyUnchecked = true; continue; }
 
         const statsBlock = agg[path[0]][path[1]];
         const outcome = _applyPolicy(policy, statsBlock, ruleName, limit);
@@ -1507,8 +1344,7 @@ function captureFingerprint() {
                 const cpus = os.cpus();
                 if (cpus && cpus[0] && cpus[0].model) cpu = cpus[0].model;
             }
-        } catch (_e) { /* leave cpu as unknown */
-        }
+        } catch (_e) { /* leave cpu as unknown */ }
         return {
             node: process.version || 'unknown',
             v8: process.versions.v8 || 'unknown',
@@ -1518,7 +1354,7 @@ function captureFingerprint() {
         };
     }
     // Browser or other environment: minimal marker. Users override as needed.
-    return {node: 'browser', v8: 'unknown', platform: 'browser', arch: 'unknown', cpu: 'unknown'};
+    return { node: 'browser', v8: 'unknown', platform: 'browser', arch: 'unknown', cpu: 'unknown' };
 }
 
 function _fingerprintMatches(a, b) {
@@ -1561,7 +1397,7 @@ function _copyStatsMap(m) {
     const out = {};
     for (const k in m) {
         const s = m[k];
-        out[k] = {min: s.min, median: s.median, max: s.max};
+        out[k] = { min: s.min, median: s.median, max: s.max };
     }
     return out;
 }

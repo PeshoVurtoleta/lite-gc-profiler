@@ -1,18 +1,5 @@
 # @zakkster/lite-gc-profiler
 
-[![npm version](https://img.shields.io/npm/v/@zakkster/lite-gc-profiler.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-![Zero-GC](https://img.shields.io/badge/Zero--GC-Hot%20path-00C853?style=for-the-badge&logo=leaf&logoColor=white)
-[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
-[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-gc-profiler?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-gc-profiler)
-[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
-![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
-[![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
-[![types](https://img.shields.io/badge/types-included-3178c6)](./index.d.ts)
-
-
 Zero-dependency GC and heap profiler. It exists to make the **zero-GC claim
 falsifiable** rather than asserted.
 
