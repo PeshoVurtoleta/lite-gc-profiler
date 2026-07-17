@@ -587,6 +587,142 @@ summary so they don't inflate `steady`-phase counters.
   for GC-event-count gating; picking either separately is honest and
   correct.
 
+## Per-frame measurement: `measureFrames` and the render-loop lane
+
+The ops lane answers "what does one call cost?" The frame lane answers
+"how does this behave inside a render loop?" Different question, different
+noise floor, different failure modes.
+
+```js
+import { measureFrames, assertFrames } from '@zakkster/lite-gc-profiler';
+
+// Async -- frames are inherently async, driven by a scheduler.
+const result = await measureFrames((i) => {
+    updateParticles(i);
+    drawScene();
+}, { frames: 300, warmup: 60 });
+
+// result shape (schema: 'lite-gc-frames/1')
+//   frames: 300, warmupFrames: 60
+//   elapsedMs, fps
+//   bytesPerFrame        // retained bytes/frame; null on source='none'
+//   bytesPerFrameStable  // true when GC-anchored (see below)
+//   majorsPerKFrame, minorsPerKFrame, maxPauseMsPerFrame
+//   droppedFrames        // frames whose work-time > frameBudgetMs
+//   frameTimes: { p50, p95, p99, max }
+//   asyncResidual        // bytes heap grew past settle() -- smoke detector
+//   source, summary
+```
+
+### The scheduler
+
+`measureFrames` drives a scheduler through `warmup + frames` ticks, one
+call to your function per tick. Three modes via `opts.scheduler`:
+
+- `'auto'` (default) — uses `requestAnimationFrame` if the runtime has
+  one, otherwise falls back to a self-correcting `setTimeout` polyfill
+  that targets `frameBudgetMs` (default 16.67ms) with drift compensation.
+- `'raf'` — forces raf. Throws a `RangeError` at setup if unavailable —
+  no silent fallback, so the intent is honest.
+- `'polyfill'` — forces the setTimeout pacer.
+- A function `(cb) => handle` — the escape hatch. Deterministic
+  schedulers in tests (e.g. `(cb) => setTimeout(cb, 0)`) run 300 frames
+  in ~150ms instead of ~5s.
+
+### `bytesPerFrame`: GC-anchored live-set delta
+
+A raw-heap slope across a 300-frame render loop is unreliable: the
+scheduler's own per-frame churn accumulates without tripping a GC drop,
+so a *clean* workload reads a phantom ~1000-2000 B/frame, while a cold
+run can collapse a real leak to zero. So `measureFrames` **stabilizes by
+default** when `globalThis.gc` is available (`--expose-gc`): it forces a
+full GC at each steady boundary and reports `bytesPerFrame` as the
+post-GC *live-set* delta across the window. A workload that retains
+nothing reads ~0; a real leak reads its true retained rate; and the
+figure is stable across cold and warm runs because both ends are live
+sets, not raw heap. The forced collections are attributed to a
+`'stabilize'` phase, so the steady-phase kind rules stay clean.
+`bytesPerFrameStable: true` marks this path.
+
+Control it with `opts.stabilize`: `undefined` (default) auto-stabilizes
+when a forceable GC exists, `true` demands it (throws under a runtime
+without `--expose-gc`), `false` opts out. Without stabilization the value
+falls back to a retention-aware slope over ~32 periodic samples —
+best-effort, flagged `bytesPerFrameStable: false`; gate above its noise
+floor.
+
+**Exact `maxBytesPerFrame: 0` isn't physically achievable** from heap
+sampling — the stabilized floor is V8 live-set jitter (tens of B/frame,
+amortizing down at higher frame counts), not allocation. For tight leak
+gating below that floor, use the differential: `compareFrames` /
+`maxExtraBytesPerFrame` cancels the apparatus floor, so clean-vs-clean
+nets to ~0 and a real leak stands out at its true rate.
+
+```js
+// coarse absolute gate -- threshold above the stabilized floor
+await assertFrames(renderFrame, { maxBytesPerFrame: 512 }, { frames: 300, warmup: 60 });
+
+// tight differential gate -- floor cancels, catches small per-frame leaks
+await assertCompareFrames(cleanBaseline, renderFrame,
+    { maxExtraBytesPerFrame: 128 }, { frames: 300, warmup: 60 });
+```
+
+### The five per-frame rules
+
+```js
+await assertFrames(renderFrame,
+    {
+        maxBytesPerFrame:    512,       // needsHeap / needsUasm / no on source=none; above the stabilized floor
+        maxMajorsPerKFrame:    1,       // requires source=gc
+        maxMinorsPerKFrame:   10,       // requires source=gc
+        maxPauseMsPerFrame:    4,       // requires source=gc
+        maxDroppedFrames:      3        // source-agnostic
+    },
+    { frames: 300, warmup: 60 }
+);
+```
+
+Four of these mirror the per-op rules' verifiability. The fifth,
+`maxDroppedFrames`, is the first source-agnostic gate in
+`VERDICT_MATRIX` — work-time is measured directly from
+`performance.now()`, no memory channel needed. Users on a runtime with
+`source='none'` (headless without any memory instrumentation) can still
+gate frame drops. That's the shape check that the matrix design
+generalizes cleanly.
+
+### `asyncResidual`: the smoke detector
+
+Every result includes `asyncResidual`: bytes the heap grew *after*
+`gc.settle()` returned. Non-zero means work spawned inside your frame
+outlived the measurement window — a fire-and-forget promise chain, an
+unawaited microtask, a background timer. Not a gate rule in v1.4.0, just
+a free signal you can log or assert against directly.
+
+### Comparing frames
+
+Same delta pattern as `compareOps`:
+
+```js
+await assertCompareFrames(oldRenderer, newRenderer,
+    { maxExtraBytesPerFrame: 20, maxExtraDroppedFrames: 0 },
+    { frames: 300, warmup: 60 }
+);
+```
+
+Source mismatch (control on `gc`, candidate on `none`) yields an
+`inconclusive` verdict, same as everywhere else in the library.
+
+### Attribution honesty: interleaved async is a v1.5.0 concern
+
+If your frame function spawns fire-and-forget promises whose allocations
+are attributed by V8's async-context propagation to whichever phase is
+current when the perf_hooks callback delivers the GC event, attribution
+can drift. For a cooperative frame function (fully awaits its own work),
+attribution is accurate. `asyncResidual` gives the escape signal for the
+uncooperative case. Full interleaved-async attribution — separating
+frame-N's spawned work from frame-N+K's synchronous work — is a
+concurrency-lane concern for v1.5.0.
+
 ## Baseline lock: guarding against silent regressions
 
 CI ergonomics: capture a known-good aggregate once, commit it as JSON, gate

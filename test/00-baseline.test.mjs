@@ -1,17 +1,17 @@
 // Baseline sanity checks. Asserts the VERSION constant matches its expected
-// value (bumped in three places per the ecosystem convention: this test, the
-// VERSION const in index.js, and package.json) and that all named exports
-// resolve. Runs first in the suite so version drift fails fast.
+// value (bumped in two places per the ecosystem convention: this test and
+// package.json; the VERSION const itself lives in Gc.js) and that all named
+// exports resolve. Runs first in the suite so version drift fails fast.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as api from '../Gc.js';
 
-const EXPECTED_VERSION = '1.3.1';
+const EXPECTED_VERSION = '1.4.0';
 
 test('VERSION constant matches expected release version', () => {
     assert.equal(api.VERSION, EXPECTED_VERSION,
-        'VERSION drift: index.js says ' + api.VERSION + ', test expects ' + EXPECTED_VERSION
+        'VERSION drift: Gc.js says ' + api.VERSION + ', test expects ' + EXPECTED_VERSION
         + '. Bump both plus package.json in lockstep.');
 });
 

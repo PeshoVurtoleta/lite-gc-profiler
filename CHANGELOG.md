@@ -1,5 +1,116 @@
 # Changelog
 
+## 1.4.0
+
+Batch 7: the frame lane. Five new public functions -- `measureFrames`,
+`checkFrames`, `assertFrames`, `compareFrames`, `assertCompareFrames` --
+gate the render-loop question the ops lane couldn't answer: how does
+this behave inside a scheduled frame budget? Additive; zero behavior
+change for existing v1.3.x callers.
+
+### What's new
+
+- `measureFrames(fn, opts)` -- async, drives a scheduler through
+  `warmup + frames` ticks, one call per tick. Result includes
+  `bytesPerFrame` (retained bytes/frame) with a `bytesPerFrameStable`
+  flag, `majorsPerKFrame`, `minorsPerKFrame`, `maxPauseMsPerFrame`,
+  `droppedFrames`, a `frameTimes` percentile distribution
+  (`p50/p95/p99/max`), and `asyncResidual` -- bytes the heap grew past
+  `gc.settle()`. Schema: `'lite-gc-frames/1'`.
+
+- `opts.stabilize` -- forces a full GC at each steady boundary so
+  `bytesPerFrame` is the retained live-set delta rather than the raw
+  heapUsed climb. On by default when `globalThis.gc` is available
+  (`--expose-gc`); `true` demands it (rejects otherwise); `false` opts
+  out to the slope estimate.
+
+- Scheduler abstraction with three modes and one escape hatch:
+  - `'auto'` (default) prefers `requestAnimationFrame`, falls back to
+    a self-correcting `setTimeout` polyfill with drift compensation.
+  - `'raf'` -- forces raf, throws `RangeError` at setup if unavailable.
+    No silent fallback: explicit intent honored.
+  - `'polyfill'` -- forces the setTimeout pacer.
+  - A function `(cb) => handle` -- deterministic schedulers for tests.
+
+- Five new `VERDICT_MATRIX` rules: `maxBytesPerFrame`,
+  `maxMajorsPerKFrame`, `maxMinorsPerKFrame`, `maxPauseMsPerFrame`,
+  `maxDroppedFrames`. Four mirror the per-op rules' verifiability.
+  The fifth, `maxDroppedFrames`, is the **first source-agnostic rule
+  in the matrix** -- work-time is measured directly from
+  `performance.now()`, no memory channel needed. Validates the matrix
+  design generalizes without special cases.
+
+- Delta rules for `compareFrames`: `maxExtraBytesPerFrame`,
+  `maxExtraDroppedFrames`.
+
+### `bytesPerFrame` design: GC-anchored live-set delta
+
+The ops lane's two-point heap delta doesn't survive a 300-frame window,
+and a raw-heap slope over the steady samples is worse: a per-frame
+scheduler's own transient churn accumulates without tripping a GC drop,
+so a *clean* workload reads a phantom ~1000-2000 B/frame while a cold
+run can collapse a real leak to zero. Neither makes `maxBytesPerFrame`
+trustworthy.
+
+`measureFrames` therefore stabilizes by default (when `globalThis.gc`
+is available): it forces a full GC at each steady boundary -- attributed
+to a `'stabilize'` phase so steady kind-rules stay clean -- and reports
+`bytesPerFrame` as the post-GC live-set delta across the window. Clean
+workloads read ~0 (down to a small, machine-dependent V8 live-set jitter
+floor), real leaks read their true retained rate, and the figure is
+stable across cold and warm runs because both ends are live sets, not
+raw heap. `bytesPerFrameStable:true` marks this path.
+
+Without a forceable GC (a browser, or `stabilize:false`), it falls back
+to a retention-aware slope over ~32 periodic samples (LSQ through
+post-GC-drop anchors). Best-effort, flagged `bytesPerFrameStable:false`;
+gate above its noise floor.
+
+Exact `maxBytesPerFrame:0` is not physically achievable from heap
+sampling -- the stabilized floor is jitter, not allocation. For tight
+leak gating below that floor, use `compareFrames` /
+`maxExtraBytesPerFrame`: a control-vs-candidate differential cancels the
+apparatus floor, so clean-vs-clean nets to ~0 and a real leak stands out
+at its true rate.
+
+### Attribution scope
+
+For a cooperative frame function (fully awaits its own work),
+attribution is accurate. For fire-and-forget promise chains, V8's
+async-context propagation can attribute allocations to whichever phase
+is current when the perf_hooks callback delivers the GC event.
+`asyncResidual` in the result gives a smoke signal for that case (bytes
+still growing past settle). Full interleaved-async attribution is a
+concurrency-lane concern for v1.5.0.
+
+### Torture (G17.5)
+
+New torture file: `test/torture/g17-5-frames.test.mjs`. Four-axis
+discipline:
+- **Axis A**: adversarial (throw propagation, async rejection, `raf`
+  unavailable guard).
+- **Axis B pin pair**: warmup allocation is quarantined out of the
+  steady `bytesPerFrame` (the steady-start GC collects it before the
+  baseline is read, so heavy-warmup steady still reads ~0); a real
+  ~1.7 KB/frame steady leak reads clearly above the clean floor in a
+  single stabilized run.
+- **Axis C**: `measureFrames` induces zero *steady* majors on a noop
+  workload -- validating that the stabilize GCs are attributed to the
+  `'stabilize'` phase, not `'steady'`.
+- **Axis D**: cold-run and warm-run produce the same verdict on
+  `maxBytesPerFrame` (clean passes, leak fails, cold==warm -- the
+  GC-timing invariant the estimator exists to hold) and on
+  `maxDroppedFrames`; result-shape stability across cold/warm.
+
+Plus one wall-clock smoke test for the real polyfill scheduler --
+proves the code path executes and terminates within a bound, without
+opening the door to timing-dependent assertions elsewhere.
+
+### Full-suite tally
+
+**376 tests, all pass** under `--expose-gc`. 333 baseline + 33 standard
+frame + 10 torture frame.
+
 ## 1.3.1
 
 Wave 1 CI hardening. One user-facing addition: `stabilize: true` on

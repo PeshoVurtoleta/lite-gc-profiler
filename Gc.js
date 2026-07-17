@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -735,7 +735,17 @@ const VERDICT_MATRIX = {
     maxBytesPerOp:    { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' },
     maxMajorsPerKOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxMinorsPerKOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
-    maxPauseMsPerOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' }
+    maxPauseMsPerOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    // Per-frame rules added in v1.4.0 (Batch 7, G17/G18). Mirror the per-op
+    // rules for the memory + GC-event columns; the last row -- maxDroppedFrames
+    // -- is source-agnostic because work-time is measured directly from
+    // performance.now(), no channel needed. This is the first rule in the
+    // matrix that gates on 'none' with 'yes', and the shape stays clean.
+    maxBytesPerFrame:    { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' },
+    maxMajorsPerKFrame:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxMinorsPerKFrame:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxPauseMsPerFrame:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
+    maxDroppedFrames:    { gc: 'yes',       heap: 'yes',       uasm: 'yes',       none: 'yes' }
 };
 
 function isCheckable(rule, source, summary) {
@@ -2120,6 +2130,633 @@ function assertCompareOps(controlOrFn, candidateOrFn, rules, opts) {
     return report;
 }
 
+// =============================================================================
+// Batch 7 (v1.4.0) -- per-frame primitives (G17/G18).
+//
+// measureFrames drives a scheduler (raf, self-correcting setTimeout polyfill,
+// or an injected function for deterministic tests) through W warmup + F
+// steady frames, calling `fn(i)` per frame. Returns a Promise -- frames are
+// inherently async, and awaiting gc.settle() at the boundary gives us
+// reliable GC-event delivery that the sync ops path can't do.
+//
+// bytesPerFrame has two paths:
+//   Stabilized (default when globalThis.gc is available): a forced full GC
+//   at each steady boundary makes the start/end heap reads compacted live
+//   sets, and bytesPerFrame is their delta over the frame count. Clean
+//   workloads read ~0, real leaks read their true retained rate, and the
+//   figure is stable cold-vs-warm because both ends are live sets rather
+//   than raw heapUsed. The forced collections are attributed to the
+//   'stabilize' phase, so steady-phase kind rules stay clean.
+//   Fallback (no forceable GC, e.g. a browser without --expose-gc, or
+//   stabilize:false): a retention-aware slope over ~32 periodic samples,
+//   fitting LSQ through post-GC-drop anchors. Best-effort -- a per-frame
+//   scheduler's own transient churn sits on top of the signal, so this
+//   path carries a noise floor and is flagged bytesPerFrameStable:false.
+//   Prefer a threshold above that floor when gating unstabilized results.
+//
+// asyncResidual: bytes the heap grew AFTER gc.settle() returned. Non-zero
+// signals that the workload spawned work outlasting the frame -- not a
+// gate rule, just a free smoke detector. Interleaved-async attribution
+// (Fable's D12) is a v1.5.0 concurrency-lane concern; this is the
+// minimum-viable warning.
+// =============================================================================
+
+/**
+ * Compute a retention-aware slope over heap samples during steady phase.
+ * The naive LSQ fit on raw samples is fooled by mid-run GC events: a
+ * minor or major collection drops heapUsed sharply, LSQ averages that
+ * drop against subsequent rises, and a real leak's slope collapses to
+ * zero or negative.
+ *
+ * The retention pattern in the sample series is: rise (allocation),
+ * drop (GC), rise, drop, rise -- with the POST-DROP samples ("local
+ * minima") slowly climbing over time if retention is accumulating.
+ * For a purely transient workload, the local minima stay flat.
+ *
+ * Algorithm:
+ *   1. Walk samples. A sample is a "post-drop" anchor if it dropped
+ *      by more than a threshold (0.8x) from the previous sample -- that
+ *      marks the boundary where V8 just ran a collection.
+ *   2. The first sample is always an anchor (pre-loop baseline).
+ *   3. The final sample is always an anchor (post-settle, definitive
+ *      retention endpoint).
+ *   4. Fit LSQ through the anchors. Slope reflects retention accumulation
+ *      rate across GC boundaries.
+ *
+ * Fallbacks:
+ *   - If no drops detected (short measurement, non-allocating workload),
+ *     the anchor set is just [first, last] and slope is the two-point
+ *     delta -- honest for that case.
+ *   - Scratch buffers (anchorValues, anchorXs) preallocated by the caller
+ *     so this stays allocation-free.
+ */
+function _retentionSlope(samples, count, anchorValues, anchorXs) {
+    if (count < 2) return 0;
+    let anchorCount = 0;
+    anchorValues[anchorCount] = samples[0];            // baseline anchor
+    anchorXs[anchorCount] = 0;
+    anchorCount++;
+    for (let i = 1; i < count; i++) {
+        if (samples[i] < samples[i - 1] * 0.8) {
+            // Sharp drop -- V8 ran a collection between samples[i-1] and samples[i].
+            // samples[i] is the post-collection live set at that x.
+            anchorValues[anchorCount] = samples[i];
+            anchorXs[anchorCount] = i;
+            anchorCount++;
+        }
+    }
+    // Force the last sample as an anchor if it isn't already -- that's the
+    // post-settle definitive endpoint.
+    if (anchorXs[anchorCount - 1] !== count - 1) {
+        anchorValues[anchorCount] = samples[count - 1];
+        anchorXs[anchorCount] = count - 1;
+        anchorCount++;
+    }
+    if (anchorCount < 2) return 0;
+    // LSQ over irregular x's. Slope = (N*Sxy - Sx*Sy) / (N*Sxx - Sx*Sx).
+    const N = anchorCount;
+    let Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+    for (let i = 0; i < N; i++) {
+        const x = anchorXs[i];
+        const y = anchorValues[i];
+        Sx  += x;
+        Sy  += y;
+        Sxx += x * x;
+        Sxy += x * y;
+    }
+    const denom = N * Sxx - Sx * Sx;
+    if (denom === 0 || !Number.isFinite(denom)) return 0;
+    const slope = (N * Sxy - Sx * Sy) / denom;
+    return Number.isFinite(slope) ? slope : 0;
+}
+
+/**
+ * Compute p50/p95/p99/max of workTimes[0..count-1]. Uses a preallocated
+ * scratch Float64Array to avoid allocating a copy in the hot path exit.
+ * The scratch is sorted in-place after copying values in.
+ */
+function _framePercentiles(workTimes, count, scratch) {
+    if (count <= 0) return { p50: 0, p95: 0, p99: 0, max: 0 };
+    for (let i = 0; i < count; i++) scratch[i] = workTimes[i];
+    // Float64Array.sort is in-place; TimSort in V8. One-off cost at result
+    // assembly, not per-frame.
+    scratch.subarray(0, count).sort();
+    const p50 = scratch[Math.floor(count * 0.50)];
+    const p95 = scratch[Math.min(count - 1, Math.floor(count * 0.95))];
+    const p99 = scratch[Math.min(count - 1, Math.floor(count * 0.99))];
+    const max = scratch[count - 1];
+    return { p50, p95, p99, max };
+}
+
+const DEFAULT_FRAME_BUDGET_MS = 1000 / 60;
+
+/**
+ * Build a self-correcting setTimeout pacer aiming for `targetMs` cadence.
+ * Drift-compensating: if the previous callback ran late, shortens the next
+ * delay so we don't accumulate lag. Bounded at 0 -- we never call
+ * setTimeout with a negative delay.
+ *
+ * Not sub-millisecond precise (setTimeout isn't), but honest for the
+ * headless polyfill role: ~16.67ms cadence within setTimeout's own noise
+ * floor. Users who need real rAF should run in a browser.
+ */
+function _createPolyfillScheduler(targetMs) {
+    let last = (typeof performance !== 'undefined' ? performance : { now: Date.now }).now();
+    return function schedule(cb) {
+        const perf = typeof performance !== 'undefined' ? performance : { now: Date.now };
+        const now = perf.now();
+        const drift = now - last;
+        const delay = drift >= targetMs ? 0 : targetMs - drift;
+        return setTimeout(function () {
+            last = perf.now();
+            cb();
+        }, delay);
+    };
+}
+
+/**
+ * Resolve the scheduler option to a `(cb) => handle` function. Auto-detect
+ * (default): requestAnimationFrame if available, else the polyfill pacer.
+ * Explicit strings 'raf' and 'polyfill' force a specific path. A function
+ * value is used directly -- the D14 escape hatch for injected/deterministic
+ * schedulers in tests.
+ *
+ * Throws RangeError on 'raf' explicit request when requestAnimationFrame
+ * is not available (headless node without a DOM shim). This keeps the
+ * test intent honest: if you asked for raf, you get raf or an error, not
+ * a silent polyfill fallback.
+ */
+function _resolveScheduler(schedulerOpt, budgetMs) {
+    if (typeof schedulerOpt === 'function') return schedulerOpt;
+    const hasRaf = typeof requestAnimationFrame === 'function';
+    if (schedulerOpt === 'raf') {
+        if (!hasRaf) throw new RangeError('measureFrames: opts.scheduler:"raf" requires a requestAnimationFrame implementation (browser or DOM shim)');
+        return function (cb) { return requestAnimationFrame(cb); };
+    }
+    if (schedulerOpt === 'polyfill') {
+        return _createPolyfillScheduler(budgetMs);
+    }
+    if (schedulerOpt === undefined || schedulerOpt === 'auto') {
+        if (hasRaf) return function (cb) { return requestAnimationFrame(cb); };
+        return _createPolyfillScheduler(budgetMs);
+    }
+    throw new TypeError('measureFrames: opts.scheduler must be "auto" | "raf" | "polyfill" | function');
+}
+
+/**
+ * Run `fn(i)` across `opts.warmup` warmup frames + `opts.frames` steady
+ * frames, one call per scheduler tick. Awaits any Promise returned by fn
+ * before advancing. Async: returns a Promise resolving to the result.
+ *
+ * @param {(i: number) => any | Promise<any>} fn
+ * @param {object} opts
+ * @param {number} opts.frames                       Steady-phase frame count. Required, > 0.
+ * @param {number} [opts.warmup=0]                   Warmup frames. Excluded from all steady stats.
+ * @param {'auto'|'raf'|'polyfill'|Function} [opts.scheduler='auto']
+ * @param {number} [opts.frameBudgetMs=16.67]        Work-time threshold for droppedFrames.
+ * @param {'auto'|'gc'|'heap'|'uasm'|'none'} [opts.source='auto']
+ * @param {number} [opts.capacity=256]               GcProfiler pause-ring capacity.
+ * @returns {Promise<{
+ *   schema: 'lite-gc-frames/1',
+ *   frames: number, warmupFrames: number,
+ *   elapsedMs: number, fps: number,
+ *   bytesPerFrame: number | null,
+ *   majorsPerKFrame: number, minorsPerKFrame: number,
+ *   maxPauseMsPerFrame: number,
+ *   droppedFrames: number,
+ *   frameTimes: { p50: number, p95: number, p99: number, max: number },
+ *   asyncResidual: number,
+ *   source: GcSource,
+ *   summary: GcSummary
+ * }>}
+ *
+ * ## Async attribution limitation
+ *
+ * Unawaited microtasks or promises spawned inside fn may have their
+ * allocations attributed to whatever phase is current when perf_hooks
+ * delivers the GC event -- not the frame that spawned them. For a
+ * cooperative fn (fully awaits its own work), attribution is accurate.
+ * For fire-and-forget promise chains, `asyncResidual` in the result
+ * gives a smoke signal (bytes still growing past settle). Full
+ * interleaved-async attribution is a v1.5.0 concurrency-lane concern.
+ */
+function measureFrames(fn, opts) {
+    if (typeof fn !== 'function') return Promise.reject(new TypeError('measureFrames: fn must be a function'));
+    if (!opts || typeof opts !== 'object') return Promise.reject(new TypeError('measureFrames: opts is required'));
+    const frames = opts.frames;
+    const warmup = opts.warmup === undefined ? 0 : opts.warmup;
+    if (!Number.isFinite(frames) || frames <= 0 || (frames | 0) !== frames) {
+        return Promise.reject(new RangeError('measureFrames: opts.frames must be a positive integer'));
+    }
+    if (!Number.isFinite(warmup) || warmup < 0 || (warmup | 0) !== warmup) {
+        return Promise.reject(new RangeError('measureFrames: opts.warmup must be a non-negative integer'));
+    }
+    const frameBudgetMs = opts.frameBudgetMs === undefined ? DEFAULT_FRAME_BUDGET_MS : +opts.frameBudgetMs;
+    if (!Number.isFinite(frameBudgetMs) || frameBudgetMs <= 0) {
+        return Promise.reject(new RangeError('measureFrames: opts.frameBudgetMs must be a positive finite number'));
+    }
+
+    // Stabilize mode: force a full GC at each steady-phase boundary so
+    // bytesPerFrame reflects the *retained* live-set delta (bytes/frame that
+    // survive collection) rather than the raw heapUsed climb, which a
+    // per-frame scheduler's own transient churn inflates into a phantom
+    // slope. The forced collections are attributed to the 'stabilize' phase,
+    // so steady-phase gate rules (majors/minors/pause per frame) stay clean.
+    //
+    // Unlike the sync ops lane -- where stabilize is strictly opt-in because
+    // forcing GC changes its passive default -- measureFrames is already
+    // async and already awaits settle(), so anchoring the two boundaries
+    // costs two collections total and makes bytesPerFrame trustworthy. It is
+    // therefore ON BY DEFAULT when globalThis.gc is available (node
+    // --expose-gc). stabilize:true demands it (reject if unavailable);
+    // stabilize:false opts out and falls back to the slope estimate, which is
+    // flagged bytesPerFrameStable:false in the result.
+    const hasForceableGc = typeof globalThis.gc === 'function';
+    if (opts.stabilize === true && !hasForceableGc) {
+        return Promise.reject(new RangeError(
+            'measureFrames: opts.stabilize:true requires node --expose-gc ' +
+            '(globalThis.gc must be a function). Run: node --expose-gc ... ' +
+            'or drop stabilize for slope-estimate measurement.'
+        ));
+    }
+    const stabilize = opts.stabilize === false ? false : (opts.stabilize === true ? true : hasForceableGc);
+
+    let schedule;
+    try {
+        schedule = _resolveScheduler(opts.scheduler, frameBudgetMs);
+    } catch (e) {
+        return Promise.reject(e);
+    }
+
+    const capacity = opts.capacity === undefined ? 256 : opts.capacity | 0;
+    const source = opts.source === undefined ? 'auto' : opts.source;
+    const gc = new GcProfiler(capacity, { source: source }).start();
+
+    // Preallocated hot-path buffers -- zero alloc per frame.
+    const workTimes = new Float64Array(frames);
+    const percentileScratch = new Float64Array(frames);
+    // Periodic heap sampling for LSQ slope. ~32 samples across steady;
+    // K clamps at 1 for tiny frame counts. Preallocate one extra slot to
+    // hold the final settle-boundary sample.
+    const K = Math.max(1, Math.floor(frames / 32));
+    const maxSamples = Math.floor(frames / K) + 2;
+    const heapSamples = new Float64Array(maxSamples);
+    const anchorValues = new Float64Array(maxSamples);
+    const anchorXs = new Float64Array(maxSamples);
+    let heapSampleCount = 0;
+
+    const isNode = typeof process !== 'undefined' && !!process.memoryUsage;
+    const canSampleMemory = source !== 'none';
+    function sampleHeap() {
+        if (!canSampleMemory || heapSampleCount >= maxSamples) return -1;
+        let used;
+        if (isNode) {
+            used = process.memoryUsage().heapUsed;
+        } else {
+            used = _readHeapUsedFor(gc);
+        }
+        if (used >= 0) heapSamples[heapSampleCount++] = used;
+        return used;
+    }
+
+    const perf = typeof performance !== 'undefined' ? performance : { now: Date.now };
+    let steadyStartT = 0;
+    let steadyEndT = 0;
+    let frameIndex = 0;
+    let inSteady = false;
+
+    return new Promise(function (resolve, reject) {
+        gc.phase('warmup');
+
+        function runFrame() {
+            // Phase transition on the boundary frame.
+            if (frameIndex === warmup && !inSteady) {
+                // Stabilized: force a full GC (attributed to 'stabilize', not
+                // 'steady') so the steady-start sample is a compacted live-set
+                // floor -- warmup allocation and JIT tier-up churn are collected
+                // out before the retained-bytes baseline is read.
+                if (stabilize) {
+                    gc.phase('stabilize');
+                    globalThis.gc();
+                }
+                gc.phase('steady');
+                inSteady = true;
+                sampleHeap();                                  // steady-start sample (post-GC when stabilized)
+                steadyStartT = perf.now();
+            }
+
+            const t0 = perf.now();
+            let ret;
+            try {
+                ret = fn(frameIndex);
+            } catch (err) {
+                gc.stop();
+                reject(err);
+                return;
+            }
+
+            function afterFn() {
+                const t1 = perf.now();
+                if (inSteady) {
+                    const steadyIdx = frameIndex - warmup;
+                    workTimes[steadyIdx] = t1 - t0;
+                    // Periodic sample every K frames (skip idx 0 -- already sampled at boundary).
+                    if (steadyIdx > 0 && steadyIdx % K === 0) sampleHeap();
+                }
+                frameIndex++;
+                if (frameIndex < warmup + frames) {
+                    schedule(runFrame);
+                } else {
+                    steadyEndT = perf.now();
+                    finalize();
+                }
+            }
+
+            if (ret && typeof ret.then === 'function') {
+                ret.then(afterFn, function (err) {
+                    gc.stop();
+                    reject(err);
+                });
+            } else {
+                afterFn();
+            }
+        }
+
+        async function finalize() {
+            // Raw steady-end heapUsed BEFORE settle and before any forced GC --
+            // the baseline for asyncResidual (which must see fire-and-forget
+            // growth, not a value we just collected away). Also the steady-end
+            // sample for the slope-estimate fallback path.
+            const preSettleUsed = (canSampleMemory && isNode) ? process.memoryUsage().heapUsed : -1;
+            if (!stabilize && canSampleMemory) sampleHeap();   // steady-end sample for slope fallback
+            let settleResult;
+            try {
+                settleResult = await gc.settle();
+            } catch (err) {
+                gc.stop();
+                reject(err);
+                return;
+            }
+            // asyncResidual: bytes the heap grew past settle. Signals
+            // fire-and-forget work outliving the measurement window. Measured
+            // on raw numbers, before the stabilize end-GC, so a forced
+            // collection can't mask it.
+            let asyncResidual = 0;
+            if (canSampleMemory && isNode && preSettleUsed >= 0) {
+                const postSettle = process.memoryUsage().heapUsed;
+                asyncResidual = Math.max(0, postSettle - preSettleUsed);
+            }
+
+            // bytesPerFrame.
+            //   Stabilized: post-GC live-set delta across the steady window.
+            //   heapSamples[0] is the compacted steady-start floor; force one
+            //   more GC now (attributed to 'stabilize', keeping steady clean)
+            //   and read the compacted steady-end floor. The difference is
+            //   bytes retained per frame -- clean workloads read ~0, real
+            //   leaks read their true rate, and the figure is stable across
+            //   cold/warm runs because both ends are live sets, not raw heap.
+            //   Fallback (no forceable GC): retention-aware slope over the
+            //   periodic samples -- best-effort, flagged not-stable.
+            let bytesPerFrame = null;
+            let bytesPerFrameStable = false;
+            if (canSampleMemory) {
+                if (stabilize && isNode && heapSampleCount >= 1) {
+                    gc.phase('stabilize');
+                    globalThis.gc();
+                    const liveEnd = process.memoryUsage().heapUsed;
+                    const liveStart = heapSamples[0];
+                    const bpf = (liveEnd - liveStart) / frames;
+                    bytesPerFrame = bpf > 0 ? bpf : 0;
+                    bytesPerFrameStable = true;
+                } else if (heapSampleCount >= 2) {
+                    const slope = _retentionSlope(heapSamples, heapSampleCount, anchorValues, anchorXs);
+                    const bpf = slope / K;
+                    bytesPerFrame = bpf > 0 ? bpf : 0;
+                    bytesPerFrameStable = false;
+                }
+            }
+
+            const summary = gc.summary();
+            gc.stop();
+
+            // droppedFrames + percentile distribution over steady work times.
+            let droppedFrames = 0;
+            for (let i = 0; i < frames; i++) {
+                if (workTimes[i] > frameBudgetMs) droppedFrames++;
+            }
+            const frameTimes = _framePercentiles(workTimes, frames, percentileScratch);
+
+            // Per-frame GC rates come from the steady phase sub-summary.
+            const steady = summary.phases.steady && summary.phases.steady.gc;
+            const steadyMajor = steady ? steady.major : 0;
+            const steadyMinor = steady ? steady.minor : 0;
+            const steadyMaxMs = steady ? steady.maxMs : 0;
+            const steadyElapsed = steadyEndT - steadyStartT;
+            const fps = steadyElapsed > 0 ? (frames * 1000) / steadyElapsed : 0;
+
+            resolve({
+                schema: 'lite-gc-frames/1',
+                frames: frames,
+                warmupFrames: warmup,
+                elapsedMs: steadyElapsed,
+                fps: fps,
+                bytesPerFrame: bytesPerFrame,
+                bytesPerFrameStable: bytesPerFrameStable,
+                majorsPerKFrame: (steadyMajor * 1000) / frames,
+                minorsPerKFrame: (steadyMinor * 1000) / frames,
+                maxPauseMsPerFrame: steadyMaxMs,
+                droppedFrames: droppedFrames,
+                frameTimes: frameTimes,
+                asyncResidual: asyncResidual,
+                source: gc.source,
+                summary: summary,
+                _settled: settleResult.drained
+            });
+        }
+
+        schedule(runFrame);
+    });
+}
+
+/**
+ * Gate a measureFrames result against per-frame rules. Sync -- takes a
+ * result, produces a report. Mirrors checkOps shape for tooling reuse.
+ *
+ * Rules: maxBytesPerFrame, maxMajorsPerKFrame, maxMinorsPerKFrame,
+ * maxPauseMsPerFrame, maxDroppedFrames. All optional; unspecified rules
+ * are skipped.
+ */
+function checkFrames(result, rules) {
+    if (!result || result.schema !== 'lite-gc-frames/1') {
+        throw new TypeError('checkFrames: result must be a measureFrames result');
+    }
+    if (!rules || typeof rules !== 'object') {
+        throw new TypeError('checkFrames: rules must be an object');
+    }
+    const source = result.source;
+    const violations = [];
+    const checked = {};
+    let sawInconclusive = false;
+
+    function checkOne(rule, actual, metric) {
+        const limit = rules[rule];
+        if (limit === undefined) return;
+        const row = VERDICT_MATRIX[rule];
+        const state = row ? row[source] : 'no';
+        if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
+            checked[rule] = true;
+            if (actual !== null && actual > limit) {
+                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
+            } else if (actual === null && (state === 'needsHeap' || state === 'needsUasm')) {
+                checked[rule] = false;
+                sawInconclusive = true;
+            }
+        } else {
+            checked[rule] = false;
+            sawInconclusive = true;
+        }
+    }
+
+    checkOne('maxBytesPerFrame', result.bytesPerFrame, 'bytesPerFrame');
+    checkOne('maxMajorsPerKFrame', result.majorsPerKFrame, 'majorsPerKFrame');
+    checkOne('maxMinorsPerKFrame', result.minorsPerKFrame, 'minorsPerKFrame');
+    checkOne('maxPauseMsPerFrame', result.maxPauseMsPerFrame, 'maxPauseMsPerFrame');
+    checkOne('maxDroppedFrames', result.droppedFrames, 'droppedFrames');
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (sawInconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        schema: 'lite-gc-report/1',
+        kind: 'frames',
+        verdict: verdict,
+        source: source,
+        violations: violations,
+        checked: checked,
+        result: result
+    };
+}
+
+/**
+ * Convenience: run measureFrames + checkFrames, throwing GcBudgetError on
+ * fail or GcInconclusiveError on inconclusive (unless allowInconclusive).
+ * Async.
+ */
+async function assertFrames(fn, rules, opts) {
+    const result = await measureFrames(fn, opts);
+    const report = checkFrames(result, rules);
+    if (report.verdict === 'fail') throw new GcBudgetError(report);
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
+/**
+ * Compare two measureFrames results (or two functions) on delta rules.
+ * Rules: maxExtraBytesPerFrame (candidate.bytesPerFrame - control > threshold),
+ * maxExtraDroppedFrames (candidate.droppedFrames - control > threshold).
+ * Async.
+ */
+async function compareFrames(controlOrFn, candidateOrFn, rules, opts) {
+    if (!rules || typeof rules !== 'object') throw new TypeError('compareFrames: rules must be an object');
+    let control, candidate;
+    if (typeof controlOrFn === 'function' && typeof candidateOrFn === 'function') {
+        control = await measureFrames(controlOrFn, opts);
+        candidate = await measureFrames(candidateOrFn, opts);
+    } else {
+        if (!controlOrFn || controlOrFn.schema !== 'lite-gc-frames/1'
+            || !candidateOrFn || candidateOrFn.schema !== 'lite-gc-frames/1') {
+            throw new TypeError('compareFrames: expected two measureFrames results or two functions');
+        }
+        control = controlOrFn;
+        candidate = candidateOrFn;
+    }
+    if (control.source !== candidate.source) {
+        return {
+            schema: 'lite-gc-report/1',
+            kind: 'frames',
+            verdict: 'inconclusive',
+            reason: 'source_mismatch',
+            source: candidate.source,
+            control: control,
+            candidate: candidate,
+            violations: [],
+            checked: {}
+        };
+    }
+
+    const violations = [];
+    const checked = {};
+    let sawInconclusive = false;
+    const source = candidate.source;
+
+    if (rules.maxExtraBytesPerFrame !== undefined) {
+        const row = VERDICT_MATRIX.maxBytesPerFrame;
+        const state = row[source];
+        if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
+            if (control.bytesPerFrame !== null && candidate.bytesPerFrame !== null) {
+                checked.maxExtraBytesPerFrame = true;
+                const delta = candidate.bytesPerFrame - control.bytesPerFrame;
+                if (delta > rules.maxExtraBytesPerFrame) {
+                    violations.push({
+                        rule: 'maxExtraBytesPerFrame', metric: 'bytesPerFrame.delta',
+                        actual: delta, limit: rules.maxExtraBytesPerFrame
+                    });
+                }
+            } else {
+                checked.maxExtraBytesPerFrame = false;
+                sawInconclusive = true;
+            }
+        } else {
+            checked.maxExtraBytesPerFrame = false;
+            sawInconclusive = true;
+        }
+    }
+    if (rules.maxExtraDroppedFrames !== undefined) {
+        // Source-agnostic, like maxDroppedFrames itself.
+        checked.maxExtraDroppedFrames = true;
+        const delta = candidate.droppedFrames - control.droppedFrames;
+        if (delta > rules.maxExtraDroppedFrames) {
+            violations.push({
+                rule: 'maxExtraDroppedFrames', metric: 'droppedFrames.delta',
+                actual: delta, limit: rules.maxExtraDroppedFrames
+            });
+        }
+    }
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (sawInconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        schema: 'lite-gc-report/1',
+        kind: 'frames',
+        verdict: verdict,
+        source: source,
+        violations: violations,
+        checked: checked,
+        control: control,
+        candidate: candidate
+    };
+}
+
+/**
+ * Convenience: compareFrames + throw on fail/inconclusive. Async.
+ */
+async function assertCompareFrames(controlOrFn, candidateOrFn, rules, opts) {
+    const report = await compareFrames(controlOrFn, candidateOrFn, rules, opts);
+    if (report.verdict === 'fail') throw new GcBudgetError(report);
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
+
 export {
     VERSION,
     GcProfiler,
@@ -2131,6 +2768,9 @@ export {
     // Batch 6 (v1.3.0) -- per-op primitives.
     measureOps, checkOps, assertOps,
     compareOps, assertCompareOps,
+    // Batch 7 (v1.4.0) -- per-frame primitives.
+    measureFrames, checkFrames, assertFrames,
+    compareFrames, assertCompareFrames,
     GcBudgetError, GcInconclusiveError,
     GC_DEFAULT_RULES, GC_DEFAULT_DIFFERENTIAL_RULES, REP_POLICY_DEFAULTS,
     VERDICT_MATRIX,

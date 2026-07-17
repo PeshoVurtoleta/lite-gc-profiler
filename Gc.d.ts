@@ -1,4 +1,4 @@
-export const VERSION: '1.3.1';
+export const VERSION: '1.4.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -709,3 +709,161 @@ export function assertCompareOps(
     rules: CompareOpsRules,
     opts: MeasureOpsOptions
 ): CompareOpsResult;
+
+// =============================================================================
+// Batch 7 (v1.4.0) -- per-frame primitives (G17/G18).
+// =============================================================================
+
+export type MeasureFramesFn = (i: number) => unknown | Promise<unknown>;
+
+/** Scheduler abstraction. A function that schedules `cb` and returns any handle. */
+export type FrameScheduler = (cb: () => void) => unknown;
+
+/** Named scheduler strings or the escape-hatch function form. */
+export type FrameSchedulerOpt = 'auto' | 'raf' | 'polyfill' | FrameScheduler;
+
+/** Per-frame rules gated by checkFrames / assertFrames. All optional. */
+export interface FramesRules {
+    /** Retained bytes per frame (LSQ retention slope). Requires memory channel. */
+    maxBytesPerFrame?: number;
+    /** Major GC events per 1000 frames. Requires source='gc'. */
+    maxMajorsPerKFrame?: number;
+    /** Minor GC events per 1000 frames. Requires source='gc'. */
+    maxMinorsPerKFrame?: number;
+    /** Max GC pause observed in steady phase (ms). Requires source='gc'. */
+    maxPauseMsPerFrame?: number;
+    /**
+     * Frames whose work-time exceeded frameBudgetMs. Source-agnostic --
+     * measured directly from performance.now(), works on any source.
+     */
+    maxDroppedFrames?: number;
+}
+
+/** Delta rules for compareFrames / assertCompareFrames. */
+export interface CompareFramesRules {
+    maxExtraBytesPerFrame?: number;
+    maxExtraDroppedFrames?: number;
+}
+
+/** Options for measureFrames. */
+export interface MeasureFramesOptions {
+    /** Steady-phase frame count. Required, positive integer. */
+    frames: number;
+    /** Warmup frames, excluded from steady stats. Default 0. */
+    warmup?: number;
+    /**
+     * Scheduler choice. 'auto' (default) prefers requestAnimationFrame,
+     * falls back to a self-correcting setTimeout polyfill. Function form
+     * is the escape hatch for deterministic tests.
+     */
+    scheduler?: FrameSchedulerOpt;
+    /** Work-time threshold for droppedFrames (ms). Default 1000/60 ≈ 16.67. */
+    frameBudgetMs?: number;
+    /** Source selection. Default 'auto'. */
+    source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
+    /** GcProfiler pause-ring capacity. Default 256. */
+    capacity?: number;
+    /**
+     * Force a full GC at each steady boundary so bytesPerFrame reflects the
+     * retained live-set delta rather than the raw heapUsed climb (which a
+     * per-frame scheduler's transient churn inflates). Requires
+     * globalThis.gc (node --expose-gc).
+     *   - undefined (default): auto -- stabilize when globalThis.gc exists,
+     *     otherwise fall back to the slope estimate.
+     *   - true: demand stabilization; reject if globalThis.gc is unavailable.
+     *   - false: never force GC; use the slope estimate (bytesPerFrameStable
+     *     will be false).
+     */
+    stabilize?: boolean;
+    /**
+     * When true, checkFrames returns the report even with inconclusive
+     * verdict instead of throwing. Only meaningful for assertFrames /
+     * assertCompareFrames.
+     */
+    allowInconclusive?: boolean;
+}
+
+/** Result of a measureFrames run. */
+export interface FramesResult {
+    schema: 'lite-gc-frames/1';
+    frames: number;
+    warmupFrames: number;
+    /** Wall-clock elapsed during steady phase (ms). */
+    elapsedMs: number;
+    /** Effective frames-per-second during steady. */
+    fps: number;
+    /**
+     * Retained bytes per steady frame. When stabilized (see options), this is
+     * the post-GC live-set delta across the steady window: clean workloads
+     * read ~0 (down to a small V8 live-set jitter floor) and real leaks read
+     * their true rate, stable across cold/warm runs. Unstabilized, it is a
+     * best-effort retention-slope estimate carrying a noise floor -- see
+     * bytesPerFrameStable. For tight leak gating below the absolute floor, use
+     * compareFrames / maxExtraBytesPerFrame, which cancels the floor.
+     * null on source='none' or source='auto' + memory unavailable.
+     */
+    bytesPerFrame: number | null;
+    /**
+     * True when bytesPerFrame was GC-anchored (stabilized) and is therefore a
+     * trustworthy retained-bytes figure; false when it is the slope estimate
+     * (no forceable GC / stabilize:false).
+     */
+    bytesPerFrameStable: boolean;
+    majorsPerKFrame: number;
+    minorsPerKFrame: number;
+    maxPauseMsPerFrame: number;
+    droppedFrames: number;
+    frameTimes: { p50: number; p95: number; p99: number; max: number };
+    /**
+     * Bytes the heap grew AFTER gc.settle() returned. Non-zero signals
+     * fire-and-forget work outliving the measurement window. Smoke
+     * detector, not a gate rule.
+     */
+    asyncResidual: number;
+    source: 'gc' | 'heap' | 'uasm' | 'none';
+    summary: GcSummary;
+}
+
+/** Result of checkFrames / assertFrames / compareFrames / assertCompareFrames. */
+export interface FramesGateResult {
+    schema: 'lite-gc-report/1';
+    kind: 'frames';
+    verdict: 'pass' | 'fail' | 'inconclusive';
+    source: 'gc' | 'heap' | 'uasm' | 'none';
+    violations: Array<{ rule: string; metric: string; actual: number; limit: number }>;
+    checked: Record<string, boolean>;
+    result?: FramesResult;
+    control?: FramesResult;
+    candidate?: FramesResult;
+    reason?: string;
+}
+
+export function measureFrames(fn: MeasureFramesFn, opts: MeasureFramesOptions): Promise<FramesResult>;
+export function checkFrames(result: FramesResult, rules: FramesRules): FramesGateResult;
+export function assertFrames(
+    fn: MeasureFramesFn,
+    rules: FramesRules,
+    opts: MeasureFramesOptions
+): Promise<FramesGateResult>;
+export function compareFrames(
+    control: FramesResult,
+    candidate: FramesResult,
+    rules: CompareFramesRules
+): Promise<FramesGateResult>;
+export function compareFrames(
+    controlFn: MeasureFramesFn,
+    candidateFn: MeasureFramesFn,
+    rules: CompareFramesRules,
+    opts: MeasureFramesOptions
+): Promise<FramesGateResult>;
+export function assertCompareFrames(
+    control: FramesResult,
+    candidate: FramesResult,
+    rules: CompareFramesRules
+): Promise<FramesGateResult>;
+export function assertCompareFrames(
+    controlFn: MeasureFramesFn,
+    candidateFn: MeasureFramesFn,
+    rules: CompareFramesRules,
+    opts: MeasureFramesOptions
+): Promise<FramesGateResult>;

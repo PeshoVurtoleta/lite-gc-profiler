@@ -178,9 +178,21 @@ test('VERDICT_MATRIX covers every rule name in GcRules', () => {
     }
 });
 
-test('VERDICT_MATRIX: none source verifies nothing', () => {
+test('VERDICT_MATRIX: none source verifies nothing (except source-agnostic rules)', () => {
+    // As of v1.4.0, maxDroppedFrames is a source-agnostic rule -- work-time
+    // is measured by performance.now() directly, no memory channel needed.
+    // It's the first rule to gate 'yes' on 'none', which validates the
+    // matrix design generalizes. All memory- and event-based rules still
+    // must return 'no' on none.
+    const SOURCE_AGNOSTIC_RULES = new Set(['maxDroppedFrames']);
     for (const rule in VERDICT_MATRIX) {
-        assert.equal(VERDICT_MATRIX[rule].none, 'no', rule + ' should be no on none');
+        if (SOURCE_AGNOSTIC_RULES.has(rule)) {
+            assert.equal(VERDICT_MATRIX[rule].none, 'yes',
+                rule + ' is source-agnostic and must verify on none');
+        } else {
+            assert.equal(VERDICT_MATRIX[rule].none, 'no',
+                rule + ' should be no on none');
+        }
     }
 });
 
