@@ -151,21 +151,18 @@ test('checkOps: inconclusive when a rule can\'t be verified on this source', () 
 test('checkOps: fail when maxBytesPerOp is clearly exceeded', () => {
     // Use plain object allocation (not Uint8Array) so heap growth lands in
     // process.memoryUsage().heapUsed rather than external ArrayBuffer memory.
-    // Uint8Array backing buffers are invisible to the sampling channel; only
-    // the wrapper (~80 bytes) counts, and its exact size varies across V8
-    // versions. Plain objects give ~100 bytes/op deterministically.
+    // A retained array is heap-visible on every V8 build and lands hundreds of
+    // bytes per op, unlike a typed array (backing buffer invisible to the
+    // sampling channel) or a small plain object (retained size varies with
+    // pointer compression). stabilize:true GC-anchors the boundaries, so a
+    // scavenge landing between the paired samples can no longer cancel the
+    // signal -- which is why this test no longer needs its "skip rather than
+    // flake" early-return. A silent skip can pass a real regression unnoticed.
     const sink = [];
-    function heavyWorkload(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-    }
-    const r = measureOps(heavyWorkload, { ops: 500, warmup: 10 });
-    // ~50 KB heap growth over 500 ops = ~100 bytes/op. A limit of 20 must fail.
+    function heavyWorkload(i) { sink.push(new Array(64).fill(i)); }
+    const r = measureOps(heavyWorkload, { ops: 500, warmup: 10, stabilize: true });
     const rep = checkOps(r, { maxBytesPerOp: 20 });
-    if (r.bytesPerOp === null || r.bytesPerOp < 20) {
-        // Edge case: if a scavenge happened between the paired boundary
-        // samples and cancellation over-corrected. Skip rather than flake.
-        return;
-    }
+    assert.notEqual(r.bytesPerOp, null);
     assert.equal(rep.verdict, 'fail');
     assert.ok(rep.violations.some((v) => v.metric === 'bytesPerOp'));
 });
@@ -224,18 +221,19 @@ test('compareOps: convenience form (two functions)', () => {
 });
 
 test('compareOps: candidate leaks vs clean control -> fail', () => {
+    // Retained array (heap-visible on every V8 build, hundreds of B/op) plus
+    // stabilize:true, which GC-anchors both measurements so the control reads
+    // ~0 instead of cold-start JIT churn. Together the delta clears the 20 B/op
+    // rule by more than an order of magnitude on any machine -- so this test no
+    // longer needs the "GC intervention edge case" early-return it used to
+    // carry. That silent skip could pass a real regression unnoticed.
     const sinkK = [];
     function control(i)   { return i | 0; }                                    // no allocation
-    function candidate(i) {
-        sinkK.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-        return i;
-    }
-    const ctlR = measureOps(control,   { ops: 500, warmup: 50 });
-    const canR = measureOps(candidate, { ops: 500, warmup: 50 });
+    function candidate(i) { sinkK.push(new Array(64).fill(i)); return i; }
+    const ctlR = measureOps(control,   { ops: 500, warmup: 50, stabilize: true });
+    const canR = measureOps(candidate, { ops: 500, warmup: 50, stabilize: true });
+    assert.notEqual(canR.bytesPerOp, null);
     const rep = compareOps(ctlR, canR, { maxExtraBytesPerOp: 20 });
-    if (canR.bytesPerOp === null || (ctlR.bytesPerOp !== null && canR.bytesPerOp - ctlR.bytesPerOp < 20)) {
-        return; // GC intervention edge case
-    }
     assert.equal(rep.verdict, 'fail');
     assert.ok(rep.violations.some((v) => v.metric === 'bytesPerOp.delta'));
 });

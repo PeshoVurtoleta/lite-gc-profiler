@@ -764,6 +764,18 @@ export interface MeasureFramesOptions {
     /** GcProfiler pause-ring capacity. Default 256. */
     capacity?: number;
     /**
+     * Force a full GC at each steady boundary so bytesPerFrame reflects the
+     * retained live-set delta rather than the raw heapUsed climb (which a
+     * per-frame scheduler's transient churn inflates). Requires
+     * globalThis.gc (node --expose-gc).
+     *   - undefined (default): auto -- stabilize when globalThis.gc exists,
+     *     otherwise fall back to the slope estimate.
+     *   - true: demand stabilization; reject if globalThis.gc is unavailable.
+     *   - false: never force GC; use the slope estimate (bytesPerFrameStable
+     *     will be false).
+     */
+    stabilize?: boolean;
+    /**
      * When true, checkFrames returns the report even with inconclusive
      * verdict instead of throwing. Only meaningful for assertFrames /
      * assertCompareFrames.
@@ -781,10 +793,22 @@ export interface FramesResult {
     /** Effective frames-per-second during steady. */
     fps: number;
     /**
-     * Retained bytes per steady frame, from segmented LSQ retention slope.
+     * Retained bytes per steady frame. When stabilized (see options), this is
+     * the post-GC live-set delta across the steady window: clean workloads
+     * read ~0 (down to a small V8 live-set jitter floor) and real leaks read
+     * their true rate, stable across cold/warm runs. Unstabilized, it is a
+     * best-effort retention-slope estimate carrying a noise floor -- see
+     * bytesPerFrameStable. For tight leak gating below the absolute floor, use
+     * compareFrames / maxExtraBytesPerFrame, which cancels the floor.
      * null on source='none' or source='auto' + memory unavailable.
      */
     bytesPerFrame: number | null;
+    /**
+     * True when bytesPerFrame was GC-anchored (stabilized) and is therefore a
+     * trustworthy retained-bytes figure; false when it is the slope estimate
+     * (no forceable GC / stabilize:false).
+     */
+    bytesPerFrameStable: boolean;
     majorsPerKFrame: number;
     minorsPerKFrame: number;
     maxPauseMsPerFrame: number;

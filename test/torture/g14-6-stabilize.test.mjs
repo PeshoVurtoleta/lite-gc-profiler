@@ -82,22 +82,19 @@ test('[axis A] error message names --expose-gc explicitly (actionable guidance)'
 // AXIS B -- real signal under real noise
 // =============================================================================
 
-test('[axis B] retained leak of 100 bytes/op survives stabilize and shows on bytesPerOp', () => {
+test('[axis B] retained leak survives stabilize and shows on bytesPerOp', () => {
     // Cannot be gamed by GC: sink retains references across the forced end
-    // GC, so the survivors show up in the delta. Multiple attempts because
-    // V8 background scheduling can occasionally spike the noise floor.
+    // GC, so the survivors show up in the delta. A retained array is
+    // heap-visible on every V8 build and lands far above this threshold --
+    // unlike a small plain object, whose retained size is build-dependent and
+    // can sit near 20 B/op once pointer compression narrows tagged slots.
+    // With an unambiguous signal a single run suffices; no best-of-attempts.
     const sink = [];
-    let bestFail = -Infinity;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        sink.length = 0;
-        function leaks(i) {
-            sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-        }
-        const r = measureOps(leaks, { ops: 500, warmup: 50, stabilize: true });
-        if (r.bytesPerOp !== null && r.bytesPerOp > bestFail) bestFail = r.bytesPerOp;
-    }
-    assert.ok(bestFail > 20,
-        'retained leak (~100 B/op) must show through stabilize; got best bytesPerOp=' + bestFail);
+    function leaks(i) { sink.push(new Array(64).fill(i)); }
+    const r = measureOps(leaks, { ops: 500, warmup: 50, stabilize: true });
+    assert.notEqual(r.bytesPerOp, null);
+    assert.ok(r.bytesPerOp > 20,
+        'retained leak must show through stabilize; got bytesPerOp=' + r.bytesPerOp);
 });
 
 test('[axis B] transient allocation collapses under stabilize (survivor semantic)', () => {
@@ -155,10 +152,20 @@ test('[axis D] cold-run assertCompareOps + stabilize == warm-run + stabilize (ec
     // no prior measureOps calls in this test process; the "warm" run runs
     // AFTER the cold run (which itself warms V8 paths). Both must throw
     // GcBudgetError -- same verdict on the same rule set.
+    //
+    // The leak retains a 1024-slot array per op rather than a small plain
+    // object. A 6-key object's retained size is V8-build dependent (pointer
+    // compression halves tagged slot width), landing near this rule's 20 B/op
+    // threshold on some builds -- and over a 500-op window V8's own live-set
+    // jitter is worth a few B/op, enough to flip the verdict between the cold
+    // and warm run and make this pin flaky. A retained array is heap-visible
+    // on every build and lands orders of magnitude above the threshold, so the
+    // pin tests verdict ORDER-INDEPENDENCE (its actual subject) rather than
+    // the engine's object layout.
     function coldControl(i)   { return i | 0; }
     const coldSink = [];
     function coldCandidate(i) {
-        coldSink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
+        coldSink.push(new Array(64).fill(i));
         return i;
     }
     // COLD: no prior calls warming these paths.
@@ -175,7 +182,7 @@ test('[axis D] cold-run assertCompareOps + stabilize == warm-run + stabilize (ec
     function warmControl(i)   { return i | 0; }
     const warmSink = [];
     function warmCandidate(i) {
-        warmSink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
+        warmSink.push(new Array(64).fill(i));
         return i;
     }
     let warmThrew = false;

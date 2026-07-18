@@ -105,9 +105,10 @@ test('stabilize: retained allocation is captured (candidate leak survives forced
     // real; stabilize doesn't erase it. bytesPerOp reflects the surviving
     // bytes divided by ops.
     const sink = [];
-    function leaks(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-    }
+    // Retained array: heap-visible on every V8 build and far above the 20 B/op
+    // threshold. A small plain object's retained size is build-dependent and
+    // can land near the threshold under pointer compression.
+    function leaks(i) { sink.push(new Array(64).fill(i)); }
     const r = measureOps(leaks, { ops: 500, warmup: 50, stabilize: true });
     assert.notEqual(r.bytesPerOp, null);
     assert.ok(r.bytesPerOp > 20,
@@ -144,10 +145,8 @@ test('stabilize: cold-run assertCompareOps produces the same verdict as warm-run
     // boundary GCs make the measurement order-independent.
     const sink = [];
     function control(i) { return i | 0; }
-    function candidate(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-        return i;
-    }
+    // Retained array -- see note above: build-independent, far above the rule.
+    function candidate(i) { sink.push(new Array(64).fill(i)); return i; }
     // Simulate cold-CI: fresh call, no prior warming of these paths.
     assert.throws(
         () => assertCompareOps(
