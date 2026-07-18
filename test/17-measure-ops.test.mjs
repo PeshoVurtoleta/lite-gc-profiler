@@ -151,21 +151,18 @@ test('checkOps: inconclusive when a rule can\'t be verified on this source', () 
 test('checkOps: fail when maxBytesPerOp is clearly exceeded', () => {
     // Use plain object allocation (not Uint8Array) so heap growth lands in
     // process.memoryUsage().heapUsed rather than external ArrayBuffer memory.
-    // Uint8Array backing buffers are invisible to the sampling channel; only
-    // the wrapper (~80 bytes) counts, and its exact size varies across V8
-    // versions. Plain objects give ~100 bytes/op deterministically.
+    // A retained array is heap-visible on every V8 build and lands hundreds of
+    // bytes per op, unlike a typed array (backing buffer invisible to the
+    // sampling channel) or a small plain object (retained size varies with
+    // pointer compression). stabilize:true GC-anchors the boundaries, so a
+    // scavenge landing between the paired samples can no longer cancel the
+    // signal -- which is why this test no longer needs its "skip rather than
+    // flake" early-return. A silent skip can pass a real regression unnoticed.
     const sink = [];
-    function heavyWorkload(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-    }
-    const r = measureOps(heavyWorkload, { ops: 500, warmup: 10 });
-    // ~50 KB heap growth over 500 ops = ~100 bytes/op. A limit of 20 must fail.
+    function heavyWorkload(i) { sink.push(new Array(64).fill(i)); }
+    const r = measureOps(heavyWorkload, { ops: 500, warmup: 10, stabilize: true });
     const rep = checkOps(r, { maxBytesPerOp: 20 });
-    if (r.bytesPerOp === null || r.bytesPerOp < 20) {
-        // Edge case: if a scavenge happened between the paired boundary
-        // samples and cancellation over-corrected. Skip rather than flake.
-        return;
-    }
+    assert.notEqual(r.bytesPerOp, null);
     assert.equal(rep.verdict, 'fail');
     assert.ok(rep.violations.some((v) => v.metric === 'bytesPerOp'));
 });
@@ -195,12 +192,29 @@ test('assertOps: passes through when allowInconclusive is set', () => {
 });
 
 test('assertOps: throws GcBudgetError on fail', () => {
+    // This needs all three protections, and previously had none of them.
+    //
+    // Without `warmup`, the first ops carry JIT tier-up churn. Without
+    // `stabilize`, bytesPerOp is a raw two-point delta that a mid-steady GC
+    // can compact BELOW the start sample -- the reading clamps to 0, `0 > 5`
+    // is false, no violation is recorded, and the expected throw never
+    // happens. Measured on the 1-CPU reference box: 4 of 60 runs of this exact
+    // scenario collapsed to <= 5 B/op. That is a ~7% flake that presents as
+    // "Missing expected exception", which tells you nothing about the cause.
+    //
+    // A retained array is also heap-visible on every V8 build, unlike a small
+    // plain object whose retained size roughly halves under pointer
+    // compression. Stabilized and warmed, this reads ~570 B/op against a
+    // threshold of 5 -- a 100x margin instead of a coin flip.
+    // 1024 slots, not 64: bytesPerOp clamps at zero when the end anchor lands
+    // below the start anchor, and a clamped zero clears no threshold no matter
+    // how large the margin would otherwise be. Retaining ~4 MB across the
+    // anchors means a clamp would require more than 4 MB of residual garbage
+    // being freed between two post-GC samples, which is not a plausible run.
     const sink = [];
-    function heavy(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-    }
+    function heavy(i) { sink.push(new Array(1024).fill(i)); }
     assert.throws(
-        () => assertOps(heavy, { maxBytesPerOp: 5 }, { ops: 500 }),
+        () => assertOps(heavy, { maxBytesPerOp: 5 }, { ops: 500, warmup: 50, stabilize: true }),
         GcBudgetError
     );
 });
@@ -224,18 +238,19 @@ test('compareOps: convenience form (two functions)', () => {
 });
 
 test('compareOps: candidate leaks vs clean control -> fail', () => {
+    // Retained array (heap-visible on every V8 build, hundreds of B/op) plus
+    // stabilize:true, which GC-anchors both measurements so the control reads
+    // ~0 instead of cold-start JIT churn. Together the delta clears the 20 B/op
+    // rule by more than an order of magnitude on any machine -- so this test no
+    // longer needs the "GC intervention edge case" early-return it used to
+    // carry. That silent skip could pass a real regression unnoticed.
     const sinkK = [];
     function control(i)   { return i | 0; }                                    // no allocation
-    function candidate(i) {
-        sinkK.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-        return i;
-    }
-    const ctlR = measureOps(control,   { ops: 500, warmup: 50 });
-    const canR = measureOps(candidate, { ops: 500, warmup: 50 });
+    function candidate(i) { sinkK.push(new Array(64).fill(i)); return i; }
+    const ctlR = measureOps(control,   { ops: 500, warmup: 50, stabilize: true });
+    const canR = measureOps(candidate, { ops: 500, warmup: 50, stabilize: true });
+    assert.notEqual(canR.bytesPerOp, null);
     const rep = compareOps(ctlR, canR, { maxExtraBytesPerOp: 20 });
-    if (canR.bytesPerOp === null || (ctlR.bytesPerOp !== null && canR.bytesPerOp - ctlR.bytesPerOp < 20)) {
-        return; // GC intervention edge case
-    }
     assert.equal(rep.verdict, 'fail');
     assert.ok(rep.violations.some((v) => v.metric === 'bytesPerOp.delta'));
 });
@@ -254,20 +269,29 @@ test('compareOps: throws on non-result inputs (primitive form)', () => {
 });
 
 test('assertCompareOps: convenience form throws GcBudgetError on delta failure', () => {
-    // Uint8Array's 2048-byte backing buffer lands in external ArrayBuffer
-    // memory, not JS heap; process.memoryUsage().heapUsed only sees the
-    // ~80-byte wrapper. On some V8 versions (notably Node 26 on Apple
-    // Silicon) the wrapper is packed tightly enough that per-op growth
-    // falls below the maxExtraBytesPerOp threshold. Use plain object
-    // allocation, which lands in heapUsed deterministically at ~100 bytes/op.
+    // Two independent portability hazards, both fixed here.
+    //
+    // 1. WHAT is allocated. A typed array's backing buffer lands in external
+    //    ArrayBuffer memory, not the JS heap, so heapUsed only sees the small
+    //    wrapper. A plain object IS heap-visible but its retained size is
+    //    V8-build dependent (pointer compression narrows tagged slots), so it
+    //    shrinks several-fold on Apple Silicon and can slip under the
+    //    threshold. A retained plain ARRAY is heap-visible on every build and
+    //    stays hundreds of bytes per op.
+    //
+    // 2. WHETHER the delta is measured against noise. Without stabilize the
+    //    two-point heap delta includes cold-start churn: a noop control can
+    //    itself read ~50 B/op from JIT tier-up, and the candidate's
+    //    allocations can be partly collected mid-loop -- so the DIFFERENCE
+    //    lands under maxExtraBytesPerOp and the expected throw never happens.
+    //    stabilize:true GC-anchors both boundaries, so the control reads ~0
+    //    and the delta is the true survivor rate.
     const sink = [];
     function control(i) { return i | 0; }
-    function candidate(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-        return i;
-    }
+    function candidate(i) { sink.push(new Array(64).fill(i)); return i; }
     assert.throws(
-        () => assertCompareOps(control, candidate, { maxExtraBytesPerOp: 20 }, { ops: 500, warmup: 50 }),
+        () => assertCompareOps(control, candidate,
+            { maxExtraBytesPerOp: 20 }, { ops: 500, warmup: 50, stabilize: true }),
         GcBudgetError
     );
 });

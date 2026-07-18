@@ -143,17 +143,32 @@ test('stabilize: cold-run assertCompareOps produces the same verdict as warm-run
     // assertCompareOps can collapse because a mid-steady major GC compacts
     // heapUsed below the start sample. With stabilize:true, the forced
     // boundary GCs make the measurement order-independent.
+    //
+    // The retained array is 1024 slots, not 64. This pin reported a false
+    // 'pass' on an M4 that could not be reproduced on the reference box at
+    // 64 slots, so the signal is sized to dominate rather than to be
+    // marginally sufficient: ~8 KB per op against a 20 B/op rule, a margin of
+    // several hundred x that no plausible live-set jitter can close.
     const sink = [];
     function control(i) { return i | 0; }
-    // Retained array -- see note above: build-independent, far above the rule.
-    function candidate(i) { sink.push(new Array(64).fill(i)); return i; }
-    // Simulate cold-CI: fresh call, no prior warming of these paths.
+    function candidate(i) { sink.push(new Array(1024).fill(i)); return i; }
+
+    // Measure explicitly BEFORE asserting the throw. `assert.throws` alone
+    // reports only "Missing expected exception" when the gate passes, which
+    // says nothing about why -- it hides whether the control read high, the
+    // candidate read low, or the measurement was never stabilized at all.
+    // These numbers make the next failure diagnosable from the report alone.
+    const opts = { ops: 500, warmup: 50, stabilize: true };
+    const ctl = measureOps(control, opts);
+    const can = measureOps(candidate, opts);
+    const delta = can.bytesPerOp - ctl.bytesPerOp;
+    assert.ok(delta > 20,
+        'retained leak must clear the 20 B/op rule -- control=' + ctl.bytesPerOp
+        + ' candidate=' + can.bytesPerOp + ' delta=' + delta
+        + ' stable=' + can.bytesPerOpStable + '/' + ctl.bytesPerOpStable);
+
     assert.throws(
-        () => assertCompareOps(
-            control, candidate,
-            { maxExtraBytesPerOp: 20 },
-            { ops: 500, warmup: 50, stabilize: true }
-        ),
+        () => assertCompareOps(control, candidate, { maxExtraBytesPerOp: 20 }, opts),
         (e) => e && e.constructor && e.constructor.name === 'GcBudgetError'
     );
 });
