@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.5.1
+# @zakkster/lite-gc-profiler v1.5.2
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -40,21 +40,51 @@ test-helpers/explain and the lite-gc-gate CLI.
 ## Key semantics
 
 - Three-state verdict never silently green on unverifiable rules.
-- Gates fail CLOSED (v1.5.1). An unknown rule key throws `TypeError`
-  rather than matching nothing; a non-finite or non-numeric threshold
-  throws `RangeError`; a non-finite metric yields `inconclusive`, never
-  `pass`. Do not pass rule keys a lane does not implement.
+- Gates fail CLOSED (v1.5.1, extended v1.5.2). An unknown rule key throws
+  `TypeError` rather than matching nothing; a non-finite or non-numeric
+  threshold throws `RangeError` on the ops/frames lanes and yields
+  `inconclusive` on the `checkNoGc` lane; a non-finite metric yields
+  `inconclusive`, never `pass`. Do not pass rule keys a lane does not
+  implement. Rule thresholds are read exactly once, so a getter cannot
+  return one value to validation and another to the comparison.
 - One measurement at a time. Overlapping/nested `measureOps`,
   `measureFrames` or `measureOpsAsync` throws/rejects "already in
-  flight" -- all lanes share one heap. Measure sequentially.
-- `opts.capacity` must be a positive integer in every lane.
+  flight" -- all lanes share one heap. Measure sequentially. The guard
+  releases when a run settles; a run that NEVER settles (a scheduler
+  that never fires, a promise that never resolves) holds it for the life
+  of the process by design -- releasing on a timeout would resume the
+  cross-contamination the guard prevents.
+- `opts.capacity` must be a positive integer <= 2**24 (MAX_RING_CAPACITY)
+  in every lane, and the GcProfiler constructor enforces the same ceiling
+  (v1.5.2). Past it: RangeError. Before the ceiling, capacities above
+  2**30 hung the process (32-bit shift wrap in pow2) and large ones below
+  it silently allocated GB-scale rings.
+- The overlapping-measurement guard is per module instance. Two copies
+  of Gc.js (source + bundled) each keep their own counter and cannot see
+  each other's in-flight runs. Import the profiler once.
+- `record()` requires a finite durationMs >= 0 and a finite startTime
+  when given; both throw RangeError otherwise (v1.5.2).
+- start() and reset() are hard cutoffs (v1.5.2): 'gc' entries whose
+  startTime precedes them are dropped even when node delivers the queued
+  backlog of an earlier sync workload later in the same turn. A profiler
+  never inherits GC history it did not observe; the synthetic record()
+  API is exempt.
 - Phases (linear, no nesting), regions (nested, LIFO enter/exit).
 - Attribution is firing-site, not allocator. Explain mode answers the
   allocator question separately via node:inspector heap sampling.
 - Rep policy defaults: majors/minors -> all-clean, pauses/rates ->
   best-clean. Override per rule.
-- Baseline regression semantic: current.median > baseline.max.
+- Baseline regression semantic: current.median > baseline.max. Both
+  comparands must be finite; a metric whose baseline `max` is NaN/null/
+  non-numeric reports `checked: false` (v1.5.2). A baseline with no
+  comparable metrics at all -> `inconclusive` with
+  `reason: 'no_comparable_metrics'`, never `pass`.
 - Fingerprint mismatch -> inconclusive (D6).
+- `summary.phases`/`summary.byRegion` define keys via defineProperty
+  (v1.5.2), so a phase named `__proto__` is a real key. Prototype and
+  shape are unchanged; no assertion style change is needed.
+- `sampleHeap()` ignores non-finite readings rather than letting them
+  poison subsequent allocation accounting (v1.5.2).
 - CLI exit codes: 0 pass, 1 fail, 2 inconclusive, 3 infrastructure error.
 
 ## Zero-alloc guarantees

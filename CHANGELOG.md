@@ -1,5 +1,217 @@
 # Changelog
 
+## 1.5.2
+
+Adversarial hardening, two passes (G99.9 + G99.10). Zero new public API.
+Seven defects found by attack-first torture over what v1.5.1 had already
+hardened: five on the verdict surfaces v1.5.1 did not reach -- the phase and
+region snapshots, the heap sampler, the `checkNoGc` threshold path and the
+baseline comparator -- then two more on a second pass over that work, an
+infinite-loop DoS in capacity handling and an observation-window hole that
+let a profiler inherit GC history it never watched. All seven are closed and
+pinned by `test/torture/g99-9-extreme.test.mjs` (41 scenarios) and
+`test/torture/g99-10-deep.test.mjs` (17 scenarios, axes T-X).
+Suite: 459 -> 517.
+
+v1.5.1 closed three routes to a false `'pass'` on the *rules* surface. Four of
+the five G99.9 defects are the same class on other surfaces. The two G99.10
+defects are different: one is a denial of service, and the other fails
+*closed* -- it made a zero-GC gate blame your code for the previous
+workload's garbage.
+
+Also verified and pinned: the retention floor (the smallest per-op leak
+`measureOps` convicts, and the zero-alloc workload it must not), and full
+accounting integrity while million-node lists, 10k-deep closure chains,
+5k-deep prototype chains, nested Maps and nested arrays are torn down under
+phases, with GC forced at all 16 region depths.
+
+### What can change what you observe
+
+Two things, both detailed below:
+
+- a ring capacity above the new `MAX_RING_CAPACITY` ceiling now throws
+  `RangeError`, where it previously hung the process or silently allocated a
+  gigabyte-scale ring;
+- your GC numbers no longer include events that began before the profiler
+  started, so a gate that was failing on the *previous* workload's garbage
+  will now pass. If a gate starts passing after this upgrade, it was wrong
+  before.
+
+Nothing else is: every other fix is observable only on input that previously
+produced a wrong answer. In particular `summary.phases` and
+`summary.byRegion` keep their exact shape -- prototype, property access,
+iteration, spreads, `JSON.stringify`, `deepStrictEqual` against an object
+literal, and the `Record<string, PhaseSnapshot>` type are all unchanged.
+
+### The gate now fails closed (continued)
+
+- **A phase or region named `__proto__` no longer vanishes from the summary.**
+  Both snapshots were built with `{}` and populated via `out[name] = ...`, so
+  the name `__proto__` set the object's prototype instead of creating an own
+  property. The GC events were counted globally but were unreachable through
+  `Object.keys`, `JSON.stringify`, or any per-phase rule -- a phase budget on
+  that phase could never fire. Both snapshots now define their keys with
+  `Object.defineProperty`, which creates an own property for every name --
+  including `__proto__` -- without touching the object's prototype. A
+  null-prototype object would also close the hole, but it would change the
+  shape consumers already rely on: `deepStrictEqual(phases, {})` would break,
+  and `phases.hasOwnProperty(...)`, `String(phases)` and `` `${phases}` ``
+  would all throw `TypeError` -- a crash in an ordinary logging path, traded
+  for a bug most consumers would never hit. `constructor`, `toString`, and
+  every other `Object.prototype` member were already safe (the intern tables
+  are `Map`s); only `__proto__` was special.
+
+- **A non-finite heap sample no longer zeroes subsequent allocation
+  accounting.** `sampleHeap()` computed `used - _heapPrev` and then assigned
+  `_heapPrev = used` unconditionally. One `NaN` reading -- a mocked or failing
+  `performance.memory`, a partial measurement -- poisoned `_heapPrev`, so the
+  *next* real sample computed `real - NaN = NaN`, accrued nothing, and left
+  `allocBytes` at `0`. Measured: the same 60 MB of growth reported
+  `allocBytes: 59_999_000` and `verdict: 'fail'` when clean, versus
+  `allocBytes: 0` and `verdict: 'pass'` with `checked: {maxAllocRate: true}`
+  when one `NaN` sample sat in the middle. Non-finite samples are now dropped
+  without advancing `_heapPrev`, so growth bracketing the glitch is still
+  measured against the last valid reading.
+
+- **`checkNoGc` thresholds are read exactly once and must be finite.**
+  `_evalRules` read each threshold twice -- once for the `!== undefined` guard,
+  once for the comparison -- so a rules object with a getter could return `0`
+  to the guard and `Infinity` to the comparison and gate nothing. Separately,
+  `checkNoGc` never called `_validateRules` (that landed only on the ops and
+  frames lanes in v1.5.1), so `checkNoGc(s, { maxMajor: NaN })` was green too.
+  Each threshold is now snapshotted into a local and requires
+  `_isFiniteMetric`; non-finite thresholds yield `inconclusive` with
+  `checked: {rule: false}` rather than `pass`.
+
+- **`checkAgainstBaseline` no longer certifies a baseline that verifies
+  nothing.** Two independent routes:
+
+  1. The metric loop skipped any pair missing from either side (`continue`),
+     then set `verdict = violations.length ? 'fail' : 'pass'`. A baseline with
+     no comparable metrics -- truncated file, schema drift, hand-edited JSON,
+     empty aggregate -- compared *nothing* and returned `'pass'` with
+     `checked: {}`.
+  2. A non-finite baseline `max` made `median > max` false for every input, so
+     all 11 metrics reported `checked: true` while enforcing nothing. Note
+     `JSON.stringify(NaN)` is `null`, so a *saved* baseline delivers `null` and
+     a hand-edited one can deliver a string; all three behaved identically.
+
+  A comparison now counts only when both comparands are finite, and a report
+  with nothing verified is `'inconclusive'` with
+  `reason: 'no_comparable_metrics'`. Partially poisoned baselines still gate on
+  the metrics that survive, and real regressions are still caught.
+
+### Diagnostics
+
+- **The overlapping-measurement error now names the abandoned-run cause.** The
+  guard releases only when a run settles, so a frame scheduler that never fires
+  its callback -- or an async op whose promise never resolves -- holds it for
+  the life of the process, and every later measurement failed with "await each
+  measurement before starting the next", which misdiagnoses a caller who did.
+  The message now explains this, and explains why there is deliberately no
+  timeout release: an abandoned run keeps allocating into the same heap, so
+  releasing the guard would resume the cross-contamination it exists to
+  prevent. Fix the run that never finished.
+
+### Confirmed correct under attack (no change)
+
+Recorded so they are not re-litigated. Transient churn reads `bytesPerOp ~ 0`
+and *passes* a tight budget -- `bytesPerOp` measures surviving allocation, and
+flagging transient garbage as retention would be a false `fail`, equally
+corrosive. Also verified: reentrant and synchronous frame schedulers,
+throwing/rejecting workloads releasing the guard, 2M op counts, capacity-1
+rings, 3000 forced collections, dual concurrent observers, `settle()` under a
+sustained storm, mixed-source `compareGc`/`gateReps`, `__proto__` payloads in
+rules and summary objects (no `Object.prototype` pollution), and all five hard
+capacity limits at and past the cliff.
+
+### An infinite-loop DoS in capacity handling
+
+`pow2` rounded the ring capacity up with `p <<= 1`. The shift coerces to
+32-bit: at 2**31 it wrapped negative, then to 0, and the loop spun
+forever. `new GcProfiler(2**30 + 1)` -- and any larger capacity, through
+every measure lane, since `_validateCapacity` accepted any positive
+integer -- hung the process in an uninterruptible loop before any
+allocation. Below the wrap it was a resource bomb instead: 2**26 silently
+allocated a 1 GB ring, and 2**30 crashed the process attempting 16 GB.
+
+Two changes, same policy as MAX_PHASES (throw loudly at the boundary):
+
+- `pow2` now doubles with float multiply, which is exact for powers of
+  two up to 2**53 and cannot wrap.
+- Capacity has a hard ceiling, `MAX_RING_CAPACITY` (2**24 = 16,777,216
+  slots; the ring costs 16 bytes/slot, so the ceiling is already 256 MB
+  -- two orders of magnitude past the documented 8-256 range). The
+  GcProfiler constructor and every lane's `opts.capacity` throw
+  `RangeError` past it. The pins run in child processes with a timeout,
+  so a regression here fails a test instead of hanging CI.
+
+### start() and reset() are now hard cutoffs
+
+Sync GC-heavy code blocks the event loop, so its 'gc' entries sit in the
+perf_hooks dispatch queue -- and node delivers that backlog to an
+observer registered *later in the same turn*. A profiler started after a
+sync workload therefore inherited the workload's GC history:
+
+- a zero-GC gate over genuinely quiet code **falsely failed** (measured:
+  a profiler started right after six forced majors reported them all
+  against an alloc-free window);
+- phase sums diverged from `gc.count`, because the pre-start entries
+  were counted globally but predate the first phase boundary
+  (measured: sum 12 vs count 15 with three `measureOps` runs earlier in
+  the same tick);
+- `reset()` had the matching hole: queued pre-reset entries repopulated
+  the counters it had just cleared;
+- restarting after `stop()` could admit entries from the stopped gap.
+
+The observer now records an observation floor at `start()` (and advances
+it at `reset()`), and drops entries whose `startTime` precedes it -- one
+compare per entry in the batched observer callback, not in a hot body.
+An entry that *began* before `start()` is excluded even if it finished
+after: observation covers events that began under observation. The
+synthetic `record()` API is deliberately not subject to the floor; tests
+inject events with arbitrary timestamps.
+
+This is a behaviour change in the fail-closed direction: numbers that
+previously included another workload's backlog no longer do. If a gate
+of yours starts passing after this upgrade, it was previously blaming
+your code for GC it did not cause.
+
+### The synthetic `record()` surface validates its input
+
+`GcProfiler.record(kind, durationMs, startTime)` coerced with
+`+durationMs || 0`, which silently turned `NaN` into `0` and let negative and
+infinite values through into the running totals. A single
+`record(GC_MAJOR, -100)` produced `totalMs: -95` next to `maxMs: 5` -- so
+`maxMs > totalMs`, `avgMs` went negative, and a `maxTotalMs` rule compared
+against a negative total passes anything. `Infinity` was quieter and worse: it
+poisoned `totalMs` and `avgMs` to non-finite for every subsequent read of that
+profiler, not just the bad entry.
+
+Both now throw `RangeError`, as does a non-finite `startTime`. This is a test
+surface, so garbage-in would be a defensible policy -- except that the garbage
+is indistinguishable from a real reading by the time a gate sees it. Pinned by
+axis X in `g99-10-deep`. All 45 existing `record()` call sites were already
+valid and are unaffected.
+
+### Verified under attack (no change)
+
+The retention floor is real and two-sided: one `{a:i}` retained per op
+reads ~40 B/op and fails a 16 B/op budget; a genuinely zero-alloc op at
+500k ops reads well under 1 B/op and passes the same budget. (At 50k
+fast ops, V8 self-noise amortizes to several bytes/op -- size runs
+accordingly, or use the differential lanes.) Accounting invariants
+(kind buckets sum to count, p99 <= max <= total, phase sums equal
+count, all four formatters) hold through deep-structure teardown storms
+and GC forced at every one of the 16 region nesting depths. Region
+intervals stay coherent across a stop()/start() gap. The v1.5.2
+`_defineSnapshotKey` fix holds under builtin-shadowing phase names
+(`toString`, `valueOf`, `hasOwnProperty`, `__proto__`, `constructor`)
+including per-phase rules and all formatters; `String(summary.phases)`
+throws only when a phase is literally named `toString`, which is
+inherent to own keys on a plain-prototype object and does not affect
+the library's own paths.
+
 ## 1.5.1
 
 Adversarial hardening (G20). Zero new public API, zero behaviour change for

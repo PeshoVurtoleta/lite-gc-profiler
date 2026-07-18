@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -40,7 +40,21 @@ const UASM_SUPPORTED = typeof performance !== 'undefined'
     && typeof globalThis !== 'undefined'
     && globalThis.crossOriginIsolated === true;
 
-function pow2(n) { let p = 1; while (p < n) p <<= 1; return p < 1 ? 1 : p; }
+// Round up to the next power of two. Float multiply, NOT `p <<= 1`: the shift
+// coerces to 32-bit, so at 2**31 it wraps negative, then to 0, and the loop
+// spins forever -- `new GcProfiler(2**30 + 1)` was an infinite-loop DoS
+// reachable from every lane. Doubling stays exact for powers of two up to
+// 2**53; MAX_RING_CAPACITY (below) keeps inputs far under that.
+function pow2(n) { let p = 1; while (p < n) p *= 2; return p < 1 ? 1 : p; }
+
+// Hard ceiling for ring capacity, applied in the GcProfiler constructor and in
+// _validateCapacity for the measure lanes. The ring costs 16 bytes per slot
+// (duration buffer + percentile scratch), so 2**24 slots is already 256 MB --
+// two orders of magnitude past any documented use (defaults are 8-256).
+// Without a ceiling, capacity was a resource bomb (2**26 silently allocated
+// 1 GB; 2**30 crashed the process on a 16 GB allocation) and, before the pow2
+// fix above, a hang. Same policy as MAX_PHASES: throw loudly at the boundary.
+const MAX_RING_CAPACITY = 16777216; // 2**24
 
 // Fixed capacities for the phase subsystem. Both throw on overflow rather than
 // silently drop -- silent overflow of a gating primitive is the class of bug G1
@@ -72,10 +86,38 @@ function percentile(ring, scratch, q) {
     if (n === 0) return 0;
     for (let i = 0; i < n; i++) scratch[i] = ring.buf[i];   // order is irrelevant; we sort
     const view = scratch.subarray(0, n);
+    // NOTE: `scratch` is a Float64Array, and TypedArray.prototype.sort is
+    // NUMERIC by default -- unlike Array.prototype.sort, which is lexicographic
+    // and would order [2, 10, 9] as [10, 2, 9], silently corrupting every
+    // percentile. This is correct only for as long as the ring stays a typed
+    // array. If it ever becomes a plain Array, this needs an explicit
+    // `(a, b) => a - b` comparator.
     view.sort();
     let idx = Math.ceil(q * n) - 1;
     if (idx < 0) idx = 0; else if (idx > n - 1) idx = n - 1;
     return view[idx];
+}
+
+/**
+ * Define a snapshot key as an OWN, enumerable property.
+ *
+ * Plain assignment `out[name] = v` cannot express a key called '__proto__':
+ * it invokes the Object.prototype setter, silently sets the prototype, and the
+ * entry vanishes from Object.keys and JSON.stringify -- a phase whose GC counts
+ * a gate can no longer see, which is a fail-open hole.
+ *
+ * defineProperty creates the own property for every name including '__proto__',
+ * WITHOUT changing the object's prototype. A null-prototype object would also
+ * fix the hole, but it changes the shape consumers already depend on: it breaks
+ * `deepStrictEqual(phases, {})`, and it makes `phases.hasOwnProperty(...)`,
+ * `String(phases)` and `${phases}` throw TypeError -- a crash in an ordinary
+ * logging path, traded for a bug most consumers will never hit. This keeps the
+ * fix and the shape. Runs once at summary time, never on the hot path.
+ */
+function _defineSnapshotKey(out, name, value) {
+    Object.defineProperty(out, name, {
+        value: value, enumerable: true, writable: true, configurable: true
+    });
 }
 
 class GcProfiler {
@@ -92,6 +134,13 @@ class GcProfiler {
     constructor(capacity = 256, options = {}) {
         if (!(capacity > 0) || !isFinite(capacity)) {
             throw new RangeError('GcProfiler: capacity must be a positive finite number');
+        }
+        if (capacity > MAX_RING_CAPACITY) {
+            throw new RangeError(
+                'GcProfiler: capacity ' + capacity + ' exceeds MAX_RING_CAPACITY (' +
+                MAX_RING_CAPACITY + '). The ring costs 16 bytes/slot; raise the ' +
+                'constant if real usage ever needs more.'
+            );
         }
 
         // Source resolution. 'auto' (default) follows the historical detection.
@@ -188,6 +237,9 @@ class GcProfiler {
         this._regionUnattrWeakcb = 0;
 
         this._obs = null; this._running = false;
+        // Observation-window floor (see start()). Infinity until the first
+        // start(): a profiler that was never started counts nothing.
+        this._observeSince = Infinity;
         this._wantHeap = options.heap !== false;
         // Batch counter for settle(): incremented once per observer callback,
         // regardless of how many entries the batch contained. Settle uses it as
@@ -215,12 +267,25 @@ class GcProfiler {
     /** Attach the perf_hooks GC observer (node). No-op where 'gc' entries are unsupported. */
     start() {
         if (this._running) return this;
+        // Observation-window floor. Sync GC-heavy code blocks the event loop, so
+        // its 'gc' entries sit in the dispatch queue and node delivers them to
+        // an observer registered LATER in the same turn. Without this floor a
+        // fresh profiler inherited that backlog: a zero-GC gate over genuinely
+        // quiet code falsely FAILED, and phase sums diverged from gc.count
+        // (pre-start entries counted globally, attributable to no phase).
+        // startTime shares performance.now()'s clock domain, so one compare per
+        // entry (in the batched observer callback, not a hot body) makes start()
+        // a hard cutoff, symmetric with stop(). An entry that BEGAN before
+        // start() is excluded even if it finished after -- observation covers
+        // events that began under observation.
+        this._observeSince = performance.now();
         if (!GC_SUPPORTED) { this._running = true; return this; }   // heap/none: nothing to attach
         const self = this;
         this._obs = new PerformanceObserver((list) => {
             const es = list.getEntries();
             for (let i = 0; i < es.length; i++) {
                 const e = es[i];
+                if (e.startTime < self._observeSince) continue;
                 // node >=16 carries kind in entry.detail; older exposed e.kind directly.
                 // Guard the object, not the expression: a null detail must fall through.
                 const d = e.detail;
@@ -310,10 +375,36 @@ class GcProfiler {
      * events into specific phases deterministically.
      */
     record(kind, durationMs, startTime) {
+        // durationMs must be a finite, non-negative number. It was previously
+        // coerced with `+durationMs || 0`, which silently turned NaN into 0 and
+        // let a negative value through -- and a negative duration DECREMENTS the
+        // running total, breaking the accounting invariants the gate depends on:
+        // a single record(kind, -100) drove totalMs to -95 with maxMs 5, so
+        // maxMs > totalMs and avgMs went negative. A `maxTotalMs` rule against a
+        // negative total passes anything. Infinity was worse in a quieter way:
+        // it poisoned totalMs and avgMs to non-finite for every later read.
+        //
+        // This is the synthetic test surface, so garbage-in would be a defensible
+        // policy -- but the garbage here is indistinguishable from a real reading
+        // downstream, and the package's whole argument is that a gate must not
+        // report a number it cannot stand behind. Same policy as MAX_PHASES and
+        // MAX_RING_CAPACITY: throw loudly at the boundary.
+        if (typeof durationMs !== 'number' || !isFinite(durationMs) || durationMs < 0) {
+            throw new RangeError(
+                'GcProfiler.record: durationMs must be a finite number >= 0; got ' +
+                (typeof durationMs === 'number' ? String(durationMs) : typeof durationMs)
+            );
+        }
+        if (startTime !== undefined && (typeof startTime !== 'number' || !isFinite(startTime))) {
+            throw new RangeError(
+                'GcProfiler.record: startTime must be a finite number when provided; got ' +
+                (typeof startTime === 'number' ? String(startTime) : typeof startTime)
+            );
+        }
         const t = startTime === undefined
             ? (typeof performance !== 'undefined' ? performance.now() : 0)
             : +startTime;
-        this._record(kind | 0, +durationMs || 0, t);
+        this._record(kind | 0, durationMs, t);
         return this;
     }
 
@@ -478,6 +569,14 @@ class GcProfiler {
             if (!HEAP_SUPPORTED || !this._wantHeap) return this;
             used = readHeapUsed();
         }
+        // A non-finite reading (broken/mocked performance.memory, a NaN from a
+        // failed measurement) must NOT advance _heapPrev. If it did, the next
+        // real sample would compute `real - NaN = NaN`, accrue nothing, and
+        // leave allocBytes frozen at 0 while the heap actually grew -- a
+        // maxAllocRate gate would then report a green PASS on a real leak.
+        // Dropping the bad sample keeps the delta measured against the last
+        // valid reading, so growth bracketing the glitch stays visible.
+        if (typeof used !== 'number' || !isFinite(used)) return this;
         const t = now === undefined ? (typeof performance !== 'undefined' ? performance.now() : 0) : now;
         this._heapActive = true;
         if (this._heapFirst < 0) {
@@ -600,11 +699,13 @@ class GcProfiler {
     }
 
     _buildPhasesSnapshot() {
+        // See _defineSnapshotKey: a phase named '__proto__' must land as an own
+        // key rather than silently setting the prototype and vanishing.
         const out = {};
         for (let i = 0; i < this._phaseIdxCount; i++) {
             const name = this._phaseNames[i];
             const count = this._phaseCount[i];
-            out[name] = {
+            _defineSnapshotKey(out, name, {
                 gc: {
                     count,
                     totalMs: this._phaseSumMs[i],
@@ -615,17 +716,19 @@ class GcProfiler {
                     incremental: this._phaseIncremental[i],
                     weakcb: this._phaseWeakcb[i]
                 }
-            };
+            });
         }
         return out;
     }
 
     _buildRegionsSnapshot() {
+        // Same reason as _buildPhasesSnapshot: a region named '__proto__' must
+        // be a visible own key, not a swallowed prototype assignment.
         const out = {};
         for (let i = 0; i < this._regionIdxCount; i++) {
             const name = this._regionNames[i];
             const count = this._regionCount[i];
-            out[name] = {
+            _defineSnapshotKey(out, name, {
                 gc: {
                     count,
                     totalMs: this._regionSumMs[i],
@@ -636,7 +739,7 @@ class GcProfiler {
                     incremental: this._regionIncremental[i],
                     weakcb: this._regionWeakcb[i]
                 }
-            };
+            });
         }
         // Only include unattributed bucket if it saw events.
         if (this._regionUnattrCount > 0) {
@@ -658,6 +761,10 @@ class GcProfiler {
     }
 
     reset() {
+        // Advance the observation floor: entries recorded before reset() but
+        // still queued for dispatch must not repopulate the counters we are
+        // clearing. Same backlog mechanism as the start() floor above.
+        this._observeSince = performance.now();
         this._dur.clear();
         this._count = 0; this._sumMs = 0; this._maxMs = 0;
         this._minor = 0; this._major = 0; this._incremental = 0; this._weakcb = 0;
@@ -781,34 +888,45 @@ function _evalRules(rules, gcStat, heapStat, summary, scope, checkFn, violations
     const prefix = scope ? 'phases.' + scope + '.gc.' : 'gc.';
     const rateMetric = scope ? 'phases.' + scope + '.heap.allocRateBytesPerSec' : 'heap.allocRateBytesPerSec';
 
-    if (rules.maxMajor !== undefined) {
-        const ok = checkFn('maxMajor', source, summary);
+    // Each threshold is read EXACTLY ONCE into a local. A rules object with a
+    // getter that returns a valid number to one read and Infinity/NaN to the
+    // next could otherwise pass validation and then compare false against the
+    // real metric -- a fail-open. Snapshotting also lets us reject a non-finite
+    // threshold (NaN/Infinity) as inconclusive rather than silently passing
+    // (NaN comparisons are always false; an unbounded gate is not a gate).
+    const _mMajor = rules.maxMajor;
+    if (_mMajor !== undefined) {
+        const ok = checkFn('maxMajor', source, summary) && _isFiniteMetric(_mMajor);
         checked.maxMajor = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.major > rules.maxMajor) violations.push({ metric: prefix + 'major', limit: rules.maxMajor, actual: gcStat.major, reason: (scope ? '[' + scope + '] ' : '') + gcStat.major + ' major GC(s) > ' + rules.maxMajor });
+        else if (gcStat.major > _mMajor) violations.push({ metric: prefix + 'major', limit: _mMajor, actual: gcStat.major, reason: (scope ? '[' + scope + '] ' : '') + gcStat.major + ' major GC(s) > ' + _mMajor });
     }
-    if (rules.maxMinor !== undefined) {
-        const ok = checkFn('maxMinor', source, summary);
+    const _mMinor = rules.maxMinor;
+    if (_mMinor !== undefined) {
+        const ok = checkFn('maxMinor', source, summary) && _isFiniteMetric(_mMinor);
         checked.maxMinor = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.minor > rules.maxMinor) violations.push({ metric: prefix + 'minor', limit: rules.maxMinor, actual: gcStat.minor, reason: (scope ? '[' + scope + '] ' : '') + gcStat.minor + ' minor GC(s) > ' + rules.maxMinor });
+        else if (gcStat.minor > _mMinor) violations.push({ metric: prefix + 'minor', limit: _mMinor, actual: gcStat.minor, reason: (scope ? '[' + scope + '] ' : '') + gcStat.minor + ' minor GC(s) > ' + _mMinor });
     }
-    if (rules.maxPauseMs !== undefined) {
-        const ok = checkFn('maxPauseMs', source, summary);
+    const _mPause = rules.maxPauseMs;
+    if (_mPause !== undefined) {
+        const ok = checkFn('maxPauseMs', source, summary) && _isFiniteMetric(_mPause);
         checked.maxPauseMs = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.maxMs > rules.maxPauseMs) violations.push({ metric: prefix + 'maxMs', limit: rules.maxPauseMs, actual: gcStat.maxMs, reason: (scope ? '[' + scope + '] ' : '') + 'max GC pause ' + gcStat.maxMs.toFixed(3) + 'ms > ' + rules.maxPauseMs + 'ms' });
+        else if (gcStat.maxMs > _mPause) violations.push({ metric: prefix + 'maxMs', limit: _mPause, actual: gcStat.maxMs, reason: (scope ? '[' + scope + '] ' : '') + 'max GC pause ' + gcStat.maxMs.toFixed(3) + 'ms > ' + _mPause + 'ms' });
     }
-    if (rules.maxTotalMs !== undefined) {
-        const ok = checkFn('maxTotalMs', source, summary);
+    const _mTotal = rules.maxTotalMs;
+    if (_mTotal !== undefined) {
+        const ok = checkFn('maxTotalMs', source, summary) && _isFiniteMetric(_mTotal);
         checked.maxTotalMs = ok;
         if (!ok) anyUnchecked = true;
-        else if (gcStat.totalMs > rules.maxTotalMs) violations.push({ metric: prefix + 'totalMs', limit: rules.maxTotalMs, actual: gcStat.totalMs, reason: (scope ? '[' + scope + '] ' : '') + 'total GC ' + gcStat.totalMs.toFixed(3) + 'ms > ' + rules.maxTotalMs + 'ms' });
+        else if (gcStat.totalMs > _mTotal) violations.push({ metric: prefix + 'totalMs', limit: _mTotal, actual: gcStat.totalMs, reason: (scope ? '[' + scope + '] ' : '') + 'total GC ' + gcStat.totalMs.toFixed(3) + 'ms > ' + _mTotal + 'ms' });
     }
-    if (rules.maxAllocRate !== undefined) {
+    const _mAlloc = rules.maxAllocRate;
+    if (_mAlloc !== undefined) {
         // Heap accounting is global-only in G2; per-phase alloc rate is unverifiable
         // regardless of source. isCheckableInPhase encodes that (returns false).
-        const ok = checkFn('maxAllocRate', source, summary);
+        const ok = checkFn('maxAllocRate', source, summary) && _isFiniteMetric(_mAlloc);
         checked.maxAllocRate = ok;
         if (!ok) anyUnchecked = true;
         else {
@@ -817,7 +935,7 @@ function _evalRules(rules, gcStat, heapStat, summary, scope, checkFn, violations
             const rate = source === 'uasm'
                 ? (summary.uasm ? summary.uasm.growthRate : 0)
                 : (heapStat ? heapStat.allocRateBytesPerSec : 0);
-            if (rate > rules.maxAllocRate) violations.push({ metric: rateMetric, limit: rules.maxAllocRate, actual: rate, reason: (scope ? '[' + scope + '] ' : '') + 'alloc rate ' + (rate / 1048576).toFixed(2) + 'MB/s > ' + (rules.maxAllocRate / 1048576).toFixed(2) + 'MB/s' });
+            if (rate > _mAlloc) violations.push({ metric: rateMetric, limit: _mAlloc, actual: rate, reason: (scope ? '[' + scope + '] ' : '') + 'alloc rate ' + (rate / 1048576).toFixed(2) + 'MB/s > ' + (_mAlloc / 1048576).toFixed(2) + 'MB/s' });
         }
     }
     return anyUnchecked;
@@ -1475,6 +1593,15 @@ function checkAgainstBaseline(currentAggregate, baseline, options) {
         const bs = baseline[group] && baseline[group][name];
         if (!cs || !bs) continue;
         const key = group + '.' + name;
+        // A comparison is only verifiable when BOTH comparands are finite.
+        // A NaN baseline max (truncated file, hand-edited JSON, a stat derived
+        // from a run with a broken clock) makes `median > NaN` false for every
+        // input -- the metric would report checked:true while gating nothing.
+        // Same fail-open the NaN-threshold fix closed on the rules path.
+        if (!_isFiniteMetric(cs.median) || !_isFiniteMetric(bs.max)) {
+            checked[key] = false;
+            continue;
+        }
         checked[key] = true;
         // Regression: current.median > baseline.max
         if (cs.median > bs.max) {
@@ -1488,8 +1615,16 @@ function checkAgainstBaseline(currentAggregate, baseline, options) {
         }
     }
 
+    // Did anything actually get verified? A baseline with no comparable
+    // metrics (empty maps, missing groups, schema drift) previously fell
+    // through to 'pass' -- a green gate that checked nothing, which is the
+    // failure mode this package exists to make impossible.
+    let anyChecked = false;
+    for (const k in checked) if (checked[k] === true) { anyChecked = true; break; }
+
     let verdict;
     if (violations.length > 0) verdict = 'fail';
+    else if (!anyChecked) verdict = 'inconclusive';
     else verdict = 'pass';
 
     const report = {
@@ -1503,6 +1638,7 @@ function checkAgainstBaseline(currentAggregate, baseline, options) {
         currentFingerprint: currentFp
     };
     if (!fpMatch) report.fingerprintMismatchAccepted = true;
+    if (verdict === 'inconclusive' && !anyChecked) report.reason = 'no_comparable_metrics';
     return report;
 }
 
@@ -2052,6 +2188,12 @@ function _validateCapacity(fnName, capacity) {
             (typeof capacity === 'number' ? String(capacity) : typeof capacity)
         );
     }
+    if (capacity > MAX_RING_CAPACITY) {
+        throw new RangeError(
+            fnName + ': opts.capacity ' + capacity + ' exceeds MAX_RING_CAPACITY (' +
+            MAX_RING_CAPACITY + ')'
+        );
+    }
     return capacity;
 }
 
@@ -2087,7 +2229,13 @@ function _enterMeasurement(fnName) {
             fnName + ': another measurement is already in flight. Heap measurements ' +
             'share one heap, so overlapping runs silently contaminate each other ' +
             '(a clean workload reads the same as a leaking one). Await each ' +
-            'measurement before starting the next.'
+            'measurement before starting the next. If you did await, a previous ' +
+            'run never settled -- a frame scheduler that never fires its callback, ' +
+            'or an async op whose promise never resolves, leaves the guard held ' +
+            'for the life of the process. The guard is deliberately NOT released ' +
+            'on a timeout: an abandoned run keeps allocating into the same heap, ' +
+            'so releasing it would resume the cross-contamination it prevents. ' +
+            'Fix the run that never finished.'
         );
     }
     _measurementsInFlight++;

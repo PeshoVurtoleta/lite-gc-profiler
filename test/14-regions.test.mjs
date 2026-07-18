@@ -23,7 +23,7 @@ test('enter() creates a region in summary.byRegion', () => {
 
 test('no enter() -> summary.byRegion is empty object', () => {
     const gc = new GcProfiler();
-    assert.deepEqual(gc.summary().byRegion, {});
+    assert.equal(Object.keys(gc.summary().byRegion).length, 0);
 });
 
 test('enter() with invalid name throws', () => {
@@ -221,7 +221,7 @@ test('reset clears region intern table and counters', () => {
     gc.exit();
     gc.reset();
     const s = gc.summary();
-    assert.deepEqual(s.byRegion, {});
+    assert.equal(Object.keys(s.byRegion).length, 0);
 });
 
 // ---- back-compat ----

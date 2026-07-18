@@ -35,7 +35,10 @@ question cannot be honestly answered, the gate refuses to lie.
 ## Sources
 
 Which signal is live is either detected from the runtime, or overridden
-explicitly via `new GcProfiler(cap, { source: ... })`:
+explicitly via `new GcProfiler(cap, { source: ... })`. `cap` is the
+pause-ring capacity (default 256, rounded up to a power of two, ceiling
+2**24 -- the ring costs 16 bytes/slot, so larger values throw rather
+than allocate GB-scale buffers):
 
 - `'gc'` -- node (or any V8 runtime exposing `perf_hooks gc` entries). Precise
   event kinds and pause durations. Default on node.
@@ -338,6 +341,14 @@ A phase referenced in rules but never declared via `profiler.phase(name)` is
 inconclusive. A phase declared but with no events verifies as pass.
 
 The report grows a `checkedByPhase` map alongside `checked`.
+
+**Snapshot keys.** As of v1.5.2 `summary.phases` and `summary.byRegion`
+define their keys with `Object.defineProperty`, so a phase or region named
+`__proto__` lands as a real own key instead of silently setting the
+snapshot's prototype and disappearing from `Object.keys` and
+`JSON.stringify`. The prototype itself is untouched: reads, iteration,
+spreads, serialization, `deepStrictEqual` and `hasOwnProperty` all behave
+exactly as before.
 
 ## Differential: comparing against a control
 
@@ -815,6 +826,16 @@ is a regression. Rationale: allowing current to be as bad as the baseline's
 worst absorbs run-to-run noise on the capture side; a current whose typical
 value exceeds even the worst observed baseline is a real regression.
 
+**A baseline that cannot verify anything is `inconclusive`, not `pass`**
+(v1.5.2). A comparison counts only when both `current.median` and
+`baseline.max` are finite, so a metric whose baseline value is `NaN`,
+`null` (what `JSON.stringify` writes for `NaN`), or a hand-edited string
+reports `checked: false` rather than silently comparing false against
+everything. If no metric survives -- a truncated baseline file, missing
+`gc`/`heap` groups, schema drift, an empty aggregate -- the verdict is
+`inconclusive` with `reason: 'no_comparable_metrics'`. Regenerate the
+baseline rather than reaching for `allowInconclusive`.
+
 **Fingerprint check.** `createBaseline` captures a fingerprint of the
 environment (node, v8, platform, arch, cpu). Comparing against a baseline
 whose fingerprint differs from the current environment returns
@@ -1064,10 +1085,20 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 node --expose-gc --test test/*.mjs test/torture/*.mjs
 ```
 
-240 tests, all passing on this hardware. Torture tests (48 scenarios across
-four axes) enforce that adversarial inputs never silently pass, that real
-signal in noise always fails, that clean signal under hostile conditions
-always passes, and that self-consistency invariants hold across the API.
+517 tests, all passing on this hardware. Torture tests (187 scenarios
+across axes A-W) enforce that adversarial inputs never silently pass, that
+real signal in noise always fails, that clean signal under hostile
+conditions always passes, and that self-consistency invariants hold across
+the API. Later axes add resource and concurrency safety (E-I), then
+hostile identifiers, poisoned samples, capacity cliffs, baseline
+integrity, prototype-pollution inputs and lifecycle (J-S), then
+observation-window integrity, the capacity ceiling, the retention floor
+and deep teardown (T-W). See `TORTURE.md` for the per-slot breakdown.
+
+Every torture scenario started as a successful attack on the library. The
+unifying theme of the serious findings has been FAIL-OPEN behaviour: a
+budget gate that reports `'pass'` on input it never verified is worse than
+no gate, because CI stays green while the invariant rots.
 
 ## License
 

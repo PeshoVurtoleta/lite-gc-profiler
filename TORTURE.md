@@ -1,9 +1,16 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 69 torture scenarios shipped across v1.1.0, v1.2.0, and v1.3.0
-(G3.5, G5.5, G10.5, G13.5, G14.5). All axes represented. Plus 3 CLI
-integration scenarios (`test/18-partial-report.test.mjs`) that live
-alongside the torture suites for the G16.5 partial-report path.
+**Status:** 187 torture scenarios shipped across v1.1.0 through v1.5.2
+(G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
+G99.10). All axes represented. Plus 3 CLI integration scenarios
+(`test/18-partial-report.test.mjs`) that live alongside the torture
+suites for the G16.5 partial-report path.
+
+Axes A-D are the original four (below). G20.5 added E-I for resource and
+concurrency safety; G99.9 added J-S for hostile inputs, capacity cliffs,
+baseline integrity and lifecycle; G99.10 added T-X for observation-window
+integrity, the capacity ceiling, the retention floor, and deep teardown.
+The letters are cumulative across the suite, not per-file.
 
 Companion to `ROADMAP.md`. The G-numbers here slot into the roadmap's
 batches -- the code lands in the same session as the subsystem it
@@ -175,7 +182,155 @@ gate's truth-telling per se.
   the exit handler is a no-op. Regression protection for the
   additive-changes-stay-additive pin.
 
+### G14.6 -- Torture for stabilize mode (v1.3.1)
+
+`test/torture/g14-6-stabilize.test.mjs` -- **8 scenarios**. Retention vs
+transient separation under `opts.stabilize`, and the `--expose-gc`
+precondition failing loudly rather than silently degrading.
+
+### G17.5 -- Torture for Batch 7 (per-frame primitives, v1.4.0)
+
+`test/torture/g17-5-frames.test.mjs` -- **10 scenarios**. Scheduler
+hostility (never-firing, double-firing, synchronous, throwing), dropped
+frame accounting, and `maxDroppedFrames` as the first source-agnostic
+rule in the matrix.
+
+### G18.5 -- Torture for Batch 8 (serialized async ops, v1.5.0)
+
+`test/torture/g18-5-ops-async.test.mjs` -- **8 scenarios**. Serialization
+of async ops, `asyncResidual` as a post-settle growth detector, and
+rejection paths releasing every resource they acquired.
+
+### G20.5 -- Adversarial (v1.5.1)
+
+`test/torture/g20-5-adversarial.test.mjs` -- **34 scenarios**. Every one
+started as a successful attack. Introduced axes E-I:
+
+**Axis E (5)** overlapping-measurement guard: concurrent and nested runs
+rejected, guard released after throws and rejections, sequential runs
+unaffected.
+
+**Axis F (2)** capacity validated identically across all three lanes.
+
+**Axis G (3)** transient garbage storms not misread as retention;
+retained vs transient separable under storm conditions.
+
+**Axis H (4)** scheduler hostility in the frames lane.
+
+**Axis I (4)** minimum viable runs, warmup larger than the steady
+window, mutated result objects rejected, very large op counts.
+
+Axes A-D in this file cover the three closed routes to a false `'pass'`
+(unknown rule key, NaN threshold, NaN metric) and the observer leak.
+
+### G99.9 -- Extreme (v1.5.2)
+
+`test/torture/g99-9-extreme.test.mjs` -- **41 scenarios**. Attack-first:
+five defects found, four fail-open, all now pinned here. Introduced axes
+J-S:
+
+**Axis J (3)** hostile identifiers. A phase or region named `__proto__`
+set the snapshot's prototype instead of creating a key -- its GC counts
+were live but unreachable through `Object.keys`/`JSON.stringify`, so a
+phase budget on it could never fire. Also pins `constructor`,
+`toString`, empty/whitespace names, a 10k-character name, NUL/RTL/emoji,
+and a user phase colliding with the reserved `unattributed` bucket.
+
+**Axis K (4)** poisoned samples. One non-finite `sampleHeap()` reading
+used to poison `_heapPrev` and zero `allocBytes` for the rest of the
+window. Also backwards and frozen clocks.
+
+**Axis L (5)** capacity cliffs. State integrity **at and after** all five
+hard limits (32 phases, 1024 boundaries, 32 regions, 16 nesting, 2048
+intervals), plus fractional capacities rounding into the ring.
+
+**Axis M (2)** garbage zoo. 20+ allocation species -- string ropes,
+typed arrays, DataViews, Map/Set/WeakMap, Symbols, RegExps, BigInts,
+Errors, Proxies, generators, FinalizationRegistry -- with the invariant
+that kind buckets sum to `gc.count`, and that every formatter plus a
+JSON round trip survives the storm with an identical verdict.
+
+**Axis N (3)** evil objects. A rules threshold implemented as a getter
+returning a valid number to the guard and `Infinity` to the comparison;
+frozen rules/opts; a thenable that throws on `then`.
+
+**Axis O (7)** volume and durability. 10k reps through
+`aggregateGc`/`gateReps`, a capacity-1 ring under 3000 forced
+collections, dual concurrent observers agreeing on one event stream,
+`stop()` as a hard cutoff, `settle()` timing out rather than
+livelocking under a sustained storm, and the transient-vs-retained pair
+in the ops lane.
+
+**Axis P (7)** baseline integrity. Every route to a baseline that
+verifies nothing yet reported `'pass'`: empty metric maps, missing
+groups, an empty current aggregate, and non-finite `max` values (`NaN`
+in memory, `null` once saved, strings when hand-edited). Includes the
+counter-pins: partial poisoning still gates on surviving metrics, and a
+real regression is still caught.
+
+**Axis Q (2)** prototype-pollution inputs. `__proto__` payloads in rules
+and summary objects must not mutate `Object.prototype` or fabricate a
+verdict.
+
+**Axis R (4)** lifecycle. `reset()` mid-region, restart without
+double-counting, `summary()` idempotence, and the overlap error naming
+the abandoned-run cause.
+
+**Axis S (4)** cross-lane agreement on mismatched and degenerate inputs.
+
+### G99.10 -- Deep (v1.5.2)
+
+`test/torture/g99-10-deep.test.mjs` -- **17 scenarios**. Second
+attack-first pass over the v1.5.2 hardening. Two defects found and
+fixed; the rest of the file pins behaviour that held under attack.
+Introduced axes T-X:
+
+**Axis T (5)** observation-window integrity. Sync GC-heavy code queues
+its 'gc' entries and node delivers the backlog to observers registered
+later in the same turn; a profiler therefore inherited GC history it
+never observed. Pins: a profiler started after six forced majors sees at
+most one (spontaneous) event over an alloc-free window, never the
+backlog; phase sums equal `gc.count` even with sync `measureOps` runs
+earlier in the tick; `reset()` cannot be repopulated by pre-reset
+entries; restart admits nothing from the stopped gap; the synthetic
+`record()` API stays exempt from the floor. Assertions tolerate one
+spontaneous V8-scheduled event inside the observed window -- the pinned
+signature is the multi-major backlog, and V8 may legitimately run a step
+of its own with a post-start timestamp.
+
+**Axis U (3)** capacity ceiling. `new GcProfiler(2**30 + 1)` (and every
+lane's `opts.capacity`) was an infinite-loop DoS via a 32-bit shift wrap
+in `pow2`; below the wrap, large capacities were a resource bomb (1 GB
+at 2**26, a 16 GB crash at 2**30). Pins: everything past
+MAX_RING_CAPACITY throws `RangeError`, the boundary value itself is
+usable, and -- because the defect was a hang -- the probes run in child
+processes with a 5s timeout so a regression fails a test rather than
+hanging CI.
+
+**Axis V (2)** retention floor, two-sided. One `{a:i}` retained per op
+(~40 B/op, V8 minimum object footprint) must fail a 16 B/op budget; a
+genuinely zero-alloc op at 500k ops must read well under the same budget
+and pass. The second pin documents measurement sizing: at 50k fast ops,
+V8 self-noise amortizes to several bytes/op, which is not a defect --
+size the run or use the differential lanes.
+
+**Axis W (3)** deep teardown. Million-node linked list, 10k-deep closure
+chain, 5k-deep prototype chain, 1k-deep nested Maps and 100k-deep nested
+arrays built and dropped under five phases: kind buckets sum to count,
+p99 <= max <= total, phase sums equal count, every formatter survives.
+GC forced at all 16 region nesting depths: every depth sees its event.
+A region interval spanning a stop()/start() gap exits cleanly and keeps
+its pre-gap counts.
+
 ### Global torture invariants (applied via harness)
+
+**Axis X (4)** the synthetic `record()` surface. It is the one entry
+point where a caller hands the profiler a number the profiler did not
+measure, and it accepted anything: `+durationMs || 0` turned NaN into a
+silent 0 and let negatives and Infinity into the running totals. A
+single negative duration produced maxMs > totalMs and a negative avgMs;
+Infinity poisoned totalMs/avgMs to non-finite for every later read.
+Finite, non-negative durations and finite startTimes are now enforced.
 
 The harness under `test/torture/harness.mjs` provides
 `assertAxisA/B/C/D` primitives so each G-slot file reads as a flat list
@@ -197,9 +352,15 @@ are tolerated by `_extract` returning 0 for absent branches.
 | 4 | v1.1.0 (shipped) | G10, G11 | **G10.5** | 13 |
 | 5 | v1.2.0 (shipped) | G12 (G13 in sibling) | **G13.5** | 11 |
 | 6 | v1.3.0 (shipped) | G14, G15, G16, G16.5 | **G14.5** | 10 |
+| 6b | v1.3.1 (shipped) | stabilize mode | **G14.6** | 8 |
+| 7 | v1.4.0 (shipped) | G17, G18 | **G17.5** | 10 |
+| 8 | v1.5.0 (shipped) | G19 | **G18.5** | 8 |
+| 8b | v1.5.1 (shipped) | G20 | **G20.5** | 34 |
+| 9 | v1.5.2 (shipped) | G99.9 | **G99.9** | 41 |
+| 10 | v1.5.2 (shipped) | G99.10 | **G99.10** | 17 |
 
-**Total shipped: 69 torture scenarios + 3 global invariants + 3 CLI
-integration scenarios (G16.5).**
+**Total shipped: 187 torture scenarios + 3 global invariants + 3 CLI
+integration scenarios (G16.5).** Full suite: 517 tests.
 
 ---
 

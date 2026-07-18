@@ -1,4 +1,4 @@
-export const VERSION: '1.5.1';
+export const VERSION: '1.5.2';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -111,6 +111,12 @@ export interface GcSummary {
      * Per-phase snapshots. Empty object when no phase() calls happened. A phase
      * appears here iff phase(name) was called with that name; its counters may
      * be zero if no events fell within its boundaries.
+     *
+     * Since v1.5.2 keys are created with `Object.defineProperty`, so a phase
+     * named `__proto__` lands as a real own key instead of setting the
+     * snapshot's prototype and vanishing from Object.keys/JSON.stringify.
+     * The prototype is unchanged: reads, iteration, spreads, JSON.stringify,
+     * deepStrictEqual and hasOwnProperty all behave as they always did.
      */
     phases: Record<string, PhaseSnapshot>;
     /**
@@ -121,6 +127,8 @@ export interface GcSummary {
      *
      * Attribution is FIRING-SITE, not allocator. Use Explain mode for
      * allocator attribution.
+     *
+     * Keys defined with defineProperty since v1.5.2, as for `phases`.
      */
     byRegion: Record<string, PhaseSnapshot>;
     [key: string]: unknown;
@@ -156,6 +164,14 @@ export interface SettleResult {
 }
 
 export class GcProfiler {
+    /**
+     * @param capacity Pause-ring capacity. Default 256. Rounded up to the next
+     * power of two. Must be a positive finite number no greater than
+     * MAX_RING_CAPACITY (2**24 = 16,777,216; the ring costs 16 bytes/slot, so
+     * the ceiling is already 256 MB). Values past the ceiling throw
+     * RangeError -- before v1.5.2, capacities above 2**30 hung the process in
+     * an infinite loop and large ones below it were a silent resource bomb.
+     */
     constructor(capacity?: number, options?: GcProfilerOptions);
 
     readonly supported: boolean;
@@ -165,15 +181,37 @@ export class GcProfiler {
     readonly majorCount: number;
     readonly minorCount: number;
 
-    /** Attach the perf_hooks GC observer (node). No-op where 'gc' entries are unsupported. */
+    /**
+     * Attach the perf_hooks GC observer (node). No-op where 'gc' entries are
+     * unsupported.
+     *
+     * start() is a hard cutoff (v1.5.2): entries whose startTime precedes the
+     * start() call are excluded even if node delivers them afterwards. Sync
+     * GC-heavy code blocks the event loop and queues its 'gc' entries for
+     * dispatch; before the cutoff, a profiler started later in the same turn
+     * inherited that backlog, so a zero-GC gate over genuinely quiet code
+     * falsely failed. An entry that began before start() is excluded even if
+     * it finished after.
+     */
     start(): this;
-    /** Detach the observer. */
+    /** Detach the observer. Also a hard cutoff, symmetric with start(). */
     stop(): this;
 
     /**
      * Inject a GC event directly (tests, or a custom source).
      * `startTime` defaults to performance.now(); pass explicit values to inject
      * events into specific phases deterministically.
+     */
+    /**
+     * Inject a synthetic GC event. This is the test surface: `startTime` is
+     * arbitrary and deliberately exempt from the start()/reset() observation
+     * cutoff that applies to the observer path.
+     *
+     * `durationMs` must be a finite number >= 0 and `startTime`, when given,
+     * must be finite -- both throw `RangeError` otherwise. Before v1.5.2 a
+     * negative duration decremented the running total (producing maxMs > totalMs
+     * and a negative avgMs), and Infinity poisoned totalMs/avgMs to non-finite
+     * for every later read.
      */
     record(kind: number, durationMs: number, startTime?: number): this;
 
@@ -240,6 +278,11 @@ export class GcProfiler {
     /** Snapshot the current window; `meta` merges over the summary. */
     summary(meta?: Record<string, unknown>): GcSummary;
 
+    /**
+     * Clear all counters and start a fresh window. Also advances the
+     * observation floor (v1.5.2): 'gc' entries recorded before reset() but
+     * still queued for dispatch cannot repopulate the cleared counters.
+     */
     reset(): this;
     destroy(): this;
 }
@@ -504,8 +547,16 @@ export interface GcBaselineResult {
     source: GcSource | 'unknown';
     baselineFingerprint?: GcFingerprint;
     currentFingerprint?: GcFingerprint;
-    /** Populated on inconclusive. */
-    reason?: string;
+    /**
+     * Populated on inconclusive.
+     *   'invalid_baseline'       -- missing or wrong-schema baseline.
+     *   'fingerprint_mismatch'   -- machine/runtime differs and
+     *                               acceptFingerprintMismatch was not set.
+     *   'no_comparable_metrics'  -- (v1.5.2) nothing could be verified: the
+     *                               baseline and aggregate share no finite
+     *                               metric pair. Previously reported 'pass'.
+     */
+    reason?: 'invalid_baseline' | 'fingerprint_mismatch' | 'no_comparable_metrics' | (string & {});
     /** True when acceptFingerprintMismatch was used. */
     fingerprintMismatchAccepted?: boolean;
 }
@@ -605,7 +656,7 @@ export interface MeasureOpsOptions {
     warmup?: number;
     /** GcProfiler source override. Default 'auto'. */
     source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
-    /** GcProfiler pause-ring capacity. Default 256. */
+    /** GcProfiler pause-ring capacity. Default 256. Positive integer <= 2**24 (MAX_RING_CAPACITY); larger values throw RangeError. */
     capacity?: number;
     /**
      * Force a full GC at each steady-phase boundary so `bytesPerOp` reflects
@@ -761,7 +812,7 @@ export interface MeasureFramesOptions {
     frameBudgetMs?: number;
     /** Source selection. Default 'auto'. */
     source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
-    /** GcProfiler pause-ring capacity. Default 256. */
+    /** GcProfiler pause-ring capacity. Default 256. Positive integer <= 2**24 (MAX_RING_CAPACITY); larger values throw RangeError. */
     capacity?: number;
     /**
      * Force a full GC at each steady boundary so bytesPerFrame reflects the
@@ -882,7 +933,7 @@ export interface MeasureOpsAsyncOptions {
     warmup?: number;
     /** Source selection. Default 'auto'. */
     source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
-    /** GcProfiler pause-ring capacity. Default 256. */
+    /** GcProfiler pause-ring capacity. Default 256. Positive integer <= 2**24 (MAX_RING_CAPACITY); larger values throw RangeError. */
     capacity?: number;
     /**
      * When true, forces a full GC at each steady boundary so bytesPerOp

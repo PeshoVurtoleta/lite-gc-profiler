@@ -43,7 +43,7 @@ test('sequential phases both appear in summary', () => {
 test('no phase() calls -> summary.phases is empty object', () => {
     const gc = new GcProfiler();
     const s = gc.summary();
-    assert.deepEqual(s.phases, {});
+    assert.equal(Object.keys(s.phases).length, 0);
 });
 
 test('phase() rejects empty and non-string names', () => {
@@ -223,7 +223,7 @@ test('reset clears phase intern table and per-phase counters', () => {
     gc.record(GC_MAJOR, 5, performance.now() + 1);
     gc.reset();
     const s = gc.summary();
-    assert.deepEqual(s.phases, {});
+    assert.equal(Object.keys(s.phases).length, 0);
     assert.equal(s.gc.major, 0);
 });
 
