@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.5.0
+# @zakkster/lite-gc-profiler v1.5.1
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -19,6 +19,10 @@ test-helpers/explain and the lite-gc-gate CLI.
   `aggregateGc`, `gateReps`, `assertReps`,
   `measureOps`, `checkOps`, `assertOps`,
   `compareOps`, `assertCompareOps`,
+  `measureFrames`, `checkFrames`, `assertFrames`,
+  `compareFrames`, `assertCompareFrames`,
+  `measureOpsAsync`, `checkOpsAsync`, `assertOpsAsync`,
+  `compareOpsAsync`, `assertCompareOpsAsync`,
   `captureFingerprint`,
   `createBaseline`, `checkAgainstBaseline`, `assertAgainstBaseline`,
   `formatConsole`, `formatJson`, `formatMarkdown`,
@@ -36,6 +40,14 @@ test-helpers/explain and the lite-gc-gate CLI.
 ## Key semantics
 
 - Three-state verdict never silently green on unverifiable rules.
+- Gates fail CLOSED (v1.5.1). An unknown rule key throws `TypeError`
+  rather than matching nothing; a non-finite or non-numeric threshold
+  throws `RangeError`; a non-finite metric yields `inconclusive`, never
+  `pass`. Do not pass rule keys a lane does not implement.
+- One measurement at a time. Overlapping/nested `measureOps`,
+  `measureFrames` or `measureOpsAsync` throws/rejects "already in
+  flight" -- all lanes share one heap. Measure sequentially.
+- `opts.capacity` must be a positive integer in every lane.
 - Phases (linear, no nesting), regions (nested, LIFO enter/exit).
 - Attribution is firing-site, not allocator. Explain mode answers the
   allocator question separately via node:inspector heap sampling.

@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -1808,7 +1808,8 @@ function measureOps(fn, opts) {
         );
     }
 
-    const gc = new GcProfiler(opts.capacity || 256, { source: opts.source || 'auto' });
+    const gc = new GcProfiler(_validateCapacity('measureOps', opts.capacity), { source: opts.source || 'auto' });
+    _enterMeasurement('measureOps');
     gc.start();
 
     // Read node's process.memoryUsage() when we're on the gc source (node),
@@ -1834,45 +1835,56 @@ function measureOps(fn, opts) {
         return { t, used: _readHeapUsedFor(gc) };
     }
 
-    // WARMUP phase. Always mark the phase boundary (even when warmup=0) so
-    // the summary.phases shape is stable and downstream consumers can rely on
-    // both keys being present.
-    gc.phase('warmup');
-    sampleBoundary();                                    // warmup boundary; used value not needed
-    for (let i = 0; i < warmup; i++) fn(i);
+    // The whole measurement runs under try/finally: a workload that throws
+    // must not leak the profiler's PerformanceObserver. Without this, every
+    // aborted run left a live observer registered for the life of the process
+    // (~6 KB retained per run, growing linearly), and the orphaned observers
+    // kept attributing GC events -- so later measurements in the same process
+    // read an inflated bytesPerOp. stop() is idempotent, so the happy path
+    // calling it here rather than inline is equivalent.
+    let steadyStartT, steadyStartUsed, steadyEndT, steadyEndUsed;
+    try {
+        // WARMUP phase. Always mark the phase boundary (even when warmup=0) so
+        // the summary.phases shape is stable and downstream consumers can rely on
+        // both keys being present.
+        gc.phase('warmup');
+        sampleBoundary();                                    // warmup boundary; used value not needed
+        for (let i = 0; i < warmup; i++) fn(i);
 
-    // STABILIZE (pre-steady): if opted in, force a full GC before the
-    // steady-start sample so retention analysis starts from a compacted
-    // heap. Attributes the forced-GC event to the 'stabilize' phase, keeping
-    // 'steady' clean for gate rules.
-    if (stabilize) {
-        gc.phase('stabilize');
-        globalThis.gc();
-    }
+        // STABILIZE (pre-steady): if opted in, force a full GC before the
+        // steady-start sample so retention analysis starts from a compacted
+        // heap. Attributes the forced-GC event to the 'stabilize' phase, keeping
+        // 'steady' clean for gate rules.
+        if (stabilize) {
+            gc.phase('stabilize');
+            globalThis.gc();
+        }
 
-    // STEADY phase -- what gets gated.
-    gc.phase('steady');
-    const startBoundary = sampleBoundary();
-    const steadyStartT = startBoundary.t;
-    const steadyStartUsed = startBoundary.used;
-    for (let i = 0; i < ops; i++) fn(i);
-
-    // STABILIZE (post-steady): force GC before the end-sample so the delta
-    // reflects surviving retention, not transient allocation. Re-enters the
-    // stabilize phase; events accumulate under it. Then re-enter steady so
-    // the end-boundary sample's own accounting stays in steady (it doesn't
-    // emit GC events but the phase boundary keeps the shape consistent).
-    if (stabilize) {
-        gc.phase('stabilize');
-        globalThis.gc();
+        // STEADY phase -- what gets gated.
         gc.phase('steady');
+        const startBoundary = sampleBoundary();
+        steadyStartT = startBoundary.t;
+        steadyStartUsed = startBoundary.used;
+        for (let i = 0; i < ops; i++) fn(i);
+
+        // STABILIZE (post-steady): force GC before the end-sample so the delta
+        // reflects surviving retention, not transient allocation. Re-enters the
+        // stabilize phase; events accumulate under it. Then re-enter steady so
+        // the end-boundary sample's own accounting stays in steady (it doesn't
+        // emit GC events but the phase boundary keeps the shape consistent).
+        if (stabilize) {
+            gc.phase('stabilize');
+            globalThis.gc();
+            gc.phase('steady');
+        }
+
+        const endBoundary = sampleBoundary();
+        steadyEndT = endBoundary.t;
+        steadyEndUsed = endBoundary.used;
+    } finally {
+        gc.stop();
+        _exitMeasurement();
     }
-
-    const endBoundary = sampleBoundary();
-    const steadyEndT = endBoundary.t;
-    const steadyEndUsed = endBoundary.used;
-
-    gc.stop();
     const summary = gc.summary();
 
     const elapsedMs = steadyEndT - steadyStartT;
@@ -1914,6 +1926,17 @@ function _readHeapUsedFor(gc) {
 // Per-op verifiability probe. Mirrors isCheckable but reads from a measureOps
 // result -- which has its own shape (has a `summary` field, no top-level heap
 // or uasm blocks).
+/**
+ * A metric can only gate if it is a finite number. null already means
+ * "not measured" and routes to inconclusive; NaN and Infinity used to slip
+ * through as a PASS, because `NaN > limit` is false -- so a run with a broken
+ * clock (a mocked performance.now, a non-monotonic timer) reported a green
+ * gate while measuring nothing. Non-finite is treated as not-measured.
+ */
+function _isFiniteMetric(v) {
+    return typeof v === 'number' && Number.isFinite(v);
+}
+
 function _isCheckableOps(rule, result) {
     const source = result.source;
     const row = VERDICT_MATRIX[rule];
@@ -1923,9 +1946,9 @@ function _isCheckableOps(rule, result) {
     if (state === 'no') return false;
     if (state === 'needsHeap') {
         // Per-op verifiability requires bytesPerOp be derivable, which means
-        // at least a start+end heap sample was captured. bytesPerOp !== null
-        // is the signal we need; a zero value is still verifiable.
-        return result.bytesPerOp !== null;
+        // at least a start+end heap sample was captured. A zero value is still
+        // verifiable; NaN/Infinity are not (see _isFiniteMetric).
+        return _isFiniteMetric(result.bytesPerOp);
     }
     if (state === 'needsUasm') {
         return result.summary && result.summary.uasm && result.summary.uasm.samples >= 2;
@@ -1956,7 +1979,128 @@ function _perOpMetricName(rule) {
     return rule;
 }
 
+/**
+ * Fail-closed rule validation, shared by every gate entry point.
+ *
+ * A budget gate that silently passes is worse than no gate at all, and both
+ * failure modes were reachable before this existed:
+ *
+ *   checkOps(r, { maxBytesPerOP: 20 })   // typo -> no rule matched -> 'pass'
+ *   checkOps(r, { maxBytesPerOp: NaN })  // actual > NaN is false  -> 'pass'
+ *
+ * The second is the nastier one: the report claimed checked:{maxBytesPerOp:true}
+ * while enforcing nothing. A non-numeric threshold was worse still -- it reached
+ * the violation formatter and threw 'r[rule].toFixed is not a function', i.e. it
+ * crashed on exactly the runs where the gate should have reported a failure.
+ *
+ * Unknown keys and non-finite thresholds now throw. Typos surface immediately
+ * instead of turning CI green forever.
+ *
+ * @param {string} fnName            Entry point name, for the error message.
+ * @param {object|null|undefined} rules
+ * @param {string[]} knownRules      Every rule key this entry point accepts.
+ */
+function _validateRules(fnName, rules, knownRules) {
+    if (rules === null || rules === undefined) return;
+    if (typeof rules !== 'object') {
+        throw new TypeError(fnName + ': rules must be an object; got ' + typeof rules);
+    }
+    for (const key of Object.keys(rules)) {
+        if (rules[key] === undefined) continue;          // explicit undefined == rule omitted
+        if (knownRules.indexOf(key) === -1) {
+            // Suggest the intended rule when the key looks like a casing/plural slip.
+            const lower = key.toLowerCase();
+            let hint = '';
+            for (const known of knownRules) {
+                const k = known.toLowerCase();
+                if (k === lower || k === lower.replace(/s$/, '') || k.replace(/[^a-z]/g, '') === lower.replace(/[^a-z]/g, '')) {
+                    hint = ' Did you mean ' + known + '?';
+                    break;
+                }
+            }
+            throw new TypeError(
+                fnName + ': unknown rule "' + key + '".' + hint +
+                ' Known rules: ' + knownRules.join(', ') + '.' +
+                ' Unknown keys are rejected because a silently-ignored rule makes the gate pass everything.'
+            );
+        }
+        const v = rules[key];
+        if (typeof v !== 'number' || !Number.isFinite(v)) {
+            throw new RangeError(
+                fnName + ': rule "' + key + '" must be a finite number; got ' +
+                (typeof v === 'number' ? String(v) : typeof v) + '.' +
+                ' A non-numeric threshold cannot gate anything (comparisons against NaN are always false).'
+            );
+        }
+    }
+}
+
+/**
+ * Validate opts.capacity consistently across all three lanes.
+ *
+ * The lanes previously disagreed: measureOps used `opts.capacity || 256`
+ * (so 0 and NaN silently became 256, and 1.5 produced a fractional ring),
+ * while the async lanes used `opts.capacity | 0` (so NaN and Infinity
+ * silently became a capacity of ZERO). Meanwhile -1 threw. Same option,
+ * three behaviours, none of them announced.
+ */
+function _validateCapacity(fnName, capacity) {
+    if (capacity === undefined) return 256;
+    if (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1) {
+        throw new RangeError(
+            fnName + ': opts.capacity must be a positive integer; got ' +
+            (typeof capacity === 'number' ? String(capacity) : typeof capacity)
+        );
+    }
+    return capacity;
+}
+
+/**
+ * Overlapping-measurement guard.
+ *
+ * Every lane measures ONE shared heap. Two measurements running concurrently
+ * both see each other's allocations, and the results are silently wrong --
+ * measured directly: a clean workload and a leaky workload run under
+ * Promise.all reported 2224 and 2332 B/frame respectively. The clean run
+ * absorbed the leak and the two became indistinguishable, with no warning.
+ *
+ * There is no correct concurrent interpretation to fall back on, so overlap
+ * is rejected rather than reported. Sequential measurement (which is what
+ * compareOps/compareFrames already do internally) is always the answer.
+ */
+/**
+ * Release the overlapping-measurement guard when `p` settles, without
+ * altering its value or rejection. Promise.prototype.finally would do this,
+ * but constructing the extra promise it needs is avoided on the hot path.
+ */
+function _releaseOnSettle(p) {
+    return p.then(
+        (v) => { _exitMeasurement(); return v; },
+        (e) => { _exitMeasurement(); throw e; }
+    );
+}
+
+let _measurementsInFlight = 0;
+function _enterMeasurement(fnName) {
+    if (_measurementsInFlight > 0) {
+        throw new Error(
+            fnName + ': another measurement is already in flight. Heap measurements ' +
+            'share one heap, so overlapping runs silently contaminate each other ' +
+            '(a clean workload reads the same as a leaking one). Await each ' +
+            'measurement before starting the next.'
+        );
+    }
+    _measurementsInFlight++;
+}
+function _exitMeasurement() {
+    if (_measurementsInFlight > 0) _measurementsInFlight--;
+}
+
 const OPS_RULES = ['maxBytesPerOp', 'maxMajorsPerKOp', 'maxMinorsPerKOp', 'maxPauseMsPerOp'];
+const FRAMES_RULES = ['maxBytesPerFrame', 'maxMajorsPerKFrame', 'maxMinorsPerKFrame', 'maxPauseMsPerFrame', 'maxDroppedFrames'];
+// compareFrames implements only these two deltas -- listing more here would
+// re-open the silent-pass hole this validator exists to close.
+const COMPARE_FRAMES_RULES = ['maxExtraBytesPerFrame', 'maxExtraDroppedFrames'];
 
 /**
  * Gate a measureOps result against per-op rules. Verdict semantics identical
@@ -1970,6 +2114,7 @@ function checkOps(result, rules) {
     if (!result || result.schema !== OPS_SCHEMA) {
         throw new TypeError('checkOps: result must be a measureOps() result (schema lite-gc-ops/1)');
     }
+    _validateRules('checkOps', rules, OPS_RULES);
     const r = rules || {};
     const violations = [];
     const checked = {};
@@ -2062,6 +2207,7 @@ function compareOps(controlOrFn, candidateOrFn, rules, opts) {
 }
 
 function _compareOpsResults(control, candidate, rules) {
+    _validateRules('compareOps', rules, Object.keys(COMPARE_OPS_RULES));
     if (!control || control.schema !== OPS_SCHEMA) {
         throw new TypeError('compareOps: control must be a measureOps() result');
     }
@@ -2388,7 +2534,17 @@ function measureFrames(fn, opts) {
         return Promise.reject(e);
     }
 
-    const capacity = opts.capacity === undefined ? 256 : opts.capacity | 0;
+    let capacity;
+    try {
+        capacity = _validateCapacity('measureFrames', opts.capacity);
+    } catch (e) {
+        return Promise.reject(e);
+    }
+    try {
+        _enterMeasurement('measureFrames');
+    } catch (e) {
+        return Promise.reject(e);
+    }
     const source = opts.source === undefined ? 'auto' : opts.source;
     const gc = new GcProfiler(capacity, { source: source }).start();
 
@@ -2425,7 +2581,7 @@ function measureFrames(fn, opts) {
     let frameIndex = 0;
     let inSteady = false;
 
-    return new Promise(function (resolve, reject) {
+    return _releaseOnSettle(new Promise(function (resolve, reject) {
         gc.phase('warmup');
 
         function runFrame() {
@@ -2575,7 +2731,7 @@ function measureFrames(fn, opts) {
         }
 
         schedule(runFrame);
-    });
+    }));
 }
 
 /**
@@ -2587,6 +2743,7 @@ function measureFrames(fn, opts) {
  * are skipped.
  */
 function checkFrames(result, rules) {
+    _validateRules('checkFrames', rules, FRAMES_RULES);
     if (!result || result.schema !== 'lite-gc-frames/1') {
         throw new TypeError('checkFrames: result must be a measureFrames result');
     }
@@ -2605,11 +2762,13 @@ function checkFrames(result, rules) {
         const state = row ? row[source] : 'no';
         if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
             checked[rule] = true;
-            if (actual !== null && actual > limit) {
-                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
-            } else if (actual === null && (state === 'needsHeap' || state === 'needsUasm')) {
+            if (!_isFiniteMetric(actual)) {
+                // null (not measured) or NaN/Infinity (measured with a broken
+                // clock/heap source). Neither can gate -- say so rather than pass.
                 checked[rule] = false;
                 sawInconclusive = true;
+            } else if (actual > limit) {
+                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
             }
         } else {
             checked[rule] = false;
@@ -2662,6 +2821,7 @@ async function assertFrames(fn, rules, opts) {
  */
 async function compareFrames(controlOrFn, candidateOrFn, rules, opts) {
     if (!rules || typeof rules !== 'object') throw new TypeError('compareFrames: rules must be an object');
+    _validateRules('compareFrames', rules, COMPARE_FRAMES_RULES);
     let control, candidate;
     if (typeof controlOrFn === 'function' && typeof candidateOrFn === 'function') {
         control = await measureFrames(controlOrFn, opts);
@@ -2828,8 +2988,9 @@ async function measureOpsAsync(fn, opts) {
     }
     const stabilize = opts.stabilize === false ? false : (opts.stabilize === true ? true : hasForceableGc);
 
-    const capacity = opts.capacity === undefined ? 256 : opts.capacity | 0;
+    const capacity = _validateCapacity('measureOpsAsync', opts.capacity);
     const source = opts.source === undefined ? 'auto' : opts.source;
+    _enterMeasurement('measureOpsAsync');
     const gc = new GcProfiler(capacity, { source: source }).start();
 
     const isNode = typeof process !== 'undefined' && !!process.memoryUsage;
@@ -2938,6 +3099,8 @@ async function measureOpsAsync(fn, opts) {
         // Halt cleanly on fn error -- profiler off, promise rejects.
         try { gc.stop(); } catch (_) {}
         throw err;
+    } finally {
+        _exitMeasurement();
     }
 }
 
@@ -2948,6 +3111,7 @@ async function measureOpsAsync(fn, opts) {
  * VERDICT_MATRIX. Mirrors checkOps shape for tooling reuse.
  */
 function checkOpsAsync(result, rules) {
+    _validateRules('checkOpsAsync', rules, OPS_RULES);
     if (!result || result.schema !== 'lite-gc-ops-async/1') {
         throw new TypeError('checkOpsAsync: result must be a measureOpsAsync result');
     }
@@ -2966,11 +3130,13 @@ function checkOpsAsync(result, rules) {
         const state = row ? row[source] : 'no';
         if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
             checked[rule] = true;
-            if (actual !== null && actual > limit) {
-                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
-            } else if (actual === null && (state === 'needsHeap' || state === 'needsUasm')) {
+            if (!_isFiniteMetric(actual)) {
+                // null (not measured) or NaN/Infinity (measured with a broken
+                // clock/heap source). Neither can gate -- say so rather than pass.
                 checked[rule] = false;
                 sawInconclusive = true;
+            } else if (actual > limit) {
+                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
             }
         } else {
             checked[rule] = false;
@@ -3020,6 +3186,7 @@ async function assertOpsAsync(fn, rules, opts) {
  */
 async function compareOpsAsync(controlOrFn, candidateOrFn, rules, opts) {
     if (!rules || typeof rules !== 'object') throw new TypeError('compareOpsAsync: rules must be an object');
+    _validateRules('compareOpsAsync', rules, Object.keys(COMPARE_OPS_RULES));
     let control, candidate;
     if (typeof controlOrFn === 'function' && typeof candidateOrFn === 'function') {
         control = await measureOpsAsync(controlOrFn, opts);

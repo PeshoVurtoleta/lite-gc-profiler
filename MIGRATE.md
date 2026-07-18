@@ -1,3 +1,62 @@
+# v1.5.1 migration notes
+
+Adversarial hardening (G20). **No new public API**, and the 425-test
+v1.5.0 suite passed unchanged before the new torture pinned the fixes.
+The only visible behaviour change is that gates which were previously
+enforcing nothing now throw at setup instead of returning `'pass'`.
+
+## What throws now that used to silently pass
+
+- `TypeError` if `rules` contains a key the lane doesn't implement.
+  Typos like `maxBytesPerOP` (capital `P`) get an error naming the
+  offending key and suggesting the intended rule (`maxBytesPerOp`).
+  `compareFrames({ maxExtraBytesPerOp: N })` also throws now -- that
+  rule belongs to `compareOps`, not `compareFrames`.
+- `RangeError` if a rule's value is not a finite number.
+  `{ maxBytesPerOp: NaN }`, `{ maxBytesPerOp: '20' }`, and
+  `{ maxBytesPerOp: Infinity }` all throw. A non-finite threshold
+  cannot enforce anything (`x > NaN` is always false).
+- `RangeError` if `opts.capacity` is not a positive integer.
+  Previously three lanes disagreed: `measureOps` treated `0`/`NaN` as
+  256; async lanes treated `NaN`/`Infinity` as 0; `-1` threw. All lanes
+  now require a positive integer.
+
+If your gate configuration was already valid, nothing changes.
+
+## What changed under `Promise.all`
+
+Every lane measures one shared heap. Two measurements running
+concurrently silently contaminate each other's readings -- a clean
+workload and a leaky one running in parallel read the same. **Overlapping
+measurements now throw** (or reject, for the async lanes) instead of
+returning silently-wrong numbers. The guard releases on settle,
+including after a throw, so an aborted run cannot wedge the process.
+
+Measurements run sequentially. That is what `compareOps` /
+`compareFrames` / `compareOpsAsync` do internally, and it is the only
+answer under a shared heap.
+
+## What changed on aborted runs
+
+A workload that throws inside the ops-lane `for` loop previously
+skipped `gc.stop()` and left the `PerformanceObserver` registered for
+the life of the process. Growth was linear -- ~6 KB per aborted run,
+~9.4 MB over 1600 -- and the orphaned observers kept attributing GC
+events, so later measurements in the same process read inflated
+`bytesPerOp`. The loop is now wrapped in `try`/`finally`. `stop()` is
+idempotent, so the happy path is unchanged.
+
+## Documented, not changed: sync `measureOps` GC-event counts
+
+`result.summary.phases.steady.gc.major` and `.minor` have always read
+zero on a sync `measureOps` run under heavy churn, because
+`PerformanceObserver` delivers on event-loop turns and a sync loop
+never yields. This is by design -- the ops lane exposes only
+`bytesPerOp` (memory reading, no observer turn required) precisely for
+this reason. Async lanes (`measureOpsAsync`, `measureFrames`) do capture
+events correctly because every `await` yields the event loop. The README
+now spells this out where it wasn't before.
+
 # v1.5.0 migration notes
 
 Batch 8: serialized async ops (G19). **Additive only** -- no breaking

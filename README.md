@@ -1,5 +1,18 @@
 # @zakkster/lite-gc-profiler
 
+[![npm version](https://img.shields.io/npm/v/@zakkster/lite-gc-profiler.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+![Zero-GC](https://img.shields.io/badge/Zero--GC-Hot%20path-00C853?style=for-the-badge&logo=leaf&logoColor=white)
+[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-gc-profiler?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-gc-profiler)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
+[![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
+[![types](https://img.shields.io/badge/types-included-3178c6)](./index.d.ts)
+
+
 Zero-dependency GC and heap profiler. It exists to make the **zero-GC claim
 falsifiable** rather than asserted.
 
@@ -440,11 +453,31 @@ const result = measureOps((i) => signal.set(i), { ops: 10_000, warmup: 500 });
 // result.bytesPerOp, result.opsPerSec, result.summary (full profiler summary)
 ```
 
-`fn(i)` gets the iteration index. Sync only in v1.3.0 -- async per-op
-accounting is ambiguous because microtasks interleave allocations across
-iterations. Internal `phase()` boundaries quarantine warmup allocations
-from steady-phase gating; `bytesPerOp` is derived from the steady heap
-delta alone.
+`fn(i)` gets the iteration index. `measureOps` is the **sync** ops
+primitive; use `measureOpsAsync` (v1.5.0) when your workload awaits.
+Internal `phase()` boundaries quarantine warmup allocations from
+steady-phase gating; `bytesPerOp` is derived from the steady heap delta
+alone.
+
+### Why `result.summary.phases.steady.gc` reads zero on sync `measureOps`
+
+Node's `PerformanceObserver` -- the mechanism this profiler uses to hear
+GC events -- delivers callbacks on **event-loop turns**. A synchronous
+`measureOps` loop never yields, so the observer's delivery queue never
+gets a turn to fire before `stop()`. The events happened; the observer
+saw nothing.
+
+This is why the ops lane exposes only `bytesPerOp` as a rule -- memory
+readings do not require an observer turn -- and no event-based rules
+(`maxMajorsPerKOp`, `maxMinorsPerKOp`, `maxPauseMsPerOp` are absent
+from the sync ops `checkOps` gate for exactly this reason). The rules
+would be unenforceable on their own primitive.
+
+The zeros in `result.summary.phases.steady.gc` on a sync `measureOps`
+run are honest -- "the observer saw nothing," not "the workload was
+clean." If you need GC-event counts under real churn, use `measureOpsAsync`
+(each `await` yields the event loop back to the observer) or
+`measureFrames` (the scheduler yields between frames).
 
 ### Gating a per-op limit
 
@@ -675,7 +708,7 @@ await assertCompareFrames(oldRenderer, newRenderer,
 Source mismatch (control on `gc`, candidate on `none`) yields an
 `inconclusive` verdict, same as everywhere else in the library.
 
-### Attribution honesty: interleaved async is a v1.5.0 concern
+### Attribution honesty: interleaved async is not yet solved
 
 If your frame function spawns fire-and-forget promises whose allocations
 are attributed by V8's async-context propagation to whichever phase is
@@ -684,7 +717,8 @@ can drift. For a cooperative frame function (fully awaits its own work),
 attribution is accurate. `asyncResidual` gives the escape signal for the
 uncooperative case. Full interleaved-async attribution — separating
 frame-N's spawned work from frame-N+K's synchronous work — is a
-concurrency-lane concern for v1.5.0.
+concurrency-lane concern for a future release; doing it honestly
+needs workers.
 
 ## Serialized async ops: `measureOpsAsync`
 

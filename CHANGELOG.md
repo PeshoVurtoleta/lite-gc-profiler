@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.5.1
+
+Adversarial hardening (G20). Zero new public API, zero behaviour change for
+correct callers; three closed routes to a false `'pass'`, one observer-leak
+fix, one overlap guard, one option unified across lanes.
+
+### The gate now fails closed
+
+An adversarial review of the gate surface found three independent routes to a
+false `'pass'`. For a CI budget gate this is the worst possible failure mode:
+the build stays green while the invariant it guards is already broken. All
+three are closed, and all three are pinned by `test/torture/g20-5-adversarial`.
+
+- **Unknown rule keys are now rejected** (`TypeError`) instead of silently
+  matching nothing. `checkOps(r, { maxBytesPerOP: 20 })` -- a capitalisation
+  slip -- previously returned `verdict: 'pass'` with `checked: {}` against a
+  workload leaking ~590 B/op. The error names the offending key and suggests
+  the intended rule. This applies to every gate entry point: `checkOps`,
+  `checkFrames`, `checkOpsAsync`, `compareOps`, `compareFrames`,
+  `compareOpsAsync`. A rule a lane does not implement is also rejected, so
+  `compareFrames` no longer accepts plausible-looking rules it never reads.
+
+- **Non-finite thresholds are now rejected** (`RangeError`). A `NaN` limit
+  compared false against every metric, so the gate passed everything -- while
+  reporting `checked: {rule: true}`, i.e. claiming to have enforced it. A
+  non-numeric limit (`'20'`, `[20]`, `true`) was worse: it coerced through the
+  comparison and then reached `limit.toFixed(3)` in the violation formatter,
+  throwing an internal `TypeError` on exactly the runs where the gate should
+  have reported a failure.
+
+- **Non-finite metrics now yield `'inconclusive'`, never `'pass'`.** A run
+  whose clock or heap source produced `NaN`/`Infinity` compared false the same
+  way and gated green. `null` (not measured) already routed to inconclusive;
+  non-finite now joins it.
+
+### Resource and concurrency safety
+
+- **A throwing workload no longer leaks the profiler's `PerformanceObserver`.**
+  The ops-lane measurement was not wrapped in `try`/`finally`, so an aborted
+  run never reached `gc.stop()`. Growth was linear -- measured at ~6 KB per
+  aborted run, ~9.4 MB over 1600 -- and the orphaned observers kept attributing
+  GC events, inflating later measurements in the same process. `stop()` is
+  idempotent, so the happy path is unchanged.
+
+- **Overlapping measurements are now rejected** rather than silently
+  contaminated. Every lane measures one shared heap: a clean workload and a
+  leaking one run under `Promise.all` reported 2224 and 2332 B/frame -- the
+  clean run absorbed the leak and the two became indistinguishable, with no
+  warning. Nested and concurrent runs throw/reject; the guard is released on
+  settle, including after a throw, so an aborted run cannot wedge the process.
+
+- **`opts.capacity` is validated consistently** across all three lanes. The
+  same option previously had three behaviours: `measureOps` used
+  `capacity || 256` (`0` and `NaN` silently became 256, `1.5` produced a
+  fractional ring), the async lanes used `capacity | 0` (`NaN` and `Infinity`
+  silently became a capacity of **zero**), and `-1` threw. All lanes now
+  require a positive integer.
+
+### Documented: sync `measureOps` cannot observe GC events
+
+`PerformanceObserver` delivers on event-loop turns. A synchronous
+`measureOps` loop never yields, so `result.summary.phases.steady.gc.major`
+and `.minor` read zero even under heavy churn -- the events happened, but
+the observer's callback queue never got a turn to fire before `stop()`.
+This is why the ops lane exposes only `bytesPerOp` (memory-source, no
+observer turn required) and no event-based rules -- the rules would be
+unenforceable on their own primitive. The async lanes (`measureOpsAsync`,
+`measureFrames`) do observe events correctly because every `await` yields
+the event loop back to the observer's delivery queue.
+
+The zeros in `summary.phases.steady.gc` on a sync ops run are honest --
+"the observer saw nothing," not "the workload was clean" -- and the README
+now spells this out where it wasn't before.
+
+### Migration
+
+Rule sets that were already correct are unaffected -- the existing 425-test
+suite passed unchanged, then grew to 442 with the new torture. Callers relying
+on unknown keys being ignored, or on a non-numeric threshold being tolerated,
+will now get an immediate error naming the problem. That is the intended
+outcome: those gates were not enforcing anything.
+
 ## 1.5.0
 
 Batch 8: serialized async ops (G19). Five new public functions --
