@@ -254,20 +254,29 @@ test('compareOps: throws on non-result inputs (primitive form)', () => {
 });
 
 test('assertCompareOps: convenience form throws GcBudgetError on delta failure', () => {
-    // Uint8Array's 2048-byte backing buffer lands in external ArrayBuffer
-    // memory, not JS heap; process.memoryUsage().heapUsed only sees the
-    // ~80-byte wrapper. On some V8 versions (notably Node 26 on Apple
-    // Silicon) the wrapper is packed tightly enough that per-op growth
-    // falls below the maxExtraBytesPerOp threshold. Use plain object
-    // allocation, which lands in heapUsed deterministically at ~100 bytes/op.
+    // Two independent portability hazards, both fixed here.
+    //
+    // 1. WHAT is allocated. A typed array's backing buffer lands in external
+    //    ArrayBuffer memory, not the JS heap, so heapUsed only sees the small
+    //    wrapper. A plain object IS heap-visible but its retained size is
+    //    V8-build dependent (pointer compression narrows tagged slots), so it
+    //    shrinks several-fold on Apple Silicon and can slip under the
+    //    threshold. A retained plain ARRAY is heap-visible on every build and
+    //    stays hundreds of bytes per op.
+    //
+    // 2. WHETHER the delta is measured against noise. Without stabilize the
+    //    two-point heap delta includes cold-start churn: a noop control can
+    //    itself read ~50 B/op from JIT tier-up, and the candidate's
+    //    allocations can be partly collected mid-loop -- so the DIFFERENCE
+    //    lands under maxExtraBytesPerOp and the expected throw never happens.
+    //    stabilize:true GC-anchors both boundaries, so the control reads ~0
+    //    and the delta is the true survivor rate.
     const sink = [];
     function control(i) { return i | 0; }
-    function candidate(i) {
-        sink.push({ a: i, b: i * 2, c: i * 3, d: 'literal', e: i + 1, f: i - 1 });
-        return i;
-    }
+    function candidate(i) { sink.push(new Array(64).fill(i)); return i; }
     assert.throws(
-        () => assertCompareOps(control, candidate, { maxExtraBytesPerOp: 20 }, { ops: 500, warmup: 50 }),
+        () => assertCompareOps(control, candidate,
+            { maxExtraBytesPerOp: 20 }, { ops: 500, warmup: 50, stabilize: true }),
         GcBudgetError
     );
 });

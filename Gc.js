@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -2756,6 +2756,364 @@ async function assertCompareFrames(controlOrFn, candidateOrFn, rules, opts) {
     return report;
 }
 
+// =============================================================================
+// Batch 8 (v1.5.0) -- serialized async ops (G19).
+//
+// measureOpsAsync answers the ops-lane question for async workloads:
+// signal setters that batch to microtasks, async batchers, Preact-style
+// commit phases, Svelte 5 runes' scheduler ticks. Same rule vocabulary
+// as measureOps -- no new VERDICT_MATRIX rows.
+//
+// Serialization contract: measureOpsAsync awaits fn(i) fully before
+// advancing to i+1. Ops do not overlap under this primitive. What fn
+// does INSIDE its promise -- fire-and-forget microtasks, background
+// timers -- is fn's problem, surfaced via `asyncResidual` (bytes heap
+// grew past settle). Interleaved-async attribution across ops is out
+// of scope (G20 workers, deferred to v1.6.0+).
+//
+// Stabilize discipline: default ON when globalThis.gc is available.
+// Same argument as v1.4.0 frame lane -- measureOpsAsync is already
+// async, already calls settle(), two forced GCs at steady boundaries
+// are marginal cost for a dramatically more trustworthy bytesPerOp
+// (live-set delta, not raw two-point subject to cold-start noise).
+// Attributed to 'stabilize' phase so steady-phase kind rules stay clean.
+// =============================================================================
+
+/**
+ * Serialized async ops measurement. Awaits fn(i) fully before advancing.
+ *
+ * @param {(i: number) => any | Promise<any>} fn
+ * @param {object} opts
+ * @param {number} opts.ops                          Steady op count. Required, positive integer.
+ * @param {number} [opts.warmup=0]                   Warmup ops, excluded from steady stats.
+ * @param {'auto'|'gc'|'heap'|'uasm'|'none'} [opts.source='auto']
+ * @param {number} [opts.capacity=256]               GcProfiler pause-ring capacity.
+ * @param {boolean} [opts.stabilize=<auto>]          Default true when globalThis.gc is available.
+ *                                                    Forces GC at steady boundaries for live-set-delta bytesPerOp.
+ * @returns {Promise<{
+ *   schema: 'lite-gc-ops-async/1',
+ *   ops: number, warmupOps: number,
+ *   elapsedMs: number, opsPerSec: number,
+ *   bytesPerOp: number | null,
+ *   bytesPerOpStable: boolean,
+ *   majorsPerKOp: number, minorsPerKOp: number,
+ *   maxPauseMsPerOp: number,
+ *   asyncResidual: number,
+ *   source: GcSource,
+ *   summary: GcSummary
+ * }>}
+ */
+async function measureOpsAsync(fn, opts) {
+    if (typeof fn !== 'function') throw new TypeError('measureOpsAsync: fn must be a function');
+    if (!opts || typeof opts !== 'object') throw new TypeError('measureOpsAsync: opts is required');
+    const ops = opts.ops;
+    const warmup = opts.warmup === undefined ? 0 : opts.warmup;
+    if (!Number.isFinite(ops) || ops <= 0 || (ops | 0) !== ops) {
+        throw new RangeError('measureOpsAsync: opts.ops must be a positive integer');
+    }
+    if (!Number.isFinite(warmup) || warmup < 0 || (warmup | 0) !== warmup) {
+        throw new RangeError('measureOpsAsync: opts.warmup must be a non-negative integer');
+    }
+
+    // Stabilize resolution mirrors measureFrames: default ON when a forceable
+    // GC is available (node --expose-gc); explicit true throws if unavailable
+    // rather than silently downgrading.
+    const hasForceableGc = typeof globalThis.gc === 'function';
+    if (opts.stabilize === true && !hasForceableGc) {
+        throw new RangeError(
+            'measureOpsAsync: opts.stabilize:true requires node --expose-gc ' +
+            '(globalThis.gc must be a function). Run: node --expose-gc ... ' +
+            'or drop stabilize for two-point-delta measurement.'
+        );
+    }
+    const stabilize = opts.stabilize === false ? false : (opts.stabilize === true ? true : hasForceableGc);
+
+    const capacity = opts.capacity === undefined ? 256 : opts.capacity | 0;
+    const source = opts.source === undefined ? 'auto' : opts.source;
+    const gc = new GcProfiler(capacity, { source: source }).start();
+
+    const isNode = typeof process !== 'undefined' && !!process.memoryUsage;
+    const canSampleMemory = source !== 'none';
+    const perf = typeof performance !== 'undefined' ? performance : { now: Date.now };
+
+    let liveStart = -1;
+    let rawStartUsed = -1;
+    let rawEndUsed = -1;
+
+    try {
+        // Warmup: allocations here are quarantined from steady-phase gates.
+        gc.phase('warmup');
+        for (let i = 0; i < warmup; i++) {
+            await fn(i);
+        }
+
+        // Warmup -> steady boundary. Stabilized: force GC and read the
+        // compacted live-set floor as the retained-bytes baseline. Warmup
+        // allocations that were truly retained still count (they're live),
+        // but transient churn and JIT tier-up allocations are collected
+        // out before we anchor. Attributed to 'stabilize' phase so steady
+        // kind rules (majors/minors/pause) stay clean.
+        if (stabilize && canSampleMemory && isNode) {
+            gc.phase('stabilize');
+            globalThis.gc();
+            liveStart = process.memoryUsage().heapUsed;
+        } else if (canSampleMemory && isNode) {
+            rawStartUsed = process.memoryUsage().heapUsed;
+        }
+
+        // Steady: the measurement window. Each fn(i) is fully awaited.
+        gc.phase('steady');
+        const t0 = perf.now();
+        for (let i = 0; i < ops; i++) {
+            await fn(warmup + i);
+        }
+        const t1 = perf.now();
+
+        // Raw steady-end heapUsed BEFORE settle and before any forced end-GC.
+        // asyncResidual is measured against this baseline so a forced
+        // collection cannot mask fire-and-forget work outliving the ops
+        // window. (Same lesson as frame lane v1.4.0.)
+        if (canSampleMemory && isNode) {
+            rawEndUsed = process.memoryUsage().heapUsed;
+        }
+
+        // Drain pending perf_hooks GC callbacks so summary reflects
+        // in-window events.
+        const settleResult = await gc.settle();
+
+        // asyncResidual: bytes heap grew past settle. Non-zero signals
+        // fire-and-forget work outliving the measurement window. Measured
+        // on raw numbers before the stabilize end-GC.
+        let asyncResidual = 0;
+        if (canSampleMemory && isNode && rawEndUsed >= 0) {
+            const post = process.memoryUsage().heapUsed;
+            asyncResidual = Math.max(0, post - rawEndUsed);
+        }
+
+        // bytesPerOp: stabilized path (live-set delta) or raw two-point.
+        let bytesPerOp = null;
+        let bytesPerOpStable = false;
+        if (canSampleMemory && isNode) {
+            if (stabilize && liveStart >= 0) {
+                gc.phase('stabilize');
+                globalThis.gc();
+                const liveEnd = process.memoryUsage().heapUsed;
+                const bpo = (liveEnd - liveStart) / ops;
+                bytesPerOp = bpo > 0 ? bpo : 0;
+                bytesPerOpStable = true;
+            } else if (rawStartUsed >= 0 && rawEndUsed >= 0) {
+                const bpo = (rawEndUsed - rawStartUsed) / ops;
+                bytesPerOp = bpo > 0 ? bpo : 0;
+                bytesPerOpStable = false;
+            }
+        }
+
+        const summary = gc.summary();
+        gc.stop();
+
+        const steady = summary.phases.steady && summary.phases.steady.gc;
+        const steadyMajor = steady ? steady.major : 0;
+        const steadyMinor = steady ? steady.minor : 0;
+        const steadyMaxMs = steady ? steady.maxMs : 0;
+        const elapsedMs = t1 - t0;
+        const opsPerSec = elapsedMs > 0 ? (ops * 1000) / elapsedMs : 0;
+
+        return {
+            schema: 'lite-gc-ops-async/1',
+            ops: ops,
+            warmupOps: warmup,
+            elapsedMs: elapsedMs,
+            opsPerSec: opsPerSec,
+            bytesPerOp: bytesPerOp,
+            bytesPerOpStable: bytesPerOpStable,
+            majorsPerKOp: (steadyMajor * 1000) / ops,
+            minorsPerKOp: (steadyMinor * 1000) / ops,
+            maxPauseMsPerOp: steadyMaxMs,
+            asyncResidual: asyncResidual,
+            source: gc.source,
+            summary: summary,
+            _settled: settleResult.drained
+        };
+    } catch (err) {
+        // Halt cleanly on fn error -- profiler off, promise rejects.
+        try { gc.stop(); } catch (_) {}
+        throw err;
+    }
+}
+
+/**
+ * Gate a measureOpsAsync result against per-op rules. Sync -- takes a
+ * result, produces a report. Same rules as checkOps (maxBytesPerOp,
+ * maxMajorsPerKOp, maxMinorsPerKOp, maxPauseMsPerOp); no new rows in
+ * VERDICT_MATRIX. Mirrors checkOps shape for tooling reuse.
+ */
+function checkOpsAsync(result, rules) {
+    if (!result || result.schema !== 'lite-gc-ops-async/1') {
+        throw new TypeError('checkOpsAsync: result must be a measureOpsAsync result');
+    }
+    if (!rules || typeof rules !== 'object') {
+        throw new TypeError('checkOpsAsync: rules must be an object');
+    }
+    const source = result.source;
+    const violations = [];
+    const checked = {};
+    let sawInconclusive = false;
+
+    function checkOne(rule, actual, metric) {
+        const limit = rules[rule];
+        if (limit === undefined) return;
+        const row = VERDICT_MATRIX[rule];
+        const state = row ? row[source] : 'no';
+        if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
+            checked[rule] = true;
+            if (actual !== null && actual > limit) {
+                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
+            } else if (actual === null && (state === 'needsHeap' || state === 'needsUasm')) {
+                checked[rule] = false;
+                sawInconclusive = true;
+            }
+        } else {
+            checked[rule] = false;
+            sawInconclusive = true;
+        }
+    }
+
+    checkOne('maxBytesPerOp', result.bytesPerOp, 'bytesPerOp');
+    checkOne('maxMajorsPerKOp', result.majorsPerKOp, 'majorsPerKOp');
+    checkOne('maxMinorsPerKOp', result.minorsPerKOp, 'minorsPerKOp');
+    checkOne('maxPauseMsPerOp', result.maxPauseMsPerOp, 'maxPauseMsPerOp');
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (sawInconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        schema: 'lite-gc-report/1',
+        kind: 'ops-async',
+        verdict: verdict,
+        source: source,
+        violations: violations,
+        checked: checked,
+        result: result
+    };
+}
+
+/**
+ * Convenience: measureOpsAsync + checkOpsAsync, throwing on fail/inconclusive.
+ * Async.
+ */
+async function assertOpsAsync(fn, rules, opts) {
+    const result = await measureOpsAsync(fn, opts);
+    const report = checkOpsAsync(result, rules);
+    if (report.verdict === 'fail') throw new GcBudgetError(report);
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
+/**
+ * Compare two measureOpsAsync results (or two async functions) on delta
+ * rules. Rules: maxExtraBytesPerOp (candidate.bytesPerOp - control > threshold),
+ * maxExtraMajorsPerKOp, maxExtraMinorsPerKOp, maxExtraPauseMsPerOp. Async.
+ */
+async function compareOpsAsync(controlOrFn, candidateOrFn, rules, opts) {
+    if (!rules || typeof rules !== 'object') throw new TypeError('compareOpsAsync: rules must be an object');
+    let control, candidate;
+    if (typeof controlOrFn === 'function' && typeof candidateOrFn === 'function') {
+        control = await measureOpsAsync(controlOrFn, opts);
+        candidate = await measureOpsAsync(candidateOrFn, opts);
+    } else {
+        if (!controlOrFn || controlOrFn.schema !== 'lite-gc-ops-async/1'
+            || !candidateOrFn || candidateOrFn.schema !== 'lite-gc-ops-async/1') {
+            throw new TypeError('compareOpsAsync: expected two measureOpsAsync results or two functions');
+        }
+        control = controlOrFn;
+        candidate = candidateOrFn;
+    }
+    if (control.source !== candidate.source) {
+        return {
+            schema: 'lite-gc-report/1',
+            kind: 'ops-async',
+            verdict: 'inconclusive',
+            reason: 'source_mismatch',
+            source: candidate.source,
+            control: control,
+            candidate: candidate,
+            violations: [],
+            checked: {}
+        };
+    }
+
+    const violations = [];
+    const checked = {};
+    let sawInconclusive = false;
+    const source = candidate.source;
+
+    function checkDelta(deltaRule, srcRule, controlV, candidateV, metric) {
+        const limit = rules[deltaRule];
+        if (limit === undefined) return;
+        const row = VERDICT_MATRIX[srcRule];
+        const state = row ? row[source] : 'no';
+        if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
+            if (controlV !== null && candidateV !== null) {
+                checked[deltaRule] = true;
+                const delta = candidateV - controlV;
+                if (delta > limit) {
+                    violations.push({
+                        rule: deltaRule, metric: metric,
+                        actual: delta, limit: limit
+                    });
+                }
+            } else {
+                checked[deltaRule] = false;
+                sawInconclusive = true;
+            }
+        } else {
+            checked[deltaRule] = false;
+            sawInconclusive = true;
+        }
+    }
+
+    checkDelta('maxExtraBytesPerOp', 'maxBytesPerOp',
+        control.bytesPerOp, candidate.bytesPerOp, 'bytesPerOp.delta');
+    checkDelta('maxExtraMajorsPerKOp', 'maxMajorsPerKOp',
+        control.majorsPerKOp, candidate.majorsPerKOp, 'majorsPerKOp.delta');
+    checkDelta('maxExtraMinorsPerKOp', 'maxMinorsPerKOp',
+        control.minorsPerKOp, candidate.minorsPerKOp, 'minorsPerKOp.delta');
+    checkDelta('maxExtraPauseMsPerOp', 'maxPauseMsPerOp',
+        control.maxPauseMsPerOp, candidate.maxPauseMsPerOp, 'maxPauseMsPerOp.delta');
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (sawInconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        schema: 'lite-gc-report/1',
+        kind: 'ops-async',
+        verdict: verdict,
+        source: source,
+        violations: violations,
+        checked: checked,
+        control: control,
+        candidate: candidate
+    };
+}
+
+/**
+ * Convenience: compareOpsAsync + throw on fail/inconclusive. Async.
+ */
+async function assertCompareOpsAsync(controlOrFn, candidateOrFn, rules, opts) {
+    const report = await compareOpsAsync(controlOrFn, candidateOrFn, rules, opts);
+    if (report.verdict === 'fail') throw new GcBudgetError(report);
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
 
 export {
     VERSION,
@@ -2771,6 +3129,9 @@ export {
     // Batch 7 (v1.4.0) -- per-frame primitives.
     measureFrames, checkFrames, assertFrames,
     compareFrames, assertCompareFrames,
+    // Batch 8 (v1.5.0) -- serialized async ops.
+    measureOpsAsync, checkOpsAsync, assertOpsAsync,
+    compareOpsAsync, assertCompareOpsAsync,
     GcBudgetError, GcInconclusiveError,
     GC_DEFAULT_RULES, GC_DEFAULT_DIFFERENTIAL_RULES, REP_POLICY_DEFAULTS,
     VERDICT_MATRIX,

@@ -130,14 +130,18 @@ test('[axis B pin #1] warmup allocation is quarantined out of steady bytesPerFra
 });
 
 test('[axis B pin #2] a real steady leak reads clearly above the clean floor', async () => {
-    // A workload that retains a large allocation each STEADY frame must read a
-    // bytesPerFrame far above THIS machine's clean floor -- in a SINGLE
-    // stabilized run, no best-of-attempts. The assertion is RELATIVE to the
-    // measured floor: retained-object byte sizes vary by V8 build/arch (a plain
-    // object is ~1.7 KB on one engine and ~340 B on another, tagged-pointer
-    // slots depend on pointer compression), so an absolute threshold is not
-    // portable. The leak retains a 1024-slot array per frame -- heap-visible
-    // and always many times the floor on any build.
+    // Mirror pin: a workload that allocates during STEADY (not warmup) must
+    // produce a bytesPerFrame clearly separated from the clean floor -- in a
+    // SINGLE stabilized run, with no best-of-attempts crutch.
+    //
+    // The assertion is RELATIVE to the floor measured on THIS machine. Retained
+    // object sizes are V8-build dependent: the same 30-key plain object retains
+    // ~1.7 KB on one engine and ~340 B on another (pointer compression changes
+    // tagged slot width, and hidden-class/backing-store layout differs), so an
+    // absolute byte threshold is not portable across machines. The leak retains
+    // a 1024-slot array per frame -- heap-visible (unlike a typed array, whose
+    // backing store is external and invisible to heapUsed) and many times the
+    // floor on any build.
     const warmupFrames = 60, steadyFrames = 300;
 
     const clean = await measureFrames((i) => i | 0, {

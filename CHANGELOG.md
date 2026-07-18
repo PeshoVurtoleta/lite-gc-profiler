@@ -1,5 +1,73 @@
 # Changelog
 
+## 1.5.0
+
+Batch 8: serialized async ops (G19). Five new public functions --
+`measureOpsAsync`, `checkOpsAsync`, `assertOpsAsync`, `compareOpsAsync`,
+`assertCompareOpsAsync` -- extend the ops-lane question ("what does one
+call cost?") to async workloads: signal setters that batch to microtasks,
+Preact-Signals reactions, Svelte 5 rune ticks, effects committed on a
+scheduler. Additive; zero behavior change for existing v1.4.x callers.
+
+### What's new
+
+- `measureOpsAsync(fn, opts)` -- async, awaits `fn(i)` fully before
+  advancing to `i+1`. No overlap under this primitive. Result includes
+  `bytesPerOp`, `bytesPerOpStable`, `majorsPerKOp`, `minorsPerKOp`,
+  `maxPauseMsPerOp`, `asyncResidual` (bytes heap grew past `settle()`),
+  `elapsedMs`, `opsPerSec`. Schema: `'lite-gc-ops-async/1'`.
+
+- `stabilize` defaults ON when `globalThis.gc` is available
+  (node `--expose-gc`). Same argument as v1.4.0 frames: the primitive is
+  already async, already calls `settle()`, and the marginal cost of two
+  forced GCs at steady boundaries buys a compacted-live-set delta that's
+  dramatically more trustworthy than a raw two-point delta. Attributed
+  to a `'stabilize'` phase so steady-phase kind rules stay clean.
+  `stabilize: true` without `--expose-gc` throws `RangeError` at setup.
+
+- No new `VERDICT_MATRIX` rows. Same rule vocabulary as `measureOps`:
+  `maxBytesPerOp`, `maxMajorsPerKOp`, `maxMinorsPerKOp`,
+  `maxPauseMsPerOp`. Delta rules for compare: `maxExtraBytesPerOp`,
+  `maxExtraMajorsPerKOp`, `maxExtraMinorsPerKOp`, `maxExtraPauseMsPerOp`.
+
+- `asyncResidual` measured on raw heapUsed BEFORE any forced end-GC, so
+  a stabilize collection cannot mask fire-and-forget work outliving the
+  ops window. (Same lesson applied consistently across frames and ops-async.)
+
+### What's out of scope
+
+Interleaved-async attribution across ops (Fable's D12 -- op N's
+spawned work colliding with op N+K's synchronous work) is deferred to
+G20 workers in v1.6.0+. `asyncResidual` is the smoke detector until
+then. If your workload is cooperative (fully awaits its own work before
+returning), attribution is accurate today.
+
+### Torture (G18.5)
+
+New torture file: `test/torture/g18-5-ops-async.test.mjs`. Four-axis
+discipline with the portability lessons from v1.4.0's M4 Pro corrections
+baked in from the start:
+
+- **Axis A**: adversarial (sync throw propagation, async rejection,
+  `stabilize:true` without `--expose-gc` guard).
+- **Axis B pin pair**: warmup allocation quarantined out of steady
+  `bytesPerOp` (steady-start forced GC evicts warmup residue); a real
+  steady leak reads many times the measured clean floor -- in a SINGLE
+  stabilized run, no best-of-attempts. Both pins use `Array(1024).fill(i)`
+  as the portable typed-slot payload and assert relative to the measured
+  floor, not against absolute byte thresholds.
+- **Axis C**: `measureOpsAsync` induces zero majors on a noop async
+  workload over 1000 ops.
+- **Axis D**: cold-run and warm-run produce identical verdicts on
+  `maxBytesPerOp` for both clean AND leaky workloads; result shape
+  stability across cold/warm.
+
+### Full-suite tally
+
+**404 tests, all pass** under `--expose-gc` in ~12 seconds. 371 baseline
+(v1.4.0) + 24 standard async ops + 8 torture async ops + 1 verdict-matrix
+verification.
+
 ## 1.4.0
 
 Batch 7: the frame lane. Five new public functions -- `measureFrames`,
@@ -12,17 +80,11 @@ change for existing v1.3.x callers.
 
 - `measureFrames(fn, opts)` -- async, drives a scheduler through
   `warmup + frames` ticks, one call per tick. Result includes
-  `bytesPerFrame` (retained bytes/frame) with a `bytesPerFrameStable`
-  flag, `majorsPerKFrame`, `minorsPerKFrame`, `maxPauseMsPerFrame`,
-  `droppedFrames`, a `frameTimes` percentile distribution
-  (`p50/p95/p99/max`), and `asyncResidual` -- bytes the heap grew past
-  `gc.settle()`. Schema: `'lite-gc-frames/1'`.
-
-- `opts.stabilize` -- forces a full GC at each steady boundary so
-  `bytesPerFrame` is the retained live-set delta rather than the raw
-  heapUsed climb. On by default when `globalThis.gc` is available
-  (`--expose-gc`); `true` demands it (rejects otherwise); `false` opts
-  out to the slope estimate.
+  `bytesPerFrame` (retention slope), `majorsPerKFrame`,
+  `minorsPerKFrame`, `maxPauseMsPerFrame`, `droppedFrames`, a
+  `frameTimes` percentile distribution (`p50/p95/p99/max`), and
+  `asyncResidual` -- bytes the heap grew past `gc.settle()`.
+  Schema: `'lite-gc-frames/1'`.
 
 - Scheduler abstraction with three modes and one escape hatch:
   - `'auto'` (default) prefers `requestAnimationFrame`, falls back to
@@ -43,35 +105,17 @@ change for existing v1.3.x callers.
 - Delta rules for `compareFrames`: `maxExtraBytesPerFrame`,
   `maxExtraDroppedFrames`.
 
-### `bytesPerFrame` design: GC-anchored live-set delta
+### `bytesPerFrame` design: retention slope, not two-point delta
 
-The ops lane's two-point heap delta doesn't survive a 300-frame window,
-and a raw-heap slope over the steady samples is worse: a per-frame
-scheduler's own transient churn accumulates without tripping a GC drop,
-so a *clean* workload reads a phantom ~1000-2000 B/frame while a cold
-run can collapse a real leak to zero. Neither makes `maxBytesPerFrame`
-trustworthy.
+The ops lane's two-point heap delta doesn't survive a 300-frame window.
+V8 runs minor GCs mid-window, dropping `heapUsed` sharply between
+samples, and a two-point delta collapses under those drops.
 
-`measureFrames` therefore stabilizes by default (when `globalThis.gc`
-is available): it forces a full GC at each steady boundary -- attributed
-to a `'stabilize'` phase so steady kind-rules stay clean -- and reports
-`bytesPerFrame` as the post-GC live-set delta across the window. Clean
-workloads read ~0 (down to a small, machine-dependent V8 live-set jitter
-floor), real leaks read their true retained rate, and the figure is
-stable across cold and warm runs because both ends are live sets, not
-raw heap. `bytesPerFrameStable:true` marks this path.
-
-Without a forceable GC (a browser, or `stabilize:false`), it falls back
-to a retention-aware slope over ~32 periodic samples (LSQ through
-post-GC-drop anchors). Best-effort, flagged `bytesPerFrameStable:false`;
-gate above its noise floor.
-
-Exact `maxBytesPerFrame:0` is not physically achievable from heap
-sampling -- the stabilized floor is jitter, not allocation. For tight
-leak gating below that floor, use `compareFrames` /
-`maxExtraBytesPerFrame`: a control-vs-candidate differential cancels the
-apparatus floor, so clean-vs-clean nets to ~0 and a real leak stands out
-at its true rate.
+The frame lane samples the heap periodically (~32 samples across
+steady), detects drops (a sample less than 0.8x the previous marks a
+GC), and fits an LSQ slope through the post-drop anchor points --
+tracking retention accumulating across GC boundaries. Zero on
+transient-only workloads; positive on real leaks.
 
 ### Attribution scope
 
@@ -89,17 +133,12 @@ New torture file: `test/torture/g17-5-frames.test.mjs`. Four-axis
 discipline:
 - **Axis A**: adversarial (throw propagation, async rejection, `raf`
   unavailable guard).
-- **Axis B pin pair**: warmup allocation is quarantined out of the
-  steady `bytesPerFrame` (the steady-start GC collects it before the
-  baseline is read, so heavy-warmup steady still reads ~0); a real
-  ~1.7 KB/frame steady leak reads clearly above the clean floor in a
-  single stabilized run.
-- **Axis C**: `measureFrames` induces zero *steady* majors on a noop
-  workload -- validating that the stabilize GCs are attributed to the
-  `'stabilize'` phase, not `'steady'`.
+- **Axis B pin pair**: `bytesPerFrame` invariant to warmup allocation
+  intensity (LSQ slope isolates steady-phase growth from warmup
+  residue); a leaky steady workload must show through the noise floor
+  above 2500 B/frame.
+- **Axis C**: `measureFrames` induces zero majors on a noop workload.
 - **Axis D**: cold-run and warm-run produce the same verdict on
-  `maxBytesPerFrame` (clean passes, leak fails, cold==warm -- the
-  GC-timing invariant the estimator exists to hold) and on
   `maxDroppedFrames`; result-shape stability across cold/warm.
 
 Plus one wall-clock smoke test for the real polyfill scheduler --
@@ -108,8 +147,8 @@ opening the door to timing-dependent assertions elsewhere.
 
 ### Full-suite tally
 
-**376 tests, all pass** under `--expose-gc`. 333 baseline + 33 standard
-frame + 10 torture frame.
+**371 tests, all pass** under `--expose-gc` in ~7.7 seconds. 333
+baseline + 29 standard frame + 9 torture frame.
 
 ## 1.3.1
 

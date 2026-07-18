@@ -1,18 +1,5 @@
 # @zakkster/lite-gc-profiler
 
-[![npm version](https://img.shields.io/npm/v/@zakkster/lite-gc-profiler.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-![Zero-GC](https://img.shields.io/badge/Zero--GC-Hot%20path-00C853?style=for-the-badge&logo=leaf&logoColor=white)
-[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
-[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-gc-profiler?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-gc-profiler)
-[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
-![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
-[![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
-[![types](https://img.shields.io/badge/types-included-3178c6)](./index.d.ts)
-
-
 Zero-dependency GC and heap profiler. It exists to make the **zero-GC claim
 falsifiable** rather than asserted.
 
@@ -605,8 +592,7 @@ const result = await measureFrames((i) => {
 // result shape (schema: 'lite-gc-frames/1')
 //   frames: 300, warmupFrames: 60
 //   elapsedMs, fps
-//   bytesPerFrame        // retained bytes/frame; null on source='none'
-//   bytesPerFrameStable  // true when GC-anchored (see below)
+//   bytesPerFrame        // retention slope, null on source='none'
 //   majorsPerKFrame, minorsPerKFrame, maxPauseMsPerFrame
 //   droppedFrames        // frames whose work-time > frameBudgetMs
 //   frameTimes: { p50, p95, p99, max }
@@ -629,50 +615,27 @@ call to your function per tick. Three modes via `opts.scheduler`:
   schedulers in tests (e.g. `(cb) => setTimeout(cb, 0)`) run 300 frames
   in ~150ms instead of ~5s.
 
-### `bytesPerFrame`: GC-anchored live-set delta
+### `bytesPerFrame`: retention slope, not two-point delta
 
-A raw-heap slope across a 300-frame render loop is unreliable: the
-scheduler's own per-frame churn accumulates without tripping a GC drop,
-so a *clean* workload reads a phantom ~1000-2000 B/frame, while a cold
-run can collapse a real leak to zero. So `measureFrames` **stabilizes by
-default** when `globalThis.gc` is available (`--expose-gc`): it forces a
-full GC at each steady boundary and reports `bytesPerFrame` as the
-post-GC *live-set* delta across the window. A workload that retains
-nothing reads ~0; a real leak reads its true retained rate; and the
-figure is stable across cold and warm runs because both ends are live
-sets, not raw heap. The forced collections are attributed to a
-`'stabilize'` phase, so the steady-phase kind rules stay clean.
-`bytesPerFrameStable: true` marks this path.
+The ops lane uses a two-point heap delta (start vs settled end). For 300+
+sample points across a real render loop, that's the wrong shape — V8
+runs minor GCs mid-window, dropping `heapUsed` sharply between samples.
+A two-point delta would collapse under those drops.
 
-Control it with `opts.stabilize`: `undefined` (default) auto-stabilizes
-when a forceable GC exists, `true` demands it (throws under a runtime
-without `--expose-gc`), `false` opts out. Without stabilization the value
-falls back to a retention-aware slope over ~32 periodic samples —
-best-effort, flagged `bytesPerFrameStable: false`; gate above its noise
-floor.
-
-**Exact `maxBytesPerFrame: 0` isn't physically achievable** from heap
-sampling — the stabilized floor is V8 live-set jitter (tens of B/frame,
-amortizing down at higher frame counts), not allocation. For tight leak
-gating below that floor, use the differential: `compareFrames` /
-`maxExtraBytesPerFrame` cancels the apparatus floor, so clean-vs-clean
-nets to ~0 and a real leak stands out at its true rate.
-
-```js
-// coarse absolute gate -- threshold above the stabilized floor
-await assertFrames(renderFrame, { maxBytesPerFrame: 512 }, { frames: 300, warmup: 60 });
-
-// tight differential gate -- floor cancels, catches small per-frame leaks
-await assertCompareFrames(cleanBaseline, renderFrame,
-    { maxExtraBytesPerFrame: 128 }, { frames: 300, warmup: 60 });
-```
+The frame lane periodically samples the heap (~32 samples across steady),
+detects the drops (a sample less than 0.8× the previous marks a GC),
+and fits a least-squares slope through the post-drop anchor points. That
+tracks retention accumulating across GC boundaries, robust to V8's
+mid-steady collections. A workload that only churns transient garbage
+converges to `bytesPerFrame ≈ 0`; a real leak accumulates as a positive
+slope through the post-GC floor.
 
 ### The five per-frame rules
 
 ```js
 await assertFrames(renderFrame,
     {
-        maxBytesPerFrame:    512,       // needsHeap / needsUasm / no on source=none; above the stabilized floor
+        maxBytesPerFrame:     50,       // needsHeap / needsUasm / no on source=none
         maxMajorsPerKFrame:    1,       // requires source=gc
         maxMinorsPerKFrame:   10,       // requires source=gc
         maxPauseMsPerFrame:    4,       // requires source=gc
@@ -722,6 +685,72 @@ attribution is accurate. `asyncResidual` gives the escape signal for the
 uncooperative case. Full interleaved-async attribution — separating
 frame-N's spawned work from frame-N+K's synchronous work — is a
 concurrency-lane concern for v1.5.0.
+
+## Serialized async ops: `measureOpsAsync`
+
+The ops lane answers "what does one call cost?" for synchronous work.
+`measureOpsAsync` answers the same question for async work: signal
+setters that batch to microtasks, effects committed on a scheduler,
+Preact-Signals reactions, Svelte 5 rune ticks.
+
+```js
+import { measureOpsAsync, assertOpsAsync } from '@zakkster/lite-gc-profiler';
+
+const result = await measureOpsAsync(async (i) => {
+    signal.set(i);
+    await scheduler.flush();
+}, { ops: 10_000, warmup: 500 });
+
+// Same rule vocabulary as measureOps -- no new gate types to learn.
+await assertOpsAsync(async (i) => signal.set(i),
+    { maxBytesPerOp: 5 },
+    { ops: 10_000, warmup: 500 }
+);
+```
+
+### Serialization contract
+
+`measureOpsAsync` awaits `fn(i)` fully before starting `fn(i+1)`. Ops
+do not overlap under this primitive. What `fn` does inside its own
+promise -- fire-and-forget microtasks, background timers, `queueMicrotask`
+chains -- is `fn`'s problem, surfaced via `asyncResidual` in the result
+(same smoke-detector semantic as the frame lane). Full interleaved-async
+attribution across ops is a v1.6.0+ concurrency-lane concern.
+
+### Stabilize on by default
+
+Following the v1.4.0 frame-lane lesson: `measureOpsAsync` is already
+async, already calls `settle()`, and the marginal cost of two forced
+GCs at steady boundaries is trivial compared to the honesty gain.
+`stabilize: true` is therefore the default whenever `globalThis.gc` is
+available (node `--expose-gc`). On that path, `bytesPerOp` is the
+compacted-live-set delta between steady boundaries -- clean workloads
+read ~0, real leaks read their true retention rate, and the reading is
+stable cold-vs-warm.
+
+Explicit opt-out: `stabilize: false` uses a raw two-point delta and
+flags the result `bytesPerOpStable: false`. `stabilize: true` without
+`--expose-gc` throws `RangeError` at setup -- no silent fallback.
+
+### The result shape
+
+```js
+{
+    schema: 'lite-gc-ops-async/1',
+    ops, warmupOps,
+    elapsedMs, opsPerSec,
+    bytesPerOp,          // live-set delta when stabilized, else raw two-point
+    bytesPerOpStable,    // true iff the stabilized path ran
+    majorsPerKOp, minorsPerKOp, maxPauseMsPerOp,
+    asyncResidual,       // bytes heap grew past settle
+    source, summary
+}
+```
+
+Same rule vocabulary as `checkOps`: `maxBytesPerOp`, `maxMajorsPerKOp`,
+`maxMinorsPerKOp`, `maxPauseMsPerOp`. Delta rules for `compareOpsAsync`:
+`maxExtraBytesPerOp`, `maxExtraMajorsPerKOp`, `maxExtraMinorsPerKOp`,
+`maxExtraPauseMsPerOp`.
 
 ## Baseline lock: guarding against silent regressions
 

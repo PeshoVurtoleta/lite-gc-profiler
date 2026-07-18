@@ -1,3 +1,83 @@
+# v1.5.0 migration notes
+
+Batch 8: serialized async ops (G19). **Additive only** -- no breaking
+changes to v1.4.x callers. Existing baselines, CI configurations, and
+gate rules keep working byte-identically.
+
+## What's new
+
+Five new public functions: `measureOpsAsync`, `checkOpsAsync`,
+`assertOpsAsync`, `compareOpsAsync`, `assertCompareOpsAsync`. All are
+`async` except `checkOpsAsync` (gate an existing result -- sync).
+
+## When to reach for `measureOpsAsync` vs `measureOps`
+
+- **`measureOps`** for synchronous hot paths -- Solid signals,
+  synchronous mutations, tight loops that don't await.
+- **`measureOpsAsync`** for async hot paths -- Preact-Signals,
+  Svelte 5 runes with async scheduler, batched effects, async
+  data mutations. Any workload where `fn(i)` returns a promise
+  and the meaningful work happens across `await`.
+- **`measureFrames`** for render-loop questions -- work distributed
+  across scheduled frame ticks with a frame budget to hit.
+
+The three lanes measure different things. Pick the one that matches
+your workload's shape; their gates compose freely.
+
+## Serialization contract
+
+`measureOpsAsync` awaits `fn(i)` fully before starting `fn(i+1)`. Ops
+do not overlap under this primitive. What `fn` does inside its own
+promise is `fn`'s problem, surfaced via `asyncResidual` in the result.
+
+If your workload has ops that spawn work outlasting their own return,
+`asyncResidual` will be non-zero. Log it, assert against it, or ignore
+it -- your choice. Full interleaved-async attribution across ops is a
+v1.6.0+ concurrency-lane concern (G20 workers).
+
+## Stabilize default parity with frame lane
+
+`measureOpsAsync` follows the v1.4.0 frame-lane rule: `stabilize`
+defaults ON when `globalThis.gc` is available. This is a deliberate
+divergence from the sync `measureOps` default (opt-in). Reasoning:
+
+- Sync `measureOps` is designed for tight-loop measurement where any
+  scheduler perturbation matters. Making stabilize opt-in there
+  preserves the passive default.
+- `measureOpsAsync` is already async, already calls `settle()`. Two
+  forced GCs at steady boundaries are marginal cost. The gain --
+  compacted-live-set delta instead of raw two-point noise -- is
+  dramatic.
+
+Same principle already applied to `measureFrames` in v1.4.0.
+
+## Portability lessons carried forward
+
+The G18.5 torture pins use `Array(1024).fill(i)` as the portable
+typed-slot payload and assert relative to the measured clean floor,
+not against absolute byte thresholds. If your CI ran the v1.4.x frame
+torture cleanly on both M4 Pro and Intel, the v1.5.0 async ops
+torture should behave the same way.
+
+If you're writing your own gate tests, the pattern to internalize:
+
+```js
+// Measure the floor on THIS machine
+const clean = await measureOpsAsync(cleanFn, opts);
+const floor = Math.max(clean.bytesPerOp, 64);   // guard against 0
+
+// Gate a candidate relative to the floor
+const candidate = await measureOpsAsync(candidateFn, opts);
+assert.ok(candidate.bytesPerOp < 4 * floor,
+    'candidate must stay within 4x of the measured clean floor');
+```
+
+Fixed-size typed-array payloads (`new Array(1024).fill(x)`,
+`new Float64Array(256)`) are heap-visible with predictable size on
+every V8 build. Plain-object payloads have V8-version-dependent sizes
+(pointer compression on/off, header layout changes) and don't survive
+cross-machine comparison.
+
 # v1.4.0 migration notes
 
 Batch 7: the frame lane. **Additive only** -- no breaking changes to

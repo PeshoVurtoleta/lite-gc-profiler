@@ -1,4 +1,4 @@
-export const VERSION: '1.4.0';
+export const VERSION: '1.5.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -764,18 +764,6 @@ export interface MeasureFramesOptions {
     /** GcProfiler pause-ring capacity. Default 256. */
     capacity?: number;
     /**
-     * Force a full GC at each steady boundary so bytesPerFrame reflects the
-     * retained live-set delta rather than the raw heapUsed climb (which a
-     * per-frame scheduler's transient churn inflates). Requires
-     * globalThis.gc (node --expose-gc).
-     *   - undefined (default): auto -- stabilize when globalThis.gc exists,
-     *     otherwise fall back to the slope estimate.
-     *   - true: demand stabilization; reject if globalThis.gc is unavailable.
-     *   - false: never force GC; use the slope estimate (bytesPerFrameStable
-     *     will be false).
-     */
-    stabilize?: boolean;
-    /**
      * When true, checkFrames returns the report even with inconclusive
      * verdict instead of throwing. Only meaningful for assertFrames /
      * assertCompareFrames.
@@ -793,22 +781,10 @@ export interface FramesResult {
     /** Effective frames-per-second during steady. */
     fps: number;
     /**
-     * Retained bytes per steady frame. When stabilized (see options), this is
-     * the post-GC live-set delta across the steady window: clean workloads
-     * read ~0 (down to a small V8 live-set jitter floor) and real leaks read
-     * their true rate, stable across cold/warm runs. Unstabilized, it is a
-     * best-effort retention-slope estimate carrying a noise floor -- see
-     * bytesPerFrameStable. For tight leak gating below the absolute floor, use
-     * compareFrames / maxExtraBytesPerFrame, which cancels the floor.
+     * Retained bytes per steady frame, from segmented LSQ retention slope.
      * null on source='none' or source='auto' + memory unavailable.
      */
     bytesPerFrame: number | null;
-    /**
-     * True when bytesPerFrame was GC-anchored (stabilized) and is therefore a
-     * trustworthy retained-bytes figure; false when it is the slope estimate
-     * (no forceable GC / stabilize:false).
-     */
-    bytesPerFrameStable: boolean;
     majorsPerKFrame: number;
     minorsPerKFrame: number;
     maxPauseMsPerFrame: number;
@@ -867,3 +843,132 @@ export function assertCompareFrames(
     rules: CompareFramesRules,
     opts: MeasureFramesOptions
 ): Promise<FramesGateResult>;
+
+// =============================================================================
+// Batch 8 (v1.5.0) -- serialized async ops (G19).
+// =============================================================================
+
+export type MeasureOpsAsyncFn = (i: number) => unknown | Promise<unknown>;
+
+/** Options for measureOpsAsync. */
+export interface MeasureOpsAsyncOptions {
+    /** Steady op count. Required, positive integer. */
+    ops: number;
+    /** Warmup ops, excluded from steady stats. Default 0. */
+    warmup?: number;
+    /** Source selection. Default 'auto'. */
+    source?: 'auto' | 'gc' | 'heap' | 'uasm' | 'none';
+    /** GcProfiler pause-ring capacity. Default 256. */
+    capacity?: number;
+    /**
+     * When true, forces a full GC at each steady boundary so bytesPerOp
+     * reflects the retained-bytes rate rather than a raw two-point delta.
+     * Defaults to true when globalThis.gc is available (node --expose-gc);
+     * defaults to false otherwise. Setting explicitly to true without a
+     * forceable GC throws a RangeError.
+     */
+    stabilize?: boolean;
+    /**
+     * When true, assertOpsAsync / assertCompareOpsAsync returns
+     * inconclusive reports instead of throwing GcInconclusiveError.
+     */
+    allowInconclusive?: boolean;
+}
+
+/** Rules for checkOpsAsync / assertOpsAsync. Same vocabulary as ops. */
+export interface OpsAsyncRules {
+    /** Retained bytes per op. Requires memory channel. */
+    maxBytesPerOp?: number;
+    /** Major GC events per 1000 ops. Requires source='gc'. */
+    maxMajorsPerKOp?: number;
+    /** Minor GC events per 1000 ops. Requires source='gc'. */
+    maxMinorsPerKOp?: number;
+    /** Max GC pause observed in steady phase (ms). Requires source='gc'. */
+    maxPauseMsPerOp?: number;
+}
+
+/** Delta rules for compareOpsAsync / assertCompareOpsAsync. */
+export interface CompareOpsAsyncRules {
+    maxExtraBytesPerOp?: number;
+    maxExtraMajorsPerKOp?: number;
+    maxExtraMinorsPerKOp?: number;
+    maxExtraPauseMsPerOp?: number;
+}
+
+/** Result of a measureOpsAsync run. */
+export interface OpsAsyncResult {
+    schema: 'lite-gc-ops-async/1';
+    ops: number;
+    warmupOps: number;
+    elapsedMs: number;
+    opsPerSec: number;
+    /**
+     * Retained bytes per op. Stabilized path (default under --expose-gc):
+     * live-set delta at forced-GC boundaries. Fallback (no forceable GC):
+     * raw two-point delta. null on source='none' or memory unavailable.
+     */
+    bytesPerOp: number | null;
+    /** True if the stabilized live-set-delta path ran; false otherwise. */
+    bytesPerOpStable: boolean;
+    majorsPerKOp: number;
+    minorsPerKOp: number;
+    maxPauseMsPerOp: number;
+    /** Bytes heap grew AFTER gc.settle(). Smoke detector for fire-and-forget work. */
+    asyncResidual: number;
+    source: 'gc' | 'heap' | 'uasm' | 'none';
+    summary: GcSummary;
+}
+
+/** Result of checkOpsAsync / assertOpsAsync / compareOpsAsync / assertCompareOpsAsync. */
+export interface OpsAsyncGateResult {
+    schema: 'lite-gc-report/1';
+    kind: 'ops-async';
+    verdict: 'pass' | 'fail' | 'inconclusive';
+    source: 'gc' | 'heap' | 'uasm' | 'none';
+    violations: Array<{ rule: string; metric: string; actual: number; limit: number }>;
+    checked: Record<string, boolean>;
+    result?: OpsAsyncResult;
+    control?: OpsAsyncResult;
+    candidate?: OpsAsyncResult;
+    reason?: string;
+}
+
+export function measureOpsAsync(
+    fn: MeasureOpsAsyncFn,
+    opts: MeasureOpsAsyncOptions
+): Promise<OpsAsyncResult>;
+
+export function checkOpsAsync(
+    result: OpsAsyncResult,
+    rules: OpsAsyncRules
+): OpsAsyncGateResult;
+
+export function assertOpsAsync(
+    fn: MeasureOpsAsyncFn,
+    rules: OpsAsyncRules,
+    opts: MeasureOpsAsyncOptions
+): Promise<OpsAsyncGateResult>;
+
+export function compareOpsAsync(
+    control: OpsAsyncResult,
+    candidate: OpsAsyncResult,
+    rules: CompareOpsAsyncRules
+): Promise<OpsAsyncGateResult>;
+export function compareOpsAsync(
+    controlFn: MeasureOpsAsyncFn,
+    candidateFn: MeasureOpsAsyncFn,
+    rules: CompareOpsAsyncRules,
+    opts: MeasureOpsAsyncOptions
+): Promise<OpsAsyncGateResult>;
+
+export function assertCompareOpsAsync(
+    control: OpsAsyncResult,
+    candidate: OpsAsyncResult,
+    rules: CompareOpsAsyncRules
+): Promise<OpsAsyncGateResult>;
+export function assertCompareOpsAsync(
+    controlFn: MeasureOpsAsyncFn,
+    candidateFn: MeasureOpsAsyncFn,
+    rules: CompareOpsAsyncRules,
+    opts: MeasureOpsAsyncOptions
+): Promise<OpsAsyncGateResult>;

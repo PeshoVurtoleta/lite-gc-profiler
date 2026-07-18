@@ -78,15 +78,21 @@ test('measureFrames: stabilizes by default under --expose-gc and a clean workloa
 });
 
 test('measureFrames: a real steady leak reads clearly above the clean floor', async () => {
-    const clean = await measureFrames((i) => i | 0, { frames: 300, warmup: 60, scheduler: fastSched });
+    // Relative to the floor measured on THIS machine -- retained object sizes
+    // are V8-build dependent, so absolute byte thresholds are not portable.
+    const clean = await measureFrames(noopWorkload, {
+        frames: 300, warmup: 60, scheduler: fastSched
+    });
     const sink = [];
-    const leaky = (i) => { sink.push(new Array(1024).fill(i)); };   // heap-visible, machine-independent
-    const leak = await measureFrames(leaky, { frames: 300, warmup: 60, scheduler: fastSched });
+    const leaky = (i) => { sink.push(new Array(1024).fill(i)); };   // heap-visible
+    const leak = await measureFrames(leaky, {
+        frames: 300, warmup: 60, scheduler: fastSched
+    });
     assert.equal(leak.bytesPerFrameStable, true);
-    // Relative to this machine's floor -- retained byte sizes vary by V8 build.
     const floor = Math.max(clean.bytesPerFrame, 128);
     assert.ok(leak.bytesPerFrame > 4 * floor,
-        'a per-frame array leak must read many times the clean floor (' + clean.bytesPerFrame + '); got ' + leak.bytesPerFrame);
+        'a per-frame array leak must read many times the clean floor ('
+        + clean.bytesPerFrame + '); got ' + leak.bytesPerFrame);
 });
 
 test('measureFrames: stabilize:false uses the slope estimate and flags bytesPerFrameStable:false', async () => {

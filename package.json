@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-gc-profiler",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Zero-dependency GC and heap profiler that makes the zero-GC claim falsifiable: three-state verdicts, phases, regions, differential and rep-aware gating, baselines, CLI, and explain mode. precise garbage-collection events in node (perf_hooks), a heap-drop heuristic in Chrome, and long-frame anomaly detection everywhere else.",
   "type": "module",
   "main": "./Gc.js",
@@ -36,6 +36,8 @@
   "files": [
     "Gc.js",
     "Gc.d.ts",
+    "index.js",
+    "index.d.ts",
     "Register.mjs",
     "TestHelpers.js",
     "TestHelpers.d.ts",
@@ -45,7 +47,6 @@
     "templates/GcGate.mjs",
     "README.md",
     "CHANGELOG.md",
-    "MIGRATE.md",
     "llms.txt",
     "LICENSE.txt"
   ],
