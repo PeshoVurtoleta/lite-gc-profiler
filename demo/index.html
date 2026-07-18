@@ -250,6 +250,82 @@
             color: var(--bad);
         }
 
+        .verdict[data-v="warn"] .lamp {
+            background: var(--warn);
+            box-shadow: 0 0 0.5rem var(--warn);
+        }
+
+        .verdict[data-v="warn"] .msg {
+            color: var(--warn);
+        }
+
+        .gate-panel {
+            margin-top: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.8rem;
+        }
+
+        .gate-head {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+            flex-wrap: wrap;
+        }
+
+        .gate-head .badge {
+            display: inline-flex;
+            align-items: center;
+            height: 20px;
+        }
+
+        .gate-btn {
+            appearance: none;
+            border: 1px solid var(--ink-faint);
+            background: transparent;
+            color: var(--ink);
+            font-family: inherit;
+            font-size: 0.82rem;
+            padding: 0.4rem 0.8rem;
+            border-radius: var(--r);
+            cursor: pointer;
+        }
+
+        @media (hover: hover) {
+            .gate-btn:hover {
+                border-color: var(--ink);
+                background: var(--panel);
+            }
+        }
+
+        .gate-btn:disabled {
+            opacity: 0.5;
+            cursor: progress;
+        }
+
+        .gate-explain {
+            font-family: var(--mono);
+            font-size: 0.78rem;
+            line-height: 1.5;
+            color: var(--ink-dim);
+            background: var(--bg);
+            border: 1px solid var(--edge);
+            border-radius: var(--r);
+            padding: 0.8rem 1rem;
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            min-height: 3rem;
+            max-height: 22rem;
+            overflow: auto;
+        }
+
+        .gate-explain:empty::before {
+            content: "Click \"Run gate\" to invoke assertFrames on the currently-selected workload.\A\A Under the hood: measureFrames -> checkFrames -> explainReport. The badge above the button is the same primitive you would embed in a README.";
+            white-space: pre-wrap;
+            color: var(--ink-faint);
+        }
+
         .note {
             color: var(--ink-faint);
             font-size: 0.72rem;
@@ -335,18 +411,31 @@
             </p>
         </div>
     </div>
+
+    <div class="gate-panel">
+        <div class="gate-head">
+            <span class="badge" id="gateBadge" title="Result of the last gate run"></span>
+            <button class="gate-btn" id="gateRun">Run gate</button>
+            <span id="gateHint" style="font-size:0.78rem;color:var(--ink-faint);">
+                assertFrames({ maxBytesPerFrame: 512 }) &mdash; runs the currently-selected mode above
+            </span>
+        </div>
+        <pre class="gate-explain" id="gateExplain"></pre>
+    </div>
 </div>
 
 <script type="importmap">
 {
   "imports": {
-    "@zakkster/lite-gc-profiler": "../index.js"
+    "@zakkster/lite-gc-profiler": "../index.js",
+    "@zakkster/lite-gc-profiler/explain": "../Explain.js"
   }
 }
 
 </script>
 <script type="module">
-    import {GcProfiler} from '@zakkster/lite-gc-profiler';
+    import {GcProfiler, measureFrames, checkFrames} from '@zakkster/lite-gc-profiler';
+    import {explainReport, gateBadge} from '@zakkster/lite-gc-profiler/explain';
 
     const MB = 1024 * 1024;
     const DPR = Math.min(2, window.devicePixelRatio || 1);
@@ -586,6 +675,68 @@
 
     setMode('pooled');
     requestAnimationFrame(frame);
+
+    // -------- v1.6.0 evidence lane: assertFrames + explainReport + gateBadge --------
+    //
+    // The scope canvas above is the LIVE view -- honest but informal. The gate
+    // panel below is the FORMAL primitive: the same measureFrames /
+    // checkFrames the CI budget gate uses, wrapped in the same explainReport
+    // narrator and gateBadge SVG a README would embed. Same input, same
+    // output, in the browser.
+    //
+    // Design notes:
+    //   * We deliberately DON'T touch the running RAF loop; the gate calls
+    //     measureFrames which drives its own scheduler. Running two loops
+    //     against the same workload is fine because Pooled/Leaky do their
+    //     own state via the fn closure -- the scope loop is view-only.
+    //   * Budget of 512 B/frame is chosen relative to a Chrome build's
+    //     harness noise floor. Under the stabilised path (node --expose-gc)
+    //     a clean workload reads ~0; without a forceable GC (browser) the
+    //     slope estimate lands well under 512 for the Pooled fn. Empirical.
+    //   * bytesPerFrameStable will be false in the browser (no --expose-gc);
+    //     explainReport surfaces that in a Hints line automatically.
+
+    const $gateBadge = document.getElementById('gateBadge');
+    const $gateRun = document.getElementById('gateRun');
+    const $gateExplain = document.getElementById('gateExplain');
+
+    // The two workloads the badge above alternates between. Isolated from
+    // the scope loop's state so the gate run doesn't fight it for objects.
+    const gatePool = [];
+    for (let i = 0; i < 256; i++) gatePool.push({ x: 0, y: 0, life: 0 });
+    let gatePoolHead = 0;
+
+    function pooledFrame() {
+        const p = gatePool[gatePoolHead];
+        gatePoolHead = (gatePoolHead + 1) & 255;         // ring, no alloc
+        p.x = Math.random(); p.y = Math.random(); p.life = 1;
+    }
+
+    const leakySink = [];
+    function leakyFrame(i) {
+        leakySink.push(new Array(64).fill(i));           // portable typed-slot payload
+    }
+
+    $gateRun.addEventListener('click', async () => {
+        $gateRun.disabled = true;
+        $gateExplain.textContent = 'Running gate on the "' + mode + '" workload…';
+        leakySink.length = 0;                            // reset leak state before the run
+        try {
+            const fn = mode === 'pooled' ? pooledFrame : leakyFrame;
+            // 120 frames + 20 warmup is enough for the slope estimator to
+            // resolve a real leak on a 60 fps scheduler without dragging
+            // the demo. The scheduler defaults to rAF in the browser.
+            const result = await measureFrames(fn, { frames: 120, warmup: 20 });
+            const report = checkFrames(result, { maxBytesPerFrame: 512 });
+            $gateBadge.innerHTML = gateBadge(report, { format: 'svg' });
+            $gateExplain.textContent = explainReport(report);
+        } catch (err) {
+            $gateBadge.innerHTML = '';
+            $gateExplain.textContent = 'Gate raised an error:\n' + (err && err.stack || String(err));
+        } finally {
+            $gateRun.disabled = false;
+        }
+    });
 </script>
 </body>
 </html>

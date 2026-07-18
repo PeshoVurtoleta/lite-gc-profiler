@@ -1,6 +1,6 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 187 torture scenarios shipped across v1.1.0 through v1.5.2
+**Status:** 206 torture scenarios shipped across v1.1.0 through v1.6.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
@@ -359,8 +359,38 @@ are tolerated by `_extract` returning 0 for absent branches.
 | 9 | v1.5.2 (shipped) | G99.9 | **G99.9** | 41 |
 | 10 | v1.5.2 (shipped) | G99.10 | **G99.10** | 17 |
 
-**Total shipped: 187 torture scenarios + 3 global invariants + 3 CLI
-integration scenarios (G16.5).** Full suite: 517 tests.
+### G21.5 -- Evidence lane (v1.6.0)
+
+`test/torture/g21-5-evidence.test.mjs` -- **10 scenarios**. Report-shape
+coverage for `explainReport` / `explainDiff` / `gateBadge` across the four
+report families and their compare variants.
+
+### G22.5 -- Evidence lane, adversarial (v1.6.0)
+
+`test/torture/g22-5-evidence-adversarial.test.mjs` -- **9 scenarios**,
+axes Y-Z. Attack-first pass over the new lane before release.
+
+**Axis Y (3)** output integrity. GitHub Actions workflow commands are
+newline-delimited, so an unsanitized name in a report forged a second
+`::error` directive from a single violation -- and `::notice` /
+`::add-mask::` the same way, which could make a failing run read as
+clean. Control characters are now stripped from every narrated field and
+from `formatGithubAnnotations`, and names are length-capped so one
+oversized field cannot flood a log. Not reachable through any public API
+(the baseline comparator ignores unrecognised metric keys); reachable by
+formatting a hand-built or deserialized report, which the formatters
+accept by design.
+
+**Axis Z (6)** narrator robustness. It runs when a gate has already
+failed, so its failure modes are asymmetric: `violations: [null]` threw
+a TypeError where the developer needed the report; an actual of 1e308
+against a limit of 1 printed `+Infinity% over limit`; and an unverified
+rule blamed the source when, since v1.5.2, a non-finite metric lands in
+the same place. All three now degrade into something readable, and
+hostile inputs are still rejected outright.
+
+**Total shipped: 206 torture scenarios + 3 global invariants + 3 CLI
+integration scenarios (G16.5).** Full suite: 558 tests.
 
 ---
 

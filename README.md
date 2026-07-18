@@ -12,7 +12,6 @@
 [![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
 [![types](https://img.shields.io/badge/types-included-3178c6)](./index.d.ts)
 
-
 Zero-dependency GC and heap profiler. It exists to make the **zero-GC claim
 falsifiable** rather than asserted.
 
@@ -1079,13 +1078,94 @@ convention so `node --test` discovers them automatically alongside the
 v1.0.0 test files. Torture tests live at `test/torture/*.test.mjs` and
 share `test/torture/harness.mjs` (a helper file, not a test).
 
+## Evidence lane: making a failed gate readable
+
+A `verdict: 'fail'` object is not a CI log line. `explainReport`,
+`explainDiff`, and `gateBadge` turn any gate report into something a
+human can act on and a README can display.
+
+All three sit under the same `./explain` subpath. They are pure
+formatters -- read a report, emit a string. No measurement, no
+observer, no perturbation. Safe to run in a signal handler, an exit
+hook, or a browser without contaminating the very thing that just
+failed.
+
+```js
+import { assertOps } from '@zakkster/lite-gc-profiler';
+import { explainReport, gateBadge } from '@zakkster/lite-gc-profiler/explain';
+
+try {
+    await assertOps(signalSet, { maxBytesPerOp: 5 },
+        { ops: 10_000, warmup: 500, stabilize: true });
+} catch (err) {
+    console.error(explainReport(err.report, { colour: true }));
+    fs.writeFileSync('gc-badge.json',
+        gateBadge(err.report, { format: 'shields-json' }));
+    throw err;
+}
+```
+
+### `explainReport` output shape
+
+For a fail:
+
+```
+gc-gate: FAIL — ops
+
+Violations (1):
+  maxBytesPerOp
+    actual: 47.20
+    limit:  5 (+42.20; +844.00% over limit)
+    means:  bytes per op
+
+Run:
+  ops:     10000
+  warmup:  500
+  source:  gc
+  stabilized: yes
+```
+
+For a compare, a Comparison block with control + candidate absolute
+readings appears above the Run footer so the deltas are read against
+their side-by-side context, not in isolation.
+
+For an inconclusive, a `Cannot verify:` block names the specific rules
+that could not be checked and the source they ran against. `pass` gets
+a compact "N rules verified" summary.
+
+Hints fire only when the report carries concrete evidence for them
+(`asyncResidual > 0`, `bytesPerFrameStable: false`,
+`bytesPerOpStable: false`, `reason: 'source_mismatch'`). No speculative
+advice.
+
+### `gateBadge` for README ornaments
+
+Three formats:
+
+- `'text'` -- `gc gate: pass` / `gc gate: fail (2)` / `gc gate: inconclusive`
+- `'shields-json'` -- the shields.io endpoint schema
+  (`{ schemaVersion, label, message, color }`) that reads over HTTPS
+  from a static file, driving a live badge in a README
+- `'svg'` -- a self-contained ~1 KB shields-style SVG string
+
+Colours: brightgreen / red / yellow for pass / fail / inconclusive.
+
+### `explainDiff` for cross-baseline comparisons
+
+For the case where a caller ran two separate `check*` calls -- e.g.
+against distinct baselines from different runs -- and wants a
+compare-style narrative without going through `compare*`. Kind mismatch
+between the two reports is surfaced in the header, not thrown, in case
+the diff is deliberately cross-lane (an ops report vs a frames report
+for a summary slide).
+
 ## Testing
 
 ```
 node --expose-gc --test test/*.mjs test/torture/*.mjs
 ```
 
-517 tests, all passing on this hardware. Torture tests (187 scenarios
+558 tests, all passing on this hardware. Torture tests (206 scenarios
 across axes A-W) enforce that adversarial inputs never silently pass, that
 real signal in noise always fails, that clean signal under hostile
 conditions always passes, and that self-consistency invariants hold across

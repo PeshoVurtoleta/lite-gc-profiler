@@ -1,5 +1,136 @@
 # Changelog
 
+## 1.6.0
+
+Batch 9: the evidence lane (G21/G22). Three new functions under the
+existing `./explain` subpath -- `explainReport`, `explainDiff`, and
+`gateBadge` -- close the loop between "gate failed in CI" and "developer
+sees why in the log." Additive; zero behaviour change for existing
+v1.5.x callers.
+
+### What's new
+
+- `explainReport(report, opts?)` -- narrate any gate report as a
+  human-readable multi-line string. Handles the four report families
+  emitted across the library (whole-window `check`, per-op `checkOps`,
+  per-frame `checkFrames`, per-op-async `checkOpsAsync`, plus all their
+  compare variants) with a unified layout: verdict header, violations
+  block naming rule / actual / limit / delta and percent-over, Cannot
+  verify block for inconclusive verdicts, per-metric Comparison block
+  for compare reports, Run footer with source and stabilize flags, and
+  Hints when the report carries evidence for actionable advice
+  (`asyncResidual > 0`, `bytesPerFrameStable: false`,
+  `bytesPerOpStable: false`, `reason: 'source_mismatch'`).
+
+- `explainDiff(controlReport, candidateReport, opts?)` -- narrate two
+  INDEPENDENT gate reports as a compare-style diff, for the case where
+  the caller ran two separate `check*` calls (e.g. against distinct
+  baselines) without going through `compare*`. A kind mismatch is
+  surfaced in the header, not thrown.
+
+- `gateBadge(report, opts?)` -- produce a status marker for the report
+  in one of three formats: `'text'` (e.g. `"gc gate: fail (2)"`),
+  `'shields-json'` (the shields.io endpoint schema for a live badge),
+  or `'svg'` (a self-contained ~1 KB shields-style SVG for direct README
+  embedding). Colours are brightgreen / red / yellow for
+  pass / fail / inconclusive.
+
+Everything under the same `./explain` subpath as `startExplainSampling`
+-- these are pure formatters that pair with the existing allocator-side
+attribution primitive when a gate fails.
+
+### Discipline: pure formatters, no perturbation
+
+Every function in the evidence lane is a read-only pass over a gate
+report. No measurement, no `PerformanceObserver`, no
+`process.memoryUsage`, no allocation on any hot path -- pinned by axis-C
+in the G21.5 torture, which runs the formatters inside a live
+`GcProfiler` window and asserts that no majors were induced.
+
+### Report-shape flexibility
+
+`explainReport` accepts reports without an explicit `schema:'lite-gc-report/1'`
+tag. The newer frames / ops-async paths emit that tag; the older sync-ops
+and reps-aware paths predate it and only carry `kind`. The formatter
+duck-types on the `verdict` field so baseline reports on disk keep
+rendering. Reports with an unknown schema value are still rejected.
+
+Two violation shapes are also accepted: the newer `{ rule, metric, actual, limit }`
+and the legacy `{ metric, actual, limit, reason }`. `rule` is preferred
+for the header when present; `reason` is preferred for the human-readable
+"means:" line when present.
+
+### Demo update
+
+`demo/index.html` now includes a formal-gate panel below the live scope:
+a Run gate button that invokes `assertFrames({ maxBytesPerFrame: 512 })`
+on the currently-selected mode (Pooled / Leaky), renders the resulting
+`gateBadge` SVG inline, and displays the `explainReport` narrative in a
+pre-formatted block. Same primitive a README would embed; same output a
+CI job would log.
+
+### Torture (G21.5)
+
+New torture file: `test/torture/g21-5-evidence.test.mjs`. Four-axis
+discipline adapted for a pure-formatter lane:
+
+- **Axis A**: adversarial (NaN/Infinity in actual/limit, 100 000-violation
+  reports, HTML-and-ANSI-tainted rule strings, verdict:pass with stale
+  violations, missing optional fields).
+- **Axis B**: real-fail reports must name the rule and include actual/limit
+  numerals; compare reports must include both control and candidate
+  metrics in the Comparison block (delta alone is unactionable).
+- **Axis C**: no perturbation -- the formatters run inside a live
+  `GcProfiler` window without inducing majors on their own workload.
+- **Axis D**: identical report input yields byte-identical output;
+  minimal-report shape (verdict-only) still produces structured output.
+
+### Full-suite tally
+
+**558 tests, all pass** under `--expose-gc`. 517 carried from v1.5.2
+(which this release includes in full) + 22 standard evidence + 10 torture
+evidence + 9 adversarial evidence.
+
+### Hardening of the new lane
+
+The evidence lane got the same attack-first pass as everything else, before
+release rather than after. Four defects, all in the direction that matters for
+a narrator -- it runs precisely when a gate has already failed, so throwing
+replaces the failure report with a stack trace, and emitting a control
+character forges a line in whatever log is reading it.
+
+- **A newline in a report could forge a GitHub Actions annotation.** Workflow
+  commands are newline-delimited, so a metric or reason carrying
+  `\n::error::...` produced two `::error` directives from one violation, the
+  second entirely controlled by the report's contents. `::notice` and
+  `::add-mask::` are reachable the same way, which means a forged line could
+  also make a failing run read as clean. `formatGithubAnnotations` and every
+  narrated field now strip control characters, and names are length-capped so
+  one oversized field cannot flood a log. Reachability, stated plainly: reports
+  this library produces only carry names from its own fixed vocabulary, and
+  this could NOT be reached through any public API -- the baseline comparator
+  ignores metric keys it does not recognise. It is reachable by formatting a
+  report built by hand or deserialized from another job, which the formatters
+  accept by design. Defence-in-depth, not a patched exploit.
+
+- **A malformed violation entry crashed the narrator.** `violations: [null]`
+  threw `Cannot read properties of null (reading 'rule')`. Malformed entries
+  are now rendered as such and the rest of the report still narrates.
+
+- **An overflowing ratio printed as a number that is not one.** An actual of
+  1e308 against a limit of 1 rendered `+Infinity% over limit`. Non-finite
+  ratios are now dropped in favour of the delta, matching the existing
+  zero-limit behaviour.
+
+- **An unverified rule blamed a cause that had not been established.** The
+  narration read `source "gc" cannot verify this rule`, but since v1.5.2 a rule
+  also lands in `checked:false` when the METRIC was non-finite -- a broken
+  clock or heap source, with the source itself fine. It now names both
+  possibilities instead of asserting one.
+
+Pinned by `test/torture/g22-5-evidence-adversarial.test.mjs` (9 scenarios,
+axes Y-Z). Suite: 517 -> 558.
+
 ## 1.5.2
 
 Adversarial hardening, two passes (G99.9 + G99.10). Zero new public API.

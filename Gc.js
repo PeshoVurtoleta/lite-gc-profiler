@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.5.2';
+const VERSION = '1.6.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -1826,12 +1826,36 @@ function formatMarkdown(report) {
  *
  * See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions
  */
+/**
+ * GitHub Actions workflow commands are NEWLINE-DELIMITED, so any newline that
+ * reaches this output starts a new directive. A metric or reason carrying
+ * `\n::error::...` therefore forges an extra annotation in the run summary --
+ * measured: one violation producing two `::error` directives, the second
+ * entirely controlled by the report's contents. `::notice`, `::add-mask::` and
+ * friends are reachable the same way, so a forged line can also make a failing
+ * run look clean.
+ *
+ * Reports this library produces only carry names from its own vocabulary, and
+ * I could not reach this through any public API. It is reachable by formatting
+ * a report built by hand or deserialized from another job -- which these
+ * formatters accept by design. Strip control characters on the way out.
+ */
+function _ghSafe(value) {
+    const str = value === undefined || value === null ? String(value) : String(value);
+    // eslint-disable-next-line no-control-regex
+    return str.replace(/[\u0000-\u001f\u007f]/g, ' ');
+}
+
 function formatGithubAnnotations(report) {
     const lines = [];
     const title = 'lite-gc-profiler';
     if (report.verdict === 'fail') {
         for (const v of report.violations) {
-            lines.push('::error title=' + title + '::' + v.metric + ': ' + v.reason);
+            if (v === null || typeof v !== 'object') {
+                lines.push('::error title=' + title + '::(malformed violation entry)');
+                continue;
+            }
+            lines.push('::error title=' + title + '::' + _ghSafe(v.metric) + ': ' + _ghSafe(v.reason));
         }
     } else if (report.verdict === 'inconclusive') {
         const unverif = [];
@@ -1848,10 +1872,11 @@ function formatGithubAnnotations(report) {
                 for (const k in scoped) if (scoped[k] === false) unverif.push('byRegion.' + region + '.' + k);
             }
         }
-        const reason = report.reason ? ' (' + report.reason + ')' : '';
-        lines.push('::warning title=' + title + '::gate inconclusive' + reason + ': ' + unverif.join(', '));
+        const reason = report.reason ? ' (' + _ghSafe(report.reason) + ')' : '';
+        lines.push('::warning title=' + title + '::gate inconclusive' + reason + ': '
+            + unverif.map(_ghSafe).join(', '));
     } else {
-        lines.push('::notice title=' + title + '::gate passed on source=' + report.source);
+        lines.push('::notice title=' + title + '::gate passed on source=' + _ghSafe(report.source));
     }
     return lines.join('\n');
 }
