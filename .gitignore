@@ -1,0 +1,7 @@
+# Test & Build Output
+coverage/
+node_modules/
+
+# macOS System Files
+.DS_Store
+/package-lock.json

@@ -6,6 +6,7 @@
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-gc-profiler?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-gc-profiler)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
 [![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
+[![Coverage Status](https://coveralls.io/repos/github/PeshoVurtoleta/lite-gc-profiler/badge.svg?branch=main)](https://coveralls.io/github/PeshoVurtoleta/lite-gc-profiler?branch=main)
 ![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
