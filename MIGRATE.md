@@ -1,5 +1,131 @@
 # Migration notes
 
+## v1.7.0
+
+Batch 10: multi-context aggregation. **Additive only** -- no breaking
+changes to v1.6.x callers. Existing baselines, gates, and reports keep
+working byte-identically.
+
+### What's new
+
+Three functions on the main entry:
+
+- `aggregateWorkerReports(reports, opts?)`
+- `checkAggregateReport(multi, rules)`
+- `assertAggregateReport(reports, rules, opts?)`
+
+Result schema: `'lite-gc-ops-multi/1'`.
+
+Rule vocabulary: same as `checkOps` -- `maxBytesPerOp`, `maxMajorsPerKOp`,
+`maxMinorsPerKOp`, `maxPauseMsPerOp`. No new `VERDICT_MATRIX` rows.
+
+### When to reach for it
+
+If your CI runs `assertOps` on a single hot path called from one thread,
+nothing changes. Keep using `assertOps`.
+
+If your workload is genuinely distributed -- N Node `worker_threads`,
+N browser Web Workers, an app that spawns per-tab or per-tenant heaps
+-- and a per-thread gate would miss cross-context retention, wrap
+your workers' `measureOps` results and gate the aggregate:
+
+```js
+import { Worker } from 'node:worker_threads';
+import { assertAggregateReport } from '@zakkster/lite-gc-profiler';
+
+const reports = await Promise.all(workerPaths.map(runOne));
+assertAggregateReport(reports, { maxBytesPerOp: 5 });
+```
+
+### What the aggregate reports and why
+
+- `bytesPerOp`: ops-weighted, `total_bytes / total_ops`. Not a naive
+  mean of per-context rates -- a 1-op context with a huge rate cannot
+  swamp a 1M-op context with a tiny rate.
+- `bytesPerOpStable`: logical AND. One context falling back to raw
+  two-point degrades the aggregate flag. A gate cannot be more
+  trustworthy than its least-trustworthy source.
+- `maxPauseMsPerOp`: MAX across contexts. The worst pause anywhere in
+  the system is the pause the aggregate reports.
+- `source`: unanimous or `'mixed'`. Mixed-source aggregates are gated
+  `inconclusive` with `reason: 'source_mismatch'`.
+
+### The v1.5.1 fail-closed discipline applies
+
+`checkAggregateReport` uses the same rule-validation surface as
+`checkOps`. Unknown rule keys throw `TypeError`. Non-finite thresholds
+throw `RangeError`. Non-finite aggregate metrics route to `inconclusive`
+(never `pass`).
+
+### No `measureOpsAcrossWorkers` -- deliberate
+
+There is no convenience primitive that owns worker spawning. The
+worker-spawning API differs meaningfully between runtimes (Node
+`worker_threads` vs browser `new Worker(URL.createObjectURL(new Blob(...)))`),
+and a portable wrapper cannot faithfully own both. `@zakkster/lite-worker`
+is the recommended browser-side transport; it is not a hard dependency
+of lite-gc-profiler because `globalThis.Worker` is `undefined` in Node
+and a runtime-agnostic import would fail in the exact place CI gates run.
+
+## v1.6.0
+
+Batch 9: evidence lane. **Additive only** -- no breaking changes to
+v1.5.x callers. Existing baselines, CI configurations, gate rules,
+and rendered explain-sampling output keep working byte-identically.
+
+### What's new
+
+Three functions under the existing `./explain` subpath:
+
+- `explainReport(report, opts?)` -- narrate any gate report
+- `explainDiff(controlReport, candidateReport, opts?)` -- narrate two
+  independent reports as a diff
+- `gateBadge(report, opts?)` -- text / shields-JSON / SVG status badge
+
+Import from `@zakkster/lite-gc-profiler/explain` alongside the existing
+`startExplainSampling` and `formatExplainConsole`. All are pure
+formatters -- they read gate reports and emit strings.
+
+### Typical CI usage
+
+```js
+import { assertOps } from '@zakkster/lite-gc-profiler';
+import { explainReport, gateBadge } from '@zakkster/lite-gc-profiler/explain';
+
+try {
+    await assertOps(signalSet, { maxBytesPerOp: 5 },
+        { ops: 10_000, warmup: 500, stabilize: true });
+} catch (err) {
+    // err.report is the failing gate report
+    console.error(explainReport(err.report, { colour: true }));
+    // Or write a shields-compatible badge JSON to a file for CI to pick up:
+    fs.writeFileSync('gc-badge.json', gateBadge(err.report, { format: 'shields-json' }));
+    throw err;
+}
+```
+
+`explainReport` handles all four report families (whole-window,
+per-op, per-frame, per-op-async, plus compare variants) and both
+violation shapes (`{ rule, metric, actual, limit }` from the newer
+paths; `{ metric, actual, limit, reason }` from the legacy paths).
+
+### Demo showcase
+
+`demo/index.html` grew a formal-gate panel that runs
+`assertFrames({ maxBytesPerFrame: 512 })` on the currently-selected
+mode and renders the resulting badge + `explainReport` narrative
+inline. The scope canvas above stays as-is -- the panel is additive.
+
+### What is NOT changed
+
+- `startExplainSampling` / `formatExplainConsole`: unchanged. Explain
+  mode remains the "who allocated" primitive; the new formatters are
+  the "what did the gate report" primitive. Both are useful; neither
+  substitutes for the other.
+- Report shapes: unchanged. `explainReport` accepts every existing
+  report shape as-is, including reports without a
+  `schema:'lite-gc-report/1'` tag.
+
 ## v1.5.2
 
 Adversarial hardening in two passes (G99.9 + G99.10). **No new public

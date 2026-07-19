@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -1836,14 +1836,13 @@ function formatMarkdown(report) {
  * run look clean.
  *
  * Reports this library produces only carry names from its own vocabulary, and
- * I could not reach this through any public API. It is reachable by formatting
+ * this was not reachable through any public API. It is reachable by formatting
  * a report built by hand or deserialized from another job -- which these
  * formatters accept by design. Strip control characters on the way out.
  */
 function _ghSafe(value) {
-    const str = value === undefined || value === null ? String(value) : String(value);
     // eslint-disable-next-line no-control-regex
-    return str.replace(/[\u0000-\u001f\u007f]/g, ' ');
+    return String(value).replace(/[\u0000-\u001f\u007f]/g, ' ');
 }
 
 function formatGithubAnnotations(report) {
@@ -3454,6 +3453,329 @@ async function assertCompareOpsAsync(controlOrFn, candidateOrFn, rules, opts) {
     return report;
 }
 
+// =============================================================================
+// Batch 10 (v1.7.0) -- multi-context aggregation (G22).
+//
+// Every measurement lane before this batch measures ONE shared heap in ONE
+// context. That's the fundamental constraint the per-op / per-frame /
+// per-op-async primitives enforce -- and it's why the v1.5.1 hardening
+// forbids overlapping measurements ("all lanes share one heap"). But a real
+// workload distributed across N Node worker_threads, or N browser Web
+// Workers, is N heaps, N GC observers, N PerformanceObservers. There is no
+// single shared heap to observe.
+//
+// aggregateWorkerReports takes an array of per-context measurement results
+// (each obtained however the user spawned that context) and produces a
+// unified aggregate that can be gated against the same rule vocabulary as
+// single-context measureOps. This is a PURE AGGREGATOR -- it does no
+// spawning, no messaging, no perturbation. Users bring their own workers
+// (node:worker_threads for CI gates; @zakkster/lite-worker for browser
+// 60fps demos; whatever Web Workers pattern fits their app) and hand the
+// resulting reports here.
+//
+// The semantic decisions the aggregator encodes:
+//
+//   bytesPerOp:       (sum of retained bytes across all contexts) /
+//                     (sum of ops across all contexts). This is the total
+//                     system retention rate, not a per-context average.
+//                     Weighted correctly when contexts run different op
+//                     counts.
+//   bytesPerOpStable: logical AND. If ANY context fell back to the raw
+//                     two-point delta (bytesPerOpStable: false), the
+//                     aggregate is not fully stabilized. One context's
+//                     honesty flag doesn't erase another's noise.
+//   majorsPerKOp,
+//   minorsPerKOp:     rate weighted by ops -- total events across contexts
+//                     divided by total ops, times 1000. Same shape as
+//                     single-context.
+//   maxPauseMsPerOp:  MAX across contexts. The worst pause anywhere in
+//                     the system is the pause the aggregate reports.
+//   source:           if all contexts agree, that source. Otherwise
+//                     'mixed' and the aggregate gate result is
+//                     'inconclusive' with reason='source_mismatch'.
+//
+// This is deliberately conservative: any single context that reports an
+// inconclusive-flavoured signal degrades the aggregate. A gate cannot be
+// more trustworthy than its least-trustworthy source.
+// =============================================================================
+
+const MULTI_SCHEMA = 'lite-gc-ops-multi/1';
+
+function _isFiniteNum(v) {
+    return typeof v === 'number' && Number.isFinite(v);
+}
+
+/**
+ * Aggregate an array of per-context ops measurement results into a single
+ * multi-context report. Accepts results from measureOps, measureOpsAsync,
+ * and any object with the same shape -- .ops, .bytesPerOp, .majorsPerKOp,
+ * .minorsPerKOp, .maxPauseMsPerOp, .source, and .summary.
+ *
+ * The per-context source of truth: whatever measurement primitive the
+ * context ran. This function does no measurement of its own.
+ *
+ * @param {Array<object>} reports                    Per-context measurement results.
+ * @param {object} [opts]
+ * @param {string} [opts.label]                      Optional label for the aggregate (e.g. 'workers').
+ * @returns {{
+ *   schema: 'lite-gc-ops-multi/1',
+ *   kind: 'ops-multi',
+ *   contexts: number,
+ *   aggregate: {
+ *     source: string,
+ *     totalOps: number,
+ *     bytesPerOp: number | null,
+ *     bytesPerOpStable: boolean,
+ *     majorsPerKOp: number,
+ *     minorsPerKOp: number,
+ *     maxPauseMsPerOp: number
+ *   },
+ *   perContext: Array<object>
+ * }}
+ */
+function aggregateWorkerReports(reports, opts) {
+    if (!Array.isArray(reports)) {
+        throw new TypeError('aggregateWorkerReports: reports must be an array');
+    }
+    if (reports.length === 0) {
+        throw new RangeError('aggregateWorkerReports: reports array must be non-empty');
+    }
+
+    // Validate the shape of each report before aggregating -- a malformed
+    // input here silently contaminates every downstream verdict. Capture
+    // .ops and .source into locals so a lying getter is observed once per
+    // report, in the pass that verifies it.
+    for (let i = 0; i < reports.length; i++) {
+        const r = reports[i];
+        if (!r || typeof r !== 'object') {
+            throw new TypeError('aggregateWorkerReports: reports[' + i + '] is not an object');
+        }
+        const ops = r.ops;
+        if (!_isFiniteNum(ops) || ops <= 0) {
+            throw new TypeError('aggregateWorkerReports: reports[' + i + '].ops must be a positive finite number; got '
+                + JSON.stringify(ops));
+        }
+        const src = r.source;
+        if (typeof src !== 'string') {
+            throw new TypeError('aggregateWorkerReports: reports[' + i + '].source must be a string');
+        }
+    }
+
+    // Source resolution: unanimous or 'mixed'.
+    let source = reports[0].source;
+    let mixed = false;
+    for (let i = 1; i < reports.length; i++) {
+        if (reports[i].source !== source) { mixed = true; break; }
+    }
+    if (mixed) source = 'mixed';
+
+    // Weighted sums. Use running accumulators to defer division until the end
+    // -- floating-point division per report and then summing accumulates
+    // error, whereas summing counts and dividing once at the end does not.
+    let totalOps = 0;
+    let totalBytes = 0;
+    let totalMajor = 0;
+    let totalMinor = 0;
+    let maxPause = 0;
+    let anyBytesUnknown = false;
+    let anyBytesUnstable = false;
+    // Each sibling metric needs the same unknown-tracking bytesPerOp has.
+    // Without it the arithmetic is asymmetric: a report's `ops` is added to
+    // totalOps unconditionally, but a missing or non-finite metric is skipped
+    // in the numerator -- so an unmeasurable context DILUTES the aggregate
+    // toward zero and the gate reads cleaner than reality. Measured: one
+    // report with NaN minorsPerKOp alongside one clean report at 1.0 produced
+    // an aggregate of 0.5, and one with NaN majorsPerKOp produced 0 majors and
+    // a passing verdict. Unknown must propagate as unknown, exactly as
+    // bytesPerOp already does.
+    let sawStablePresent = false;
+    let sawStableAbsent = false;
+    let anyMajorsUnknown = false;
+    let anyMinorsUnknown = false;
+    let anyPauseUnknown = false;
+
+    for (const r of reports) {
+        const ops = r.ops;
+        totalOps += ops;
+
+        // Capture the metric fields ONCE per report. A malicious or accidental
+        // getter that returns different values on successive reads (a
+        // thenable, a mutating counter) must be observed exactly once so the
+        // aggregate's provenance is stable. This is also cheaper -- one
+        // property access per metric instead of two or three.
+        const bpo = r.bytesPerOp;
+        const bposStable = r.bytesPerOpStable;
+        const majorsK = r.majorsPerKOp;
+        const minorsK = r.minorsPerKOp;
+        const pause = r.maxPauseMsPerOp;
+
+        // bytesPerOp: propagate a null through as 'unknown for aggregate'.
+        // A single context that couldn't measure memory means the aggregate
+        // can't either.
+        if (bpo === null || bpo === undefined) {
+            anyBytesUnknown = true;
+        } else if (_isFiniteNum(bpo)) {
+            totalBytes += bpo * ops;
+        } else {
+            // NaN/Infinity contaminates aggregate -- treat as unknown.
+            anyBytesUnknown = true;
+        }
+
+        // bytesPerOpStable: only defined on newer paths. An all-legacy set has
+        // nothing to degrade, so absence alone stays true. But in a MIXED set
+        // -- some contexts reporting the flag, others not -- absence is
+        // meaningful: at least one context came from a path that reports it,
+        // so silence from another is unknown provenance, not confirmed
+        // stability. Claiming true there asserts something the aggregate
+        // cannot show, which is the one thing this package argues against.
+        if (bposStable === false) anyBytesUnstable = true;
+        if (bposStable === undefined) sawStableAbsent = true; else sawStablePresent = true;
+
+        if (_isFiniteNum(majorsK)) totalMajor += (majorsK / 1000) * ops;
+        else anyMajorsUnknown = true;
+        if (_isFiniteNum(minorsK)) totalMinor += (minorsK / 1000) * ops;
+        else anyMinorsUnknown = true;
+        if (_isFiniteNum(pause)) {
+            if (pause > maxPause) maxPause = pause;
+        } else {
+            anyPauseUnknown = true;
+        }
+    }
+
+    const bytesPerOp = anyBytesUnknown ? null : (totalOps > 0 ? totalBytes / totalOps : 0);
+    const bytesPerOpStable = !anyBytesUnstable && !(sawStablePresent && sawStableAbsent);
+    const majorsPerKOp = anyMajorsUnknown ? null
+        : (totalOps > 0 ? (totalMajor / totalOps) * 1000 : 0);
+    const minorsPerKOp = anyMinorsUnknown ? null
+        : (totalOps > 0 ? (totalMinor / totalOps) * 1000 : 0);
+    const maxPauseMsPerOp = anyPauseUnknown ? null : maxPause;
+
+    return {
+        schema: MULTI_SCHEMA,
+        kind: 'ops-multi',
+        contexts: reports.length,
+        aggregate: {
+            source: source,
+            totalOps: totalOps,
+            bytesPerOp: bytesPerOp,
+            bytesPerOpStable: bytesPerOpStable,
+            majorsPerKOp: majorsPerKOp,
+            minorsPerKOp: minorsPerKOp,
+            maxPauseMsPerOp: maxPauseMsPerOp
+        },
+        perContext: reports.slice()                  // defensive copy
+    };
+}
+
+/**
+ * Gate an aggregate report against per-op rules. Same rule vocabulary as
+ * checkOps -- maxBytesPerOp, maxMajorsPerKOp, maxMinorsPerKOp,
+ * maxPauseMsPerOp. If the aggregate source is 'mixed' (contexts ran on
+ * different sources), returns 'inconclusive' with
+ * reason='source_mismatch' -- deltas across mixed sources are not
+ * comparable.
+ *
+ * @param {object} multiReport                       Result of aggregateWorkerReports.
+ * @param {object} rules                             Any subset of the ops rule set.
+ * @returns {object}                                 Gate report (schema 'lite-gc-report/1', kind 'ops-multi').
+ */
+function checkAggregateReport(multiReport, rules) {
+    if (!multiReport || multiReport.schema !== MULTI_SCHEMA) {
+        throw new TypeError('checkAggregateReport: multiReport must be a lite-gc-ops-multi/1 result');
+    }
+    if (!rules || typeof rules !== 'object') {
+        throw new TypeError('checkAggregateReport: rules must be an object');
+    }
+    // Reuse the same rule-validation surface that checkOpsAsync uses so
+    // typos/unknown-keys throw at setup (v1.5.1 hardening).
+    _validateRules('checkAggregateReport', rules, OPS_RULES);
+
+    const agg = multiReport.aggregate;
+    const source = agg.source;
+
+    if (source === 'mixed') {
+        // A gate across contexts on different sources is not meaningful.
+        // Report the state honestly; do not fabricate a comparable delta.
+        return {
+            schema: 'lite-gc-report/1',
+            kind: 'ops-multi',
+            verdict: 'inconclusive',
+            reason: 'source_mismatch',
+            source: 'mixed',
+            violations: [],
+            checked: {},
+            result: multiReport
+        };
+    }
+
+    const violations = [];
+    const checked = {};
+    let sawInconclusive = false;
+
+    function checkOne(rule, actual, metric) {
+        const limit = rules[rule];
+        if (limit === undefined) return;
+        const row = VERDICT_MATRIX[rule];
+        const state = row ? row[source] : 'no';
+        if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
+            checked[rule] = true;
+            if (actual === null || actual === undefined) {
+                checked[rule] = false;
+                sawInconclusive = true;
+            } else if (!_isFiniteNum(actual)) {
+                // Non-finite metric routes to inconclusive (v1.5.1 discipline).
+                checked[rule] = false;
+                sawInconclusive = true;
+            } else if (actual > limit) {
+                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
+            }
+        } else {
+            checked[rule] = false;
+            sawInconclusive = true;
+        }
+    }
+
+    checkOne('maxBytesPerOp', agg.bytesPerOp, 'bytesPerOp');
+    checkOne('maxMajorsPerKOp', agg.majorsPerKOp, 'majorsPerKOp');
+    checkOne('maxMinorsPerKOp', agg.minorsPerKOp, 'minorsPerKOp');
+    checkOne('maxPauseMsPerOp', agg.maxPauseMsPerOp, 'maxPauseMsPerOp');
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (sawInconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        schema: 'lite-gc-report/1',
+        kind: 'ops-multi',
+        verdict: verdict,
+        source: source,
+        violations: violations,
+        checked: checked,
+        result: multiReport
+    };
+}
+
+/**
+ * Convenience: aggregateWorkerReports + checkAggregateReport, throwing
+ * GcBudgetError on fail or GcInconclusiveError on inconclusive (unless
+ * opts.allowInconclusive).
+ *
+ * @param {Array<object>} reports
+ * @param {object} rules
+ * @param {{ allowInconclusive?: boolean }} [opts]
+ * @returns {object}
+ */
+function assertAggregateReport(reports, rules, opts) {
+    const multi = aggregateWorkerReports(reports);
+    const report = checkAggregateReport(multi, rules);
+    if (report.verdict === 'fail') throw new GcBudgetError(report);
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
 
 export {
     VERSION,
@@ -3472,6 +3794,8 @@ export {
     // Batch 8 (v1.5.0) -- serialized async ops.
     measureOpsAsync, checkOpsAsync, assertOpsAsync,
     compareOpsAsync, assertCompareOpsAsync,
+    // Batch 10 (v1.7.0) -- multi-context aggregation.
+    aggregateWorkerReports, checkAggregateReport, assertAggregateReport,
     GcBudgetError, GcInconclusiveError,
     GC_DEFAULT_RULES, GC_DEFAULT_DIFFERENTIAL_RULES, REP_POLICY_DEFAULTS,
     VERDICT_MATRIX,

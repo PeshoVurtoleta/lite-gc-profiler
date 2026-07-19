@@ -796,6 +796,110 @@ Same rule vocabulary as `checkOps`: `maxBytesPerOp`, `maxMajorsPerKOp`,
 `maxExtraBytesPerOp`, `maxExtraMajorsPerKOp`, `maxExtraMinorsPerKOp`,
 `maxExtraPauseMsPerOp`.
 
+## Multi-context aggregation: gating across worker heaps
+
+Every measurement lane above measures **one shared heap in one context**.
+That's what the "overlapping measurements throw" hardening in v1.5.1
+enforces -- all lanes share one heap. But a real workload distributed
+across N Node worker_threads, or N browser Web Workers, is N heaps, N GC
+observers, N `PerformanceObserver`s. There is no single shared heap to
+observe.
+
+`aggregateWorkerReports` takes an array of per-context measurement
+results and produces a unified aggregate that can be gated against the
+same rule vocabulary as single-context `measureOps`. Pure aggregation --
+no spawning, no messaging, no perturbation. You bring the workers, the
+aggregator handles the semantic.
+
+```js
+import {
+    aggregateWorkerReports, checkAggregateReport, assertAggregateReport
+} from '@zakkster/lite-gc-profiler';
+```
+
+### Node CI gates: `worker_threads`
+
+```js
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
+import { assertAggregateReport } from '@zakkster/lite-gc-profiler';
+
+// worker.mjs -- runs measureOps on this context's heap and posts the result.
+//
+//   import { measureOps } from '@zakkster/lite-gc-profiler';
+//   import { parentPort } from 'node:worker_threads';
+//   const result = measureOps(hotPath, { ops: 10_000, warmup: 500, stabilize: true });
+//   parentPort.postMessage(result);
+
+const workerUrl = new URL('./worker.mjs', import.meta.url);
+function runOne() {
+    return new Promise((res, rej) => {
+        const w = new Worker(workerUrl);         // inherits --expose-gc from parent
+        w.once('message', (m) => { w.terminate(); res(m); });
+        w.once('error', rej);
+    });
+}
+
+const reports = await Promise.all([runOne(), runOne(), runOne(), runOne()]);
+assertAggregateReport(reports, { maxBytesPerOp: 5 });
+```
+
+Node worker_threads inherit the parent's `--expose-gc`. Do not pass it
+via `execArgv` -- Node rejects that with `ERR_WORKER_INVALID_EXEC_ARGV`,
+because `--expose-gc` can only be set at top-level process start.
+
+### Browser 60fps: `@zakkster/lite-worker`
+
+For the browser side, `@zakkster/lite-worker` gives you a zero-GC
+per-frame channel that pairs cleanly with the frame-lane primitive.
+Each worker runs `measureFrames` on its own heap, posts the result
+back over the typed channel (`ctx.post`/`.call`), the main thread
+collects and aggregates. See the lite-worker README for the transport
+details.
+
+### The aggregation semantics
+
+The aggregator encodes conservative decisions:
+
+- **`bytesPerOp`**: `(total retained bytes across all contexts) / (total
+  ops across all contexts)`. Weighted by ops, so a 1-op context with a
+  huge rate cannot swamp a 1M-op context with a tiny rate. If any
+  context reports `null` or non-finite, the aggregate is `null`.
+- **`bytesPerOpStable`**: logical **AND** across contexts. One context
+  falling back to the raw two-point delta degrades the aggregate flag.
+  A gate cannot be more trustworthy than its least-trustworthy source.
+- **`majorsPerKOp`, `minorsPerKOp`**: ops-weighted rate. Same shape as
+  single-context.
+- **`maxPauseMsPerOp`**: **MAX** across contexts. The worst pause
+  anywhere in the system is the pause the aggregate reports.
+- **`source`**: unanimous or `'mixed'`. A mixed-source aggregate is
+  gated `inconclusive` with `reason: 'source_mismatch'` -- deltas across
+  mixed sources are not comparable.
+
+### Result shape
+
+```js
+{
+    schema: 'lite-gc-ops-multi/1',
+    kind: 'ops-multi',
+    contexts: 4,
+    aggregate: {
+        source: 'gc',
+        totalOps: 40000,
+        bytesPerOp: 3.2,
+        bytesPerOpStable: true,
+        majorsPerKOp: 0.1,
+        minorsPerKOp: 2.4,
+        maxPauseMsPerOp: 3.8
+    },
+    perContext: [ /* the input reports, defensive copy */ ]
+}
+```
+
+The v1.5.1 gate-fail-closed discipline extends to `checkAggregateReport`:
+unknown rule keys throw, non-finite thresholds throw, non-finite aggregate
+metrics route to `inconclusive` (never `pass`).
+
 ## Baseline lock: guarding against silent regressions
 
 CI ergonomics: capture a known-good aggregate once, commit it as JSON, gate
@@ -967,6 +1071,87 @@ report shape returned by `checkNoGc`, `compareGc`, `gateReps`, or
 The CLI's `--format` flag picks one of these; nothing in the library forces
 you to use the CLI though -- import the formatters directly in any tool.
 
+## Evidence lane: making a failed gate readable
+
+A `verdict: 'fail'` object is not a CI log line. `explainReport`,
+`explainDiff`, and `gateBadge` turn any gate report into something a
+human can act on and a README can display.
+
+All three sit under the same `./explain` subpath. They are pure
+formatters -- read a report, emit a string. No measurement, no
+observer, no perturbation. Safe to run in a signal handler, an exit
+hook, or a browser without contaminating the very thing that just
+failed.
+
+```js
+import { assertOps } from '@zakkster/lite-gc-profiler';
+import { explainReport, gateBadge } from '@zakkster/lite-gc-profiler/explain';
+
+try {
+    await assertOps(signalSet, { maxBytesPerOp: 5 },
+        { ops: 10_000, warmup: 500, stabilize: true });
+} catch (err) {
+    console.error(explainReport(err.report, { colour: true }));
+    fs.writeFileSync('gc-badge.json',
+        gateBadge(err.report, { format: 'shields-json' }));
+    throw err;
+}
+```
+
+### `explainReport` output shape
+
+For a fail:
+
+```
+gc-gate: FAIL -- ops
+
+Violations (1):
+  maxBytesPerOp
+    actual: 47.20
+    limit:  5 (+42.20; +844.00% over limit)
+    means:  bytes per op
+
+Run:
+  ops:     10000
+  warmup:  500
+  source:  gc
+  stabilized: yes
+```
+
+For a compare, a Comparison block with control + candidate absolute
+readings appears above the Run footer so the deltas are read against
+their side-by-side context, not in isolation.
+
+For an inconclusive, a `Cannot verify:` block names the specific rules
+that could not be checked and the source they ran against. `pass` gets
+a compact "N rules verified" summary.
+
+Hints fire only when the report carries concrete evidence for them
+(`asyncResidual > 0`, `bytesPerFrameStable: false`,
+`bytesPerOpStable: false`, `reason: 'source_mismatch'`). No speculative
+advice.
+
+### `gateBadge` for README ornaments
+
+Three formats:
+
+- `'text'` -- `gc gate: pass` / `gc gate: fail (2)` / `gc gate: inconclusive`
+- `'shields-json'` -- the shields.io endpoint schema
+  (`{ schemaVersion, label, message, color }`) that reads over HTTPS
+  from a static file, driving a live badge in a README
+- `'svg'` -- a self-contained ~1 KB shields-style SVG string
+
+Colours: brightgreen / red / yellow for pass / fail / inconclusive.
+
+### `explainDiff` for cross-baseline comparisons
+
+For the case where a caller ran two separate `check*` calls -- e.g.
+against distinct baselines from different runs -- and wants a
+compare-style narrative without going through `compare*`. Kind mismatch
+between the two reports is surfaced in the header, not thrown, in case
+the diff is deliberately cross-lane (an ops report vs a frames report
+for a summary slide).
+
 ## Explain mode: allocator attribution
 
 When a gate fails, regions tell you where the pause fired. Explain mode
@@ -1078,94 +1263,13 @@ convention so `node --test` discovers them automatically alongside the
 v1.0.0 test files. Torture tests live at `test/torture/*.test.mjs` and
 share `test/torture/harness.mjs` (a helper file, not a test).
 
-## Evidence lane: making a failed gate readable
-
-A `verdict: 'fail'` object is not a CI log line. `explainReport`,
-`explainDiff`, and `gateBadge` turn any gate report into something a
-human can act on and a README can display.
-
-All three sit under the same `./explain` subpath. They are pure
-formatters -- read a report, emit a string. No measurement, no
-observer, no perturbation. Safe to run in a signal handler, an exit
-hook, or a browser without contaminating the very thing that just
-failed.
-
-```js
-import { assertOps } from '@zakkster/lite-gc-profiler';
-import { explainReport, gateBadge } from '@zakkster/lite-gc-profiler/explain';
-
-try {
-    await assertOps(signalSet, { maxBytesPerOp: 5 },
-        { ops: 10_000, warmup: 500, stabilize: true });
-} catch (err) {
-    console.error(explainReport(err.report, { colour: true }));
-    fs.writeFileSync('gc-badge.json',
-        gateBadge(err.report, { format: 'shields-json' }));
-    throw err;
-}
-```
-
-### `explainReport` output shape
-
-For a fail:
-
-```
-gc-gate: FAIL — ops
-
-Violations (1):
-  maxBytesPerOp
-    actual: 47.20
-    limit:  5 (+42.20; +844.00% over limit)
-    means:  bytes per op
-
-Run:
-  ops:     10000
-  warmup:  500
-  source:  gc
-  stabilized: yes
-```
-
-For a compare, a Comparison block with control + candidate absolute
-readings appears above the Run footer so the deltas are read against
-their side-by-side context, not in isolation.
-
-For an inconclusive, a `Cannot verify:` block names the specific rules
-that could not be checked and the source they ran against. `pass` gets
-a compact "N rules verified" summary.
-
-Hints fire only when the report carries concrete evidence for them
-(`asyncResidual > 0`, `bytesPerFrameStable: false`,
-`bytesPerOpStable: false`, `reason: 'source_mismatch'`). No speculative
-advice.
-
-### `gateBadge` for README ornaments
-
-Three formats:
-
-- `'text'` -- `gc gate: pass` / `gc gate: fail (2)` / `gc gate: inconclusive`
-- `'shields-json'` -- the shields.io endpoint schema
-  (`{ schemaVersion, label, message, color }`) that reads over HTTPS
-  from a static file, driving a live badge in a README
-- `'svg'` -- a self-contained ~1 KB shields-style SVG string
-
-Colours: brightgreen / red / yellow for pass / fail / inconclusive.
-
-### `explainDiff` for cross-baseline comparisons
-
-For the case where a caller ran two separate `check*` calls -- e.g.
-against distinct baselines from different runs -- and wants a
-compare-style narrative without going through `compare*`. Kind mismatch
-between the two reports is surfaced in the header, not thrown, in case
-the diff is deliberately cross-lane (an ops report vs a frames report
-for a summary slide).
-
 ## Testing
 
 ```
 node --expose-gc --test test/*.mjs test/torture/*.mjs
 ```
 
-558 tests, all passing on this hardware. Torture tests (206 scenarios
+601 tests, all passing on this hardware. Torture tests (225 scenarios
 across axes A-W) enforce that adversarial inputs never silently pass, that
 real signal in noise always fails, that clean signal under hostile
 conditions always passes, and that self-consistency invariants hold across

@@ -1,4 +1,4 @@
-export const VERSION: '1.6.0';
+export const VERSION: '1.7.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -1047,3 +1047,106 @@ export function assertCompareOpsAsync(
     rules: CompareOpsAsyncRules,
     opts: MeasureOpsAsyncOptions
 ): Promise<OpsAsyncGateResult>;
+
+// =============================================================================
+// Batch 10 (v1.7.0) -- multi-context aggregation (G22).
+// =============================================================================
+
+/**
+ * A single per-context measurement used as input to aggregateWorkerReports.
+ * The minimum required shape is a subset of what measureOps / measureOpsAsync
+ * produce -- .ops, .source, and any subset of the numeric rate/pause fields.
+ * Missing numeric fields are treated as zero for rate accumulation.
+ */
+export interface WorkerReport {
+    /** Steady-phase op count for this context. Must be a positive finite number. */
+    ops: number;
+    /** Source label -- must be a string. Values that don't match across contexts yield 'mixed'. */
+    source: string;
+    /** null on source='none' or memory-unavailable; propagates to the aggregate. */
+    bytesPerOp?: number | null;
+    /** true iff the context ran the stabilised (forced-GC boundary) path. Missing = treat as non-degrading. */
+    bytesPerOpStable?: boolean;
+    majorsPerKOp?: number;
+    minorsPerKOp?: number;
+    maxPauseMsPerOp?: number;
+    /** Optional GC summary; carried through to perContext but not aggregated. */
+    summary?: GcSummary;
+}
+
+/** Aggregate metrics derived from N per-context reports. */
+export interface AggregatedOpsMetrics {
+    source: string;
+    totalOps: number;
+    /** null if any per-context bytesPerOp was null or non-finite. */
+    bytesPerOp: number | null;
+    /**
+     * Logical AND across contexts. false if any context reported false, and
+     * also false when the set is MIXED -- some contexts reporting the flag and
+     * others omitting it -- because absence there is unknown provenance rather
+     * than confirmed stability. An all-legacy set (no context reports it) has
+     * nothing to degrade and stays true.
+     */
+    bytesPerOpStable: boolean;
+    /**
+     * Ops-weighted rate: (total events across contexts / total ops) * 1000.
+     *
+     * null if ANY context omitted the metric or reported it non-finite. A
+     * context's ops count lands in the denominator regardless, so treating an
+     * absent metric as a zero contribution would dilute the aggregate toward
+     * clean and gate green on something never measured -- notably for
+     * `measureOps` results, which carry no GC rates at all because the
+     * synchronous lane cannot observe GC events.
+     */
+    majorsPerKOp: number | null;
+    minorsPerKOp: number | null;
+    /** MAX across contexts -- the worst pause anywhere. null if any context omitted it. */
+    maxPauseMsPerOp: number | null;
+}
+
+export interface WorkerAggregateResult {
+    schema: 'lite-gc-ops-multi/1';
+    kind: 'ops-multi';
+    contexts: number;
+    aggregate: AggregatedOpsMetrics;
+    perContext: WorkerReport[];
+}
+
+export interface WorkerAggregateOptions {
+    /** Optional label for the aggregate. Not used in the returned shape yet. */
+    label?: string;
+}
+
+/**
+ * Aggregate an array of per-context ops measurement results into a single
+ * multi-context report. Pure aggregation -- no measurement, no observer, no
+ * perturbation. Users bring their own workers (node:worker_threads, browser
+ * Web Workers via @zakkster/lite-worker or a hand-rolled Blob URL, etc.) and
+ * hand the per-context results here.
+ */
+export function aggregateWorkerReports(
+    reports: WorkerReport[],
+    opts?: WorkerAggregateOptions
+): WorkerAggregateResult;
+
+/**
+ * Gate an aggregate report against per-op rules. Same rule vocabulary as
+ * checkOps -- maxBytesPerOp, maxMajorsPerKOp, maxMinorsPerKOp,
+ * maxPauseMsPerOp. If contexts ran on different sources ('mixed'), the
+ * verdict is inconclusive with reason='source_mismatch'.
+ */
+export function checkAggregateReport(
+    multiReport: WorkerAggregateResult,
+    rules: OpsRules
+): GcReport;
+
+/**
+ * Convenience: aggregateWorkerReports + checkAggregateReport, throwing
+ * GcBudgetError on fail or GcInconclusiveError on inconclusive (unless
+ * opts.allowInconclusive).
+ */
+export function assertAggregateReport(
+    reports: WorkerReport[],
+    rules: OpsRules,
+    opts?: { allowInconclusive?: boolean }
+): GcReport;

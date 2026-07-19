@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.6.0
+# @zakkster/lite-gc-profiler v1.7.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -23,6 +23,7 @@ test-helpers/explain and the lite-gc-gate CLI.
   `compareFrames`, `assertCompareFrames`,
   `measureOpsAsync`, `checkOpsAsync`, `assertOpsAsync`,
   `compareOpsAsync`, `assertCompareOpsAsync`,
+  `aggregateWorkerReports`, `checkAggregateReport`, `assertAggregateReport`,
   `captureFingerprint`,
   `createBaseline`, `checkAgainstBaseline`, `assertAgainstBaseline`,
   `formatConsole`, `formatJson`, `formatMarkdown`,
@@ -38,7 +39,6 @@ test-helpers/explain and the lite-gc-gate CLI.
   `explainReport`, `explainDiff`, `gateBadge` (v1.6.0 evidence lane:
   pure gate-report formatters; browser-safe; no measurement, no
   observer, no perturbation).
-  `formatExplainConsole`.
 - `bin/lite-gc-gate` (CLI).
 
 ## Key semantics

@@ -1,5 +1,120 @@
 # Changelog
 
+## 1.7.0
+
+Batch 10: multi-context aggregation (G22). Three new functions --
+`aggregateWorkerReports`, `checkAggregateReport`, `assertAggregateReport`
+-- extend the ops rule vocabulary across worker heaps. Additive; zero
+behaviour change for existing v1.6.x callers.
+
+### The problem this closes
+
+Every measurement lane before this batch measures ONE shared heap in ONE
+context. That's what the v1.5.1 "overlapping measurements throw"
+hardening enforces -- all lanes share one heap. But a real workload
+distributed across N Node worker_threads or N browser Web Workers is N
+heaps, N GC observers, N `PerformanceObserver`s. A gate that measures
+only the main thread misses everything the workers retain.
+
+### What's new
+
+- `aggregateWorkerReports(reports, opts?)` -- weighted aggregation of
+  per-context ops results into a single `'lite-gc-ops-multi/1'` report.
+  `bytesPerOp` is `(total bytes) / (total ops)` -- ops-weighted, so a
+  1-op context with a huge rate cannot swamp a 1M-op context with a
+  tiny rate. `bytesPerOpStable` is logical AND -- one unstable context
+  degrades the aggregate. `maxPauseMsPerOp` is MAX -- the worst pause
+  anywhere in the system. Mixed sources yield `source: 'mixed'`.
+
+- `checkAggregateReport(multi, rules)` -- gate the aggregate against the
+  same rule vocabulary as `checkOps` (`maxBytesPerOp`, `maxMajorsPerKOp`,
+  `maxMinorsPerKOp`, `maxPauseMsPerOp`). Mixed-source aggregates return
+  `inconclusive` with `reason: 'source_mismatch'`. The v1.5.1
+  fail-closed hardening applies here too -- unknown rule keys throw,
+  non-finite thresholds throw, non-finite aggregate metrics route to
+  inconclusive.
+
+- `assertAggregateReport(reports, rules, opts?)` -- convenience form
+  that throws `GcBudgetError` on fail or `GcInconclusiveError` on
+  inconclusive.
+
+### What this batch does NOT include
+
+Pure aggregation only. The user brings their own workers. No convenience
+`measureOpsAcrossWorkers` primitive that owns worker spawning -- the
+worker-spawning API differs meaningfully between runtimes (Node
+`worker_threads` vs browser `new Worker(URL.createObjectURL(new Blob(...)))`)
+and a portable convenience wrapper cannot faithfully own both. The
+README documents both patterns with runnable examples.
+
+`@zakkster/lite-worker` is the recommended browser-side transport (its
+`frameChannel` is the zero-GC ping-pong ring that pairs cleanly with
+`measureFrames`); it is **not** a hard dependency of
+lite-gc-profiler -- `globalThis.Worker` is undefined in Node, so a
+runtime-agnostic import would fail in the exact place CI gates run.
+
+### Torture (G22.5)
+
+New torture file: `test/torture/g22-5-multi.test.mjs`. Five axes:
+
+- **Axis A**: adversarial (NaN/Infinity in per-context bytesPerOp,
+  getters that lie between reads, prototype-injected properties). The
+  read-once discipline: each metric is captured into a local before the
+  finiteness check, so a lying getter is observed exactly once. Caught
+  a real bug during build -- initial impl read `r.bytesPerOp` three
+  times; fixed.
+- **Axis B**: weight-imbalance (1-op context alongside 1M-op context;
+  the weighted average must equal `total_bytes / total_ops`, not a
+  naive mean).
+- **Axis C**: no perturbation -- aggregating 1000 reports 10 times inside
+  a live `GcProfiler` window induces no majors.
+- **Axis D**: identical input yields byte-identical aggregate on repeat
+  calls.
+- **Axis R**: real Node `worker_threads` round-trip. Spawns two workers,
+  each runs `measureOps` on its own heap, ships results back via
+  `postMessage`, aggregates on main. Pins that the ops result shape
+  survives structured clone and that the aggregator handles genuine
+  cross-context inputs -- not just synthetic POJOs.
+
+### Full-suite tally
+
+**601 tests, all pass** under `--expose-gc`. 558 carried from v1.6.0 + 23
+standard aggregate + 8 torture aggregate.
+
+### Hardening of the aggregation lane
+
+The new lane got the same attack-first pass as the rest of the package, before
+release. Two defects, both fail-open, both found by asking the question this
+package always asks: what does it report when it cannot measure?
+
+- **An unmeasurable context diluted the aggregate toward clean.** A context's
+  `ops` count is added to `totalOps` unconditionally, but a missing or
+  non-finite `majorsPerKOp` / `minorsPerKOp` / `maxPauseMsPerOp` was skipped in
+  the numerator -- so the broken context sat in the denominator contributing
+  zero. Measured: one context with `NaN` minorsPerKOp beside one clean context
+  at 1.0 aggregated to **0.5**, and a `NaN` majorsPerKOp aggregated to **0
+  majors with a passing verdict**. `bytesPerOp` already had the right
+  discipline (unknown propagates as `null`); its three siblings now do too, and
+  a gate on an unknown metric returns `inconclusive` instead of green.
+
+  The sharpest case is the most ordinary one: `measureOps` results carry no GC
+  rates at all -- the synchronous lane cannot observe GC events, as the README
+  has always said -- so aggregating them reported a fabricated clean GC profile
+  that `maxMajorsPerKOp: 0` passed. `AggregatedOpsMetrics.majorsPerKOp`,
+  `minorsPerKOp` and `maxPauseMsPerOp` are now `number | null`.
+
+- **A mixed stability set claimed stability.** `bytesPerOpStable` treated an
+  absent flag as `true`. In an all-legacy set that is right -- there is nothing
+  to degrade -- but when one context reports the flag and another omits it,
+  absence is unknown provenance, and claiming `true` asserts what the aggregate
+  cannot show.
+
+Also carried forward: the evidence-lane hardening from v1.6.0
+(`formatGithubAnnotations` control-character sanitising, narrator robustness),
+which this branch predated. Pinned by
+`test/torture/g23-5-aggregate-adversarial.test.mjs` (11 scenarios, axes AA-AC)
+and `g22-5-evidence-adversarial.test.mjs` (9 scenarios). Suite: 589 -> 601.
+
 ## 1.6.0
 
 Batch 9: the evidence lane (G21/G22). Three new functions under the
@@ -87,49 +202,8 @@ discipline adapted for a pure-formatter lane:
 
 ### Full-suite tally
 
-**558 tests, all pass** under `--expose-gc`. 517 carried from v1.5.2
-(which this release includes in full) + 22 standard evidence + 10 torture
-evidence + 9 adversarial evidence.
-
-### Hardening of the new lane
-
-The evidence lane got the same attack-first pass as everything else, before
-release rather than after. Four defects, all in the direction that matters for
-a narrator -- it runs precisely when a gate has already failed, so throwing
-replaces the failure report with a stack trace, and emitting a control
-character forges a line in whatever log is reading it.
-
-- **A newline in a report could forge a GitHub Actions annotation.** Workflow
-  commands are newline-delimited, so a metric or reason carrying
-  `\n::error::...` produced two `::error` directives from one violation, the
-  second entirely controlled by the report's contents. `::notice` and
-  `::add-mask::` are reachable the same way, which means a forged line could
-  also make a failing run read as clean. `formatGithubAnnotations` and every
-  narrated field now strip control characters, and names are length-capped so
-  one oversized field cannot flood a log. Reachability, stated plainly: reports
-  this library produces only carry names from its own fixed vocabulary, and
-  this could NOT be reached through any public API -- the baseline comparator
-  ignores metric keys it does not recognise. It is reachable by formatting a
-  report built by hand or deserialized from another job, which the formatters
-  accept by design. Defence-in-depth, not a patched exploit.
-
-- **A malformed violation entry crashed the narrator.** `violations: [null]`
-  threw `Cannot read properties of null (reading 'rule')`. Malformed entries
-  are now rendered as such and the rest of the report still narrates.
-
-- **An overflowing ratio printed as a number that is not one.** An actual of
-  1e308 against a limit of 1 rendered `+Infinity% over limit`. Non-finite
-  ratios are now dropped in favour of the delta, matching the existing
-  zero-limit behaviour.
-
-- **An unverified rule blamed a cause that had not been established.** The
-  narration read `source "gc" cannot verify this rule`, but since v1.5.2 a rule
-  also lands in `checked:false` when the METRIC was non-finite -- a broken
-  clock or heap source, with the source itself fine. It now names both
-  possibilities instead of asserting one.
-
-Pinned by `test/torture/g22-5-evidence-adversarial.test.mjs` (9 scenarios,
-axes Y-Z). Suite: 517 -> 558.
+**549 tests, all pass** under `--expose-gc`. 517 baseline (v1.5.2) + 22
+standard evidence + 10 torture evidence.
 
 ## 1.5.2
 
