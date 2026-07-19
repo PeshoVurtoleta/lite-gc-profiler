@@ -4,11 +4,21 @@ The README is a reference. It answers *what does this API do?*
 
 This is the cookbook. It answers *how do I use it for X?*
 
-Recipes are graded -- five for people new to the library, three for
-people who have shipped one gate and want to compare, baseline, and
-narrate failures, two for real workloads across worker heaps and
-allocator hunts. Read them in order if you are new; jump around if you
-know what you are looking for.
+Recipes are graded in four tiers:
+
+- **Start here (0)** -- you have installed the package and want to see a
+  number, before deciding anything gates.
+- **Basics (1-5)** -- your first gate, picking a lane, choosing a
+  threshold, reading a verdict, wiring it into CI.
+- **Working (6-14)** -- comparing against a control, locking a baseline,
+  narrating failures, render loops, worker heaps, allocator hunts, and
+  getting the result into a CI log a human will read.
+- **Pro (15-18)** -- what to do when a threshold that passes on your
+  laptop fails on the runner, how to triage `inconclusive` instead of
+  suppressing it, and how to gate when no absolute number is portable.
+
+Read them in order if you are new; jump around if you know what you are
+looking for.
 
 Each recipe has the same shape:
 
@@ -34,6 +44,7 @@ out of it if you have.
 
 **Recipes**
 
+0. [Just show me a number](#recipe-0-just-show-me-a-number)
 1. [My first gate](#recipe-1-my-first-gate)
 2. [Picking a lane](#recipe-2-picking-a-lane)
 3. [Setting a threshold you can defend](#recipe-3-setting-a-threshold-you-can-defend)
@@ -44,6 +55,14 @@ out of it if you have.
 8. [Explaining a failure](#recipe-8-explaining-a-failure)
 9. [Gating across worker threads](#recipe-9-gating-across-worker-threads)
 10. [Explain mode: finding the allocator](#recipe-10-explain-mode-finding-the-allocator)
+11. [Gating a render loop](#recipe-11-gating-a-render-loop)
+12. [Aggregating worker threads](#recipe-12-aggregating-worker-threads)
+13. [Aggregating render loops across contexts](#recipe-13-aggregating-render-loops-across-contexts)
+14. [Getting the failure into your CI log](#recipe-14-getting-the-failure-into-your-ci-log)
+15. [Pro: thresholds that survive a different machine](#recipe-15-pro-thresholds-that-survive-a-different-machine)
+16. [Pro: triaging inconclusive instead of suppressing it](#recipe-16-pro-triaging-inconclusive-instead-of-suppressing-it)
+17. [Pro: gating when no absolute number is portable](#recipe-17-pro-gating-when-no-absolute-number-is-portable)
+18. [Flaky workloads: gating across repetitions](#recipe-18-flaky-workloads----gating-across-repetitions)
 
 **CLI**
 
@@ -118,6 +137,69 @@ flowchart TD
 
 The failure path leaves you evidence. Never bypass it with
 `allowInconclusive` unless you know why the run can't verify.
+
+---
+
+## Recipe 0: Just show me a number
+
+**Goal.** See what a function actually retains, before deciding anything
+about budgets. Gating is the second thing you do, not the first.
+
+**Primitive.** `measureOps`. It measures and returns; it never throws a
+budget error, because you have not set a budget.
+
+**Code.**
+
+```js
+// save as probe.mjs, run with:  node --expose-gc probe.mjs
+import { measureOps } from '@zakkster/lite-gc-profiler';
+
+const kept = [];
+
+const leaky = (i) => { kept.push({ id: i }); };   // retains one object per call
+const clean = (i) => i * 2;                       // retains nothing
+
+console.log('leaky:', measureOps(leaky, { ops: 10_000, warmup: 500, stabilize: true }).bytesPerOp);
+console.log('clean:', measureOps(clean, { ops: 10_000, warmup: 500, stabilize: true }).bytesPerOp);
+```
+
+Roughly what you should see:
+
+```
+leaky: 43.5
+clean: 0.2
+```
+
+Your exact numbers will differ -- that is the point of Recipe 15 -- but
+the shape holds everywhere: tens of bytes for the leak, essentially zero
+for the clean function.
+
+**Reading the verdict.** There is no verdict here -- that is the point.
+`bytesPerOp` is bytes *retained* per call, measured as the difference in
+the live heap between two forced garbage collections. It is not bytes
+allocated. A function that allocates a megabyte per call and drops it
+all reads approximately zero, and that is correct: transient garbage is
+not a leak, and the collector's whole job is to make it free.
+
+Two numbers, two lessons. `leaky` at ~41 B/op is one small object per
+call surviving collection -- the smallest realistic leak there is.
+`clean` at 0 is what "retains nothing" looks like. Everything else in
+this cookbook is about turning that gap into something CI can act on.
+
+**Gotchas.**
+
+- Without `--expose-gc`, `stabilize: true` throws at setup instead of
+  quietly falling back to a noisier measurement. If you asked for the
+  anchored path you get it or an error, never a worse number wearing the
+  same name.
+- Run it twice. The two readings should be close. If `clean` is not
+  near zero, your "clean" function is retaining something -- a closure,
+  a console reference, an array you forgot -- and finding out now is
+  cheaper than finding out through a failing gate later.
+- Do not compare `bytesPerOp` across machines yet. The same object can
+  measure ~1.7 KB on one build and ~340 bytes on another, because
+  pointer compression changes how wide a tagged slot is. Recipe 15 is
+  entirely about this.
 
 ---
 
@@ -756,6 +838,445 @@ are the exact source lines. That is where to look first.
 - **Explain mode answers "who allocated," not "where the pause fired."**
   Region attribution (Recipe not yet written; see README) is
   firing-site. Both are useful. Neither substitutes for the other.
+
+---
+
+## Recipe 11: Gating a render loop
+
+**Goal.** Prove a frame callback retains nothing across frames, and does
+not drop frames while doing it.
+
+**Primitive.** `assertFrames`, or `measureFrames` + `checkFrames` when
+you want the report without the throw.
+
+**Code.**
+
+```js
+import { measureFrames, checkFrames, assertFrames } from '@zakkster/lite-gc-profiler';
+
+const scheduler = (cb) => setTimeout(cb, 0);      // node; use rAF in a browser
+
+await assertFrames(drawFrame,
+    { maxBytesPerFrame: 512, maxDroppedFrames: 2 },
+    { frames: 600, warmup: 120, scheduler }
+);
+```
+
+**Reading the verdict.**
+
+```js
+{
+    kind: 'frames', verdict: 'pass',
+    checked: { maxBytesPerFrame: true, maxDroppedFrames: true },
+    result: {
+        frames: 600,
+        bytesPerFrame: 12.4,
+        bytesPerFrameStable: true,      // the anchored path ran
+        droppedFrames: 0,
+        frameTimes: { p50: 0.31, p99: 1.02 },
+        asyncResidual: 0
+    }
+}
+```
+
+`bytesPerFrameStable: true` is the field to look at first. It says the
+number came from the forced-GC anchored path rather than a raw
+two-point delta. A `false` there does not mean you leaked; it means the
+figure you are gating on is the noisier one, and a tight threshold on it
+will flake.
+
+`asyncResidual` is a smoke detector, not a gate. It reports bytes the
+heap grew *after* the measurement window settled -- fire-and-forget work
+your frame callback kicked off that landed late.
+
+Do not read a small non-zero value as a bug. An empty frame callback on
+node measures a few kilobytes of residual, because the scheduler, the
+promise machinery and the observer's own bookkeeping all allocate after
+the window closes. What matters is the trend: residual that scales with
+your workload means real allocation is escaping frame attribution, and
+the frame numbers should be treated as a floor rather than a total.
+
+**Gotchas.**
+
+- Exact `maxBytesPerFrame: 0` is not achievable. V8's own live-set
+  jitter is worth tens of bytes per frame on a quiet loop. Gate above
+  the floor, or use the differential form in Recipe 17.
+- `maxDroppedFrames` is a count, not a rate. Six hundred frames with two
+  drops passes `maxDroppedFrames: 2`; six thousand frames with two drops
+  passes the same rule while being ten times better. Scale the threshold
+  with the frame count or you are gating on luck.
+- A scheduler that never fires its callback leaves the measurement
+  pending forever -- there is no internal watchdog. If a run hangs, that
+  is the first thing to check.
+
+---
+
+## Recipe 12: Aggregating worker threads
+
+**Goal.** Gate the whole system when the work is spread across worker
+threads, each with its own heap.
+
+**Primitive.** `aggregateWorkerReports` + `checkAggregateReport`, or
+`assertAggregateReport` for the throwing form.
+
+**Code.**
+
+```js
+import {
+    aggregateWorkerReports, checkAggregateReport
+} from '@zakkster/lite-gc-profiler';
+
+// each worker ran measureOpsAsync and posted its result back
+const reports = await Promise.all(workers.map((w) => w.measure()));
+
+const multi = aggregateWorkerReports(reports);
+const report = checkAggregateReport(multi, { maxBytesPerOp: 32 });
+```
+
+**Reading the verdict.**
+
+```js
+multi.aggregate === {
+    source: 'gc',
+    totalOps: 40_000,
+    bytesPerOp: 18.2,          // ops-WEIGHTED, not a mean of means
+    bytesPerOpStable: true,
+    majorsPerKOp: 0.4,
+    minorsPerKOp: 12.1,
+    maxPauseMsPerOp: 0.08      // MAX across contexts, not an average
+}
+```
+
+Weighting matters. A worker that ran 100 ops and a worker that ran
+100,000 ops do not get an equal vote: the aggregate is total bytes over
+total ops, so the big worker dominates in proportion to the work it
+actually did. Pause is a max, because the worst pause anywhere in the
+system is the one your frame budget felt.
+
+**Gotchas.**
+
+- **`measureOps` results carry no GC rates.** The synchronous lane
+  cannot observe GC events at all -- `PerformanceObserver` delivers on
+  event-loop turns and a sync loop never yields -- so a report from it
+  has no `majorsPerKOp`. Aggregate those and `majorsPerKOp` comes back
+  `null`, and a rule on it returns `inconclusive`. That is correct: the
+  alternative is a fabricated zero that passes `maxMajorsPerKOp: 0` on
+  metrics nobody measured. Use `measureOpsAsync` in workers if you want
+  to gate GC counts.
+- Any context reporting a metric as null or non-finite makes that
+  aggregate metric `null`. A broken context cannot dilute the total
+  toward clean by contributing zero to the numerator while its ops still
+  count in the denominator.
+- Mixed `source` values across contexts produce `verdict:
+  'inconclusive'` with `reason: 'source_mismatch'`, not a fabricated
+  comparison. Gate contexts that can see memory separately from ones
+  that cannot.
+
+---
+
+## Recipe 13: Aggregating render loops across contexts
+
+**Goal.** The same question as Recipe 12, for render loops: several
+contexts each running a frame loop -- an iframe per widget, a worker per
+layer, a tab per panel -- gated as one system.
+
+**Primitive.** `aggregateFrameReports` + `checkAggregateFramesReport`
+(`assertAggregateFramesReport` to throw).
+
+**Code.**
+
+```js
+import {
+    aggregateFrameReports, checkAggregateFramesReport
+} from '@zakkster/lite-gc-profiler';
+
+const reports = await Promise.all(contexts.map((c) => c.measureFrames()));
+
+const multi = aggregateFrameReports(reports);
+const report = checkAggregateFramesReport(multi, {
+    maxBytesPerFrame: 512,
+    maxDroppedFrames: 4          // SUM across contexts -- see below
+});
+```
+
+**Reading the verdict.** Three different aggregation rules apply, and
+knowing which is which is the whole recipe:
+
+| Metric | How it combines | Why |
+| --- | --- | --- |
+| `bytesPerFrame`, `majorsPerKFrame`, `minorsPerKFrame` | frames-weighted mean | a context that rendered more frames gets a proportional vote |
+| `maxPauseMsPerFrame` | MAX | the worst pause anywhere is the one the user saw |
+| `droppedFrames`, `asyncResidual` | SUM | drops and late allocation accumulate system-wide |
+
+`droppedFrames` being a SUM is the one that surprises people. Four
+contexts dropping one frame each is four dropped frames, not one.
+Budget accordingly, and scale the threshold with the number of contexts
+rather than copying the single-context number across.
+
+**Gotchas.**
+
+- If any context omits `droppedFrames`, the total is `null` and the gate
+  is `inconclusive` rather than a smaller number. A sum missing a term
+  is not a system-wide total, and reporting it as one would understate
+  drops precisely when a context is misbehaving.
+- `asyncResidual` is deliberately more forgiving: an *absent* value
+  counts as zero, because a lane that does not track residual has none.
+  A *present but broken* value yields `null`. Absence and corruption are
+  different claims.
+- `bytesPerFrameStable` on the aggregate is `false` if any context
+  reported false, and also if some contexts report the flag while others
+  omit it. A mixed set cannot show that every context used the anchored
+  path, so it does not claim to.
+- The two aggregators are not interchangeable. Feeding a frames report
+  to `aggregateWorkerReports` throws naming the missing `ops` field, and
+  vice versa. That is a guardrail, not an inconvenience.
+
+---
+
+## Recipe 14: Getting the failure into your CI log
+
+**Goal.** Turn a report object into something a human reads in a build
+log, and something a CI system renders natively.
+
+**Primitive.** `explainReport` for humans, `formatGithubAnnotations` /
+`formatMarkdown` / `formatJson` / `formatConsole` for machines.
+
+**Code.**
+
+```js
+import { checkOps, formatGithubAnnotations, formatMarkdown } from '@zakkster/lite-gc-profiler';
+import { explainReport, explainDiff, gateBadge } from '@zakkster/lite-gc-profiler/explain';
+
+const report = checkOps(result, { maxBytesPerOp: 32 });
+
+console.log(explainReport(report));            // narrated, for a human
+console.log(formatGithubAnnotations(report));  // ::error -- renders in the Actions UI
+fs.writeFileSync('gc.md', formatMarkdown(report));   // PR comment body
+fs.writeFileSync('gc.json', formatJson(report));     // machine-readable artifact
+```
+
+`explainDiff` narrates two INDEPENDENT reports side by side -- useful
+when control and candidate were measured in separate jobs and you never
+had both results in one process to hand to `compareOps`:
+
+```js
+console.log(explainDiff(mainBranchReport, prBranchReport));
+```
+
+`gateBadge(report)` returns a short status string suitable for a README
+badge or a commit status.
+
+**Reading the verdict.** `explainReport` output has a fixed shape:
+verdict header, a violations block naming rule / actual / limit / delta
+and percent over, a "Cannot verify" block for inconclusive rules, and a
+Run footer with the source and stabilize flags. When the report carries
+evidence for it, a Hints block suggests the next action -- a non-zero
+`asyncResidual`, a `bytesPerOpStable: false`, a `source_mismatch`.
+
+**Gotchas.**
+
+- The formatters are pure. They never measure, never install an
+  observer, and never perturb the heap, so it is safe to call them
+  inside a measured window if you must.
+- They accept any well-formed report object, including one deserialized
+  from another job. Control characters in report fields are stripped on
+  the way out, because GitHub workflow commands are newline-delimited
+  and a stray newline would otherwise forge a second annotation.
+- `formatJson` is the one to archive. The narrated forms are for
+  reading; the JSON is what a future run compares against.
+
+---
+
+## Recipe 15: Pro: thresholds that survive a different machine
+
+**Goal.** Stop a gate that passes on your laptop from failing on the CI
+runner for reasons that have nothing to do with your code.
+
+**The problem, concretely.** A retained plain object with 30 keys
+measured **~1.7 KB** on one machine and **~340 bytes** on another. Same
+JavaScript, same library, same workload. Pointer compression halves the
+width of a tagged slot, and object header layout changes between V8
+versions. An absolute byte threshold is not a portable unit.
+
+This is not flakiness. A threshold of 500 is simply *correct* on one
+build and *wrong* on the other, and no amount of re-running will settle
+it.
+
+**What to do, in order of preference.**
+
+1. **Gate on a differential, not an absolute.** Measure a control in the
+   same process on the same machine and gate the delta -- see Recipe 17.
+   The machine-dependent floor cancels out of a subtraction.
+2. **Measure the floor, then gate relative to it.**
+
+```js
+const floor = measureOps(noop, { ops: 10_000, warmup: 500, stabilize: true }).bytesPerOp;
+const mine  = measureOps(hot,  { ops: 10_000, warmup: 500, stabilize: true }).bytesPerOp;
+
+// portable: "no more than 4x the empty-loop floor"
+assert.ok(mine < 4 * Math.max(floor, 32));
+```
+
+3. **If you must use an absolute, size the signal, not the threshold.**
+   A threshold is only as trustworthy as its margin. Retaining one small
+   object per op against a budget of 16 gives you roughly a 2-3x margin
+   on a good build and less on a compressed one. Retaining a 64-slot
+   array gives several hundred bytes per op against the same budget --
+   a margin no build difference can close.
+
+**Gotchas.**
+
+- Typed arrays are the wrong instrument for this. A `Float64Array`'s
+  backing store lives outside the JS heap, so a 2 KB typed array reads
+  as roughly 200 bytes of wrapper. Use a plain `Array` when you want a
+  leak the heap sampler can see.
+- `bytesPerOp` clamps at zero. If a collection compacts the heap below
+  the start anchor, a real leak can read as exactly `0` rather than a
+  negative number, and a clamped zero clears every threshold. If a
+  known-leaky workload reads exactly zero, do not trust the run -- add
+  `warmup`, add `stabilize`, and make the retained object larger.
+- Two machines disagreeing is data, not noise. The slower one usually
+  resolves small regressions better; the faster one hides them.
+
+---
+
+## Recipe 16: Pro: triaging inconclusive instead of suppressing it
+
+**Goal.** Treat the third verdict as information rather than an
+annoyance to configure away.
+
+**What it means.** `pass` is "no violation." `inconclusive` is "I could
+not check." Collapsing the second into the first is the single most
+expensive mistake you can make with this library, because a green build
+that means nothing is worse than a red one.
+
+**The triage table.**
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| `checked: { rule: false }`, `source: 'none'` | the runtime has no heap channel | run under `--expose-gc`, or gate on event-count rules instead of byte rules |
+| `reason: 'source_mismatch'` | contexts measured on different sources | aggregate comparable contexts only |
+| `reason: 'no_comparable_metrics'` | the baseline and the current run share no metric | regenerate the baseline; it predates the metrics you are gating |
+| aggregate metric is `null` | some context omitted or broke that metric | find the context; a `measureOps` report legitimately has no GC rates |
+| metric is `NaN`/`Infinity` | the measurement itself broke | check for a mocked timer or a patched `process.memoryUsage` |
+
+**Code.** The escape hatch exists, and it should be loud:
+
+```js
+const report = checkOps(result, { maxBytesPerOp: 32 });
+
+if (report.verdict === 'inconclusive') {
+    // do NOT silently continue
+    console.warn(explainReport(report));
+    if (process.env.CI) process.exit(2);       // distinct from 1 = fail
+}
+```
+
+Exit code 2 for inconclusive, 1 for fail, 0 for pass keeps the two
+apart in your pipeline. `allowInconclusive: true` exists on the assert
+forms for the case where you have genuinely decided that an
+unverifiable environment should not block a merge -- use it
+deliberately, per call, never as a global default.
+
+---
+
+## Recipe 17: Pro: gating when no absolute number is portable
+
+**Goal.** Gate a hot path whose absolute retention you cannot pin,
+because the floor moves between machines, V8 versions, and CI runners.
+
+**Primitive.** The differential lanes: `compareOps` /
+`assertCompareOps`, `compareFrames` / `assertCompareFrames`,
+`compareOpsAsync` / `assertCompareOpsAsync`.
+
+**Why it works.** Both measurements happen in the same process on the
+same machine within the same run, so V8's irreducible floor -- the tens
+of bytes that make `maxBytesPerOp: 0` unachievable -- is present in both
+and cancels out of the subtraction. What survives is the difference your
+change made.
+
+**Code.**
+
+```js
+import { assertCompareOps } from '@zakkster/lite-gc-profiler';
+
+const control   = (i) => i | 0;                  // does nothing
+const candidate = (i) => mySignal.set(i);        // the thing under test
+
+assertCompareOps(control, candidate,
+    { maxExtraBytesPerOp: 8 },                   // 8 bytes MORE than doing nothing
+    { ops: 10_000, warmup: 500, stabilize: true }
+);
+```
+
+**Reading the verdict.** The rule vocabulary is different: the
+differential lanes gate `maxExtra*` deltas, not absolutes. Clean
+against clean nets approximately zero on any machine. A real leak stands
+out by its own size rather than by clearing a floor you had to guess.
+
+**Gotchas.**
+
+- Order the pair correctly. Control first, candidate second; the delta
+  is candidate minus control, and a negative delta means your candidate
+  retained *less*, which passes.
+- Keep the two workloads the same shape. If the control does nothing and
+  the candidate does real work, you are measuring the work, not the
+  regression. The useful control is the previous implementation, not an
+  empty function.
+- `compareFrames` implements only `maxExtraBytesPerFrame` and
+  `maxExtraDroppedFrames`. Passing a plausible-looking
+  `maxExtraMajorsPerKFrame` throws rather than being silently ignored --
+  a rule that does nothing is worse than a rule that is missing.
+- Sequential, never concurrent. Two measurements overlapping on one heap
+  see each other's allocations; the library refuses overlapping runs for
+  exactly this reason.
+
+---
+
+## Recipe 18: Flaky workloads -- gating across repetitions
+
+**Goal.** Gate something whose single-run measurement is genuinely
+noisy -- a workload with real variance, not a badly sized one.
+
+**Primitive.** `aggregateGc` to combine repetitions, `gateReps` /
+`assertReps` to apply a policy across them.
+
+**Code.**
+
+```js
+import { GcProfiler, aggregateGc, gateReps, REP_POLICY_DEFAULTS } from '@zakkster/lite-gc-profiler';
+
+const summaries = [];
+for (let rep = 0; rep < 7; rep++) {
+    const gc = new GcProfiler(256).start();
+    await runWorkload();
+    await gc.settle();
+    gc.stop();
+    summaries.push(gc.summary());
+}
+
+const report = gateReps(summaries, { maxMajor: 0 }, { policy: 'quorum-5' });
+```
+
+**Reading the verdict.** The policy decides what "passing" means across
+repetitions:
+
+- `'all'` -- every repetition must satisfy the rules. Strictest; use it
+  when a single violation is a real regression.
+- `'median'` -- the median repetition must satisfy them. Tolerates one
+  bad run without tolerating a trend.
+- `'quorum-N'` -- at least N repetitions must satisfy them. Use it when
+  you know the environment produces occasional outliers you cannot fix.
+
+**Gotchas.**
+
+- Reach for this only after Recipe 15. Most "flaky" gates are not
+  variance -- they are an absolute threshold sitting too close to a
+  machine-dependent floor, and repeating a badly sized measurement seven
+  times just gives you seven badly sized measurements.
+- An odd repetition count makes `'median'` unambiguous.
+- `REP_POLICY_DEFAULTS` documents the shipped defaults; read it rather
+  than guessing what an omitted policy does.
 
 ---
 

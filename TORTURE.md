@@ -1,6 +1,6 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 225 torture scenarios shipped across v1.1.0 through v1.7.0
+**Status:** 251 torture scenarios shipped across v1.1.0 through v1.8.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
@@ -382,8 +382,8 @@ order-independence, no input mutation, an overflowing accumulator routed
 to inconclusive rather than reported, and mixed sources refusing to
 fabricate a comparable verdict.
 
-**Total shipped: 225 torture scenarios + 3 global invariants + 3 CLI
-integration scenarios (G16.5).** Full suite: 601 tests.
+**Total shipped: 251 torture scenarios + 3 global invariants + 3 CLI
+integration scenarios (G16.5).** Full suite: 655 tests.
 
 ---
 

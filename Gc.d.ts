@@ -1,4 +1,4 @@
-export const VERSION: '1.7.0';
+export const VERSION: '1.8.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -1148,5 +1148,127 @@ export function checkAggregateReport(
 export function assertAggregateReport(
     reports: WorkerReport[],
     rules: OpsRules,
+    opts?: { allowInconclusive?: boolean }
+): GcReport;
+
+// =============================================================================
+// Batch 11 (v1.8.0) -- multi-context frame aggregation (G23).
+// =============================================================================
+
+/**
+ * A single per-context frames measurement used as input to
+ * aggregateFrameReports. The minimum required shape is a subset of
+ * what measureFrames produces -- .frames, .source, and any subset of
+ * the numeric rate/pause/drop fields.
+ */
+export interface FramesReport {
+    /** Steady-phase frame count for this context. Must be a positive finite number. */
+    frames: number;
+    /** Source label -- must be a string. Values that don't match across contexts yield 'mixed'. */
+    source: string;
+    /** null on source='none' or memory-unavailable; propagates to the aggregate. */
+    bytesPerFrame?: number | null;
+    /** true iff the context ran the stabilised (forced-GC boundary) path. */
+    bytesPerFrameStable?: boolean;
+    majorsPerKFrame?: number;
+    minorsPerKFrame?: number;
+    maxPauseMsPerFrame?: number;
+    droppedFrames?: number;
+    asyncResidual?: number;
+    /**
+     * Per-context frameTimes are preserved in perContext[i] but NOT
+     * carried into the aggregate. Percentiles are not compositional.
+     */
+    frameTimes?: { p50: number; p95: number; p99: number; max: number };
+    summary?: GcSummary;
+}
+
+/** Aggregate metrics derived from N per-context frames reports. */
+export interface AggregatedFramesMetrics {
+    source: string;
+    totalFrames: number;
+    /** null if any per-context bytesPerFrame was null or non-finite. */
+    bytesPerFrame: number | null;
+    /**
+     * true only when no context reported false AND (all contexts
+     * reported the flag OR none did). A mixed presence/absence set
+     * yields false -- unknown provenance from silent contexts.
+     */
+    bytesPerFrameStable: boolean;
+    /** null if any context omitted or reported non-finite. Dilution guard. */
+    majorsPerKFrame: number | null;
+    /** null if any context omitted or reported non-finite. */
+    minorsPerKFrame: number | null;
+    /** null if any context omitted or reported non-finite. */
+    maxPauseMsPerFrame: number | null;
+    /** SUM across contexts; null if any context omitted. */
+    droppedFrames: number | null;
+    /**
+     * SUM across contexts. An ABSENT value counts as zero -- a lane that does
+     * not track residual has none by definition, and this is a smoke signal
+     * rather than a gated metric, so absence should not poison the total.
+     *
+     * A PRESENT but non-finite value is different: that context's residual
+     * reading broke. Folding it in as zero made the aggregate under-report
+     * exactly when something was wrong, so it yields null instead.
+     */
+    asyncResidual: number | null;
+}
+
+export interface FramesAggregateResult {
+    schema: 'lite-gc-frames-multi/1';
+    kind: 'frames-multi';
+    contexts: number;
+    aggregate: AggregatedFramesMetrics;
+    perContext: FramesReport[];
+}
+
+export interface FramesAggregateOptions {
+    /** Optional label for the aggregate. */
+    label?: string;
+}
+
+/** Rules for checkAggregateFramesReport. Same vocabulary as checkFrames. */
+export interface FramesRules {
+    maxBytesPerFrame?: number;
+    maxMajorsPerKFrame?: number;
+    maxMinorsPerKFrame?: number;
+    maxPauseMsPerFrame?: number;
+    maxDroppedFrames?: number;
+}
+
+/**
+ * Aggregate an array of per-context frames measurement results into a
+ * single multi-context report. Pure aggregation -- no spawning, no
+ * messaging, no perturbation. Users bring their own workers.
+ *
+ * Weighted-by-frames rates; MAX for pause; SUM for droppedFrames and
+ * asyncResidual; logical AND with provenance for stability;
+ * dilution guard on all rate metrics (missing on any context -> null
+ * on aggregate). frameTimes deliberately absent -- percentiles are
+ * not compositional.
+ */
+export function aggregateFrameReports(
+    reports: FramesReport[],
+    opts?: FramesAggregateOptions
+): FramesAggregateResult;
+
+/**
+ * Gate a frames aggregate against per-frame rules. Same rule
+ * vocabulary as checkFrames. Mixed sources return inconclusive with
+ * reason='source_mismatch'.
+ */
+export function checkAggregateFramesReport(
+    multiReport: FramesAggregateResult,
+    rules: FramesRules
+): GcReport;
+
+/**
+ * Convenience: aggregateFrameReports + checkAggregateFramesReport,
+ * throwing on fail or inconclusive (unless allowInconclusive).
+ */
+export function assertAggregateFramesReport(
+    reports: FramesReport[],
+    rules: FramesRules,
     opts?: { allowInconclusive?: boolean }
 ): GcReport;

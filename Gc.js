@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.7.0';
+const VERSION = '1.8.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -3776,6 +3776,319 @@ function assertAggregateReport(reports, rules, opts) {
     return report;
 }
 
+// =============================================================================
+// Batch 11 (v1.8.0) -- multi-context frame aggregation (G23).
+//
+// Extends v1.7.0's multi-context story to the render-loop lane. Same
+// weighted-by-count / MAX-across-contexts / sum-for-drops / logical-AND-
+// for-stability semantics, adapted for the frames field vocabulary.
+//
+// One field is deliberately dropped from the aggregate: `frameTimes`
+// (p50/p95/p99/max). A system-wide percentile cannot be reconstructed
+// from per-context summary percentiles -- computing a global p95 needs
+// every frame's work-time, not four contexts' p95s. The aggregate could
+// invent a max-of-p95s or an average-of-p95s but neither would be a
+// real percentile. It would be a number that reads plausible on the
+// dashboard and lies on the gate. If a user needs distribution stats,
+// gate `maxDroppedFrames` on the aggregate and hold each context's
+// `frameTimes` separately.
+//
+// Dilution guard applies from day one, mirroring the Batch 10 hardening
+// pass (v1.7.0 + G23.5-adversarial): a missing or non-finite metric on
+// ANY context marks the aggregate metric as unknown, which routes to
+// inconclusive at gate time. Silently averaging a missing metric as
+// zero would let an unmeasurable context read the whole system cleaner
+// than reality -- the exact failure mode the Batch 10 hardening
+// closed on the ops aggregate.
+// =============================================================================
+
+const MULTI_FRAMES_SCHEMA = 'lite-gc-frames-multi/1';
+
+/**
+ * Aggregate an array of per-context frames measurement results into a
+ * single multi-context report. Accepts results from measureFrames --
+ * .frames, .source, and any subset of the numeric rate/pause/drop
+ * fields.
+ *
+ * @param {Array<object>} reports                    Per-context measureFrames results.
+ * @param {object} [opts]
+ * @param {string} [opts.label]                      Optional label for the aggregate.
+ * @returns {{
+ *   schema: 'lite-gc-frames-multi/1',
+ *   kind: 'frames-multi',
+ *   contexts: number,
+ *   aggregate: {
+ *     source: string,
+ *     totalFrames: number,
+ *     bytesPerFrame: number | null,
+ *     bytesPerFrameStable: boolean,
+ *     majorsPerKFrame: number | null,
+ *     minorsPerKFrame: number | null,
+ *     maxPauseMsPerFrame: number | null,
+ *     droppedFrames: number,
+ *     asyncResidual: number
+ *   },
+ *   perContext: Array<object>
+ * }}
+ */
+function aggregateFrameReports(reports, opts) {
+    if (!Array.isArray(reports)) {
+        throw new TypeError('aggregateFrameReports: reports must be an array');
+    }
+    if (reports.length === 0) {
+        throw new RangeError('aggregateFrameReports: reports array must be non-empty');
+    }
+
+    // Validation pass: capture .frames and .source ONCE per report so a
+    // lying getter is observed exactly once, in the pass that verifies
+    // it. Same read-once discipline as the ops aggregate.
+    for (let i = 0; i < reports.length; i++) {
+        const r = reports[i];
+        if (!r || typeof r !== 'object') {
+            throw new TypeError('aggregateFrameReports: reports[' + i + '] is not an object');
+        }
+        const frames = r.frames;
+        if (!_isFiniteNum(frames) || frames <= 0) {
+            throw new TypeError('aggregateFrameReports: reports[' + i + '].frames must be a positive finite number; got '
+                + JSON.stringify(frames));
+        }
+        const src = r.source;
+        if (typeof src !== 'string') {
+            throw new TypeError('aggregateFrameReports: reports[' + i + '].source must be a string');
+        }
+    }
+
+    // Source resolution: unanimous or 'mixed'.
+    let source = reports[0].source;
+    let mixed = false;
+    for (let i = 1; i < reports.length; i++) {
+        if (reports[i].source !== source) { mixed = true; break; }
+    }
+    if (mixed) source = 'mixed';
+
+    let totalFrames = 0;
+    let totalBytes = 0;
+    let totalMajor = 0;
+    let totalMinor = 0;
+    let maxPause = 0;
+    let totalDropped = 0;
+    let totalAsyncResidual = 0;
+    let anyBytesUnknown = false;
+    let anyBytesUnstable = false;
+    // Dilution guard: track unknown-metric presence per rate/pause dimension.
+    // A missing or non-finite value on ANY context propagates as unknown to
+    // the aggregate rather than silently diluting the numerator (v1.7.1
+    // hardening on ops, applied here from day one).
+    let anyMajorsUnknown = false;
+    let anyMinorsUnknown = false;
+    let anyPauseUnknown = false;
+    let anyDroppedUnknown = false;
+    let anyResidualUnknown = false;
+    // Stability provenance follows the ops aggregator's nuanced rule:
+    // absence alone in an all-legacy set stays true, but a MIXED set --
+    // some contexts reporting the flag, others not -- yields false because
+    // silence from a lane that could report it is unknown provenance.
+    let sawStablePresent = false;
+    let sawStableAbsent = false;
+
+    for (const r of reports) {
+        // Capture the metric fields ONCE per report. Lying getters,
+        // thenables, mutating counters -- read once each so the
+        // aggregate's provenance is stable.
+        const frames = r.frames;
+        const bpf = r.bytesPerFrame;
+        const bpfStable = r.bytesPerFrameStable;
+        const majorsK = r.majorsPerKFrame;
+        const minorsK = r.minorsPerKFrame;
+        const pause = r.maxPauseMsPerFrame;
+        const dropped = r.droppedFrames;
+        const asyncRes = r.asyncResidual;
+
+        totalFrames += frames;
+
+        // bytesPerFrame: null / undefined / non-finite all mark the aggregate
+        // as unknown. A context that couldn't measure memory means the
+        // aggregate can't either.
+        if (bpf === null || bpf === undefined) {
+            anyBytesUnknown = true;
+        } else if (_isFiniteNum(bpf)) {
+            totalBytes += bpf * frames;
+        } else {
+            anyBytesUnknown = true;
+        }
+
+        if (bpfStable === false) anyBytesUnstable = true;
+        if (bpfStable === undefined) sawStableAbsent = true; else sawStablePresent = true;
+
+        // Rate metrics with dilution guard. A missing or non-finite value
+        // on ANY context marks the aggregate metric unknown -- silently
+        // averaging a missing metric as zero would let an unmeasurable
+        // context read the whole system cleaner than reality.
+        if (_isFiniteNum(majorsK)) totalMajor += (majorsK / 1000) * frames;
+        else anyMajorsUnknown = true;
+        if (_isFiniteNum(minorsK)) totalMinor += (minorsK / 1000) * frames;
+        else anyMinorsUnknown = true;
+        if (_isFiniteNum(pause)) {
+            if (pause > maxPause) maxPause = pause;
+        } else {
+            anyPauseUnknown = true;
+        }
+        // droppedFrames: SUM, not rate. A context that dropped 3 frames
+        // and a context that dropped 5 frames dropped 8 frames together.
+        // If any context is missing this field, the sum is not a real
+        // system-wide total; mark unknown.
+        if (_isFiniteNum(dropped)) totalDropped += dropped;
+        else anyDroppedUnknown = true;
+
+        // asyncResidual: SUM across contexts. Fire-and-forget growth
+        // accumulates system-wide. ABSENT counts as zero -- a lane that does
+        // not track it contributes no residual by definition, and this is a
+        // smoke signal rather than a gated metric, so absence should not
+        // poison the total.
+        //
+        // A PRESENT but non-finite value is a different thing: that is a
+        // context whose residual reading broke, not one that has none.
+        // Folding it in as zero made the aggregate under-report -- measured,
+        // one context with NaN residual beside one reporting 1000 summed to
+        // 1000 and read as if nothing were unaccounted for. A smoke detector
+        // whose job is to warn must say "unknown" rather than "all clear".
+        if (asyncRes === undefined || asyncRes === null) {
+            // absent: contributes nothing, by definition
+        } else if (_isFiniteNum(asyncRes)) {
+            totalAsyncResidual += asyncRes;
+        } else {
+            anyResidualUnknown = true;
+        }
+    }
+
+    const bytesPerFrame = anyBytesUnknown ? null : (totalFrames > 0 ? totalBytes / totalFrames : 0);
+    // Nuanced stability: true only if we have no unstable flags AND
+    // (either every context reported the flag OR none did). Mixed
+    // presence indicates unknown provenance from the silent contexts.
+    const bytesPerFrameStable = !anyBytesUnstable && !(sawStablePresent && sawStableAbsent);
+    const majorsPerKFrame = anyMajorsUnknown ? null : (totalFrames > 0 ? (totalMajor / totalFrames) * 1000 : 0);
+    const minorsPerKFrame = anyMinorsUnknown ? null : (totalFrames > 0 ? (totalMinor / totalFrames) * 1000 : 0);
+    const maxPauseMsPerFrame = anyPauseUnknown ? null : maxPause;
+    // droppedFrames stays a number even when unknown -- but we surface the
+    // provenance via a null-when-any-missing rule so a gate cannot silently
+    // pass on a partial sum.
+    const droppedFramesAgg = anyDroppedUnknown ? null : totalDropped;
+
+    return {
+        schema: MULTI_FRAMES_SCHEMA,
+        kind: 'frames-multi',
+        contexts: reports.length,
+        aggregate: {
+            source: source,
+            totalFrames: totalFrames,
+            bytesPerFrame: bytesPerFrame,
+            bytesPerFrameStable: bytesPerFrameStable,
+            majorsPerKFrame: majorsPerKFrame,
+            minorsPerKFrame: minorsPerKFrame,
+            maxPauseMsPerFrame: maxPauseMsPerFrame,
+            droppedFrames: droppedFramesAgg,
+            asyncResidual: anyResidualUnknown ? null : totalAsyncResidual
+        },
+        perContext: reports.slice()
+    };
+}
+
+/**
+ * Gate an aggregate frames report against per-frame rules. Same rule
+ * vocabulary as checkFrames -- maxBytesPerFrame, maxMajorsPerKFrame,
+ * maxMinorsPerKFrame, maxPauseMsPerFrame, maxDroppedFrames. Mixed
+ * sources return inconclusive with reason='source_mismatch'.
+ */
+function checkAggregateFramesReport(multiReport, rules) {
+    if (!multiReport || multiReport.schema !== MULTI_FRAMES_SCHEMA) {
+        throw new TypeError('checkAggregateFramesReport: multiReport must be a lite-gc-frames-multi/1 result');
+    }
+    if (!rules || typeof rules !== 'object') {
+        throw new TypeError('checkAggregateFramesReport: rules must be an object');
+    }
+    _validateRules('checkAggregateFramesReport', rules, FRAMES_RULES);
+
+    const agg = multiReport.aggregate;
+    const source = agg.source;
+
+    if (source === 'mixed') {
+        return {
+            schema: 'lite-gc-report/1',
+            kind: 'frames-multi',
+            verdict: 'inconclusive',
+            reason: 'source_mismatch',
+            source: 'mixed',
+            violations: [],
+            checked: {},
+            result: multiReport
+        };
+    }
+
+    const violations = [];
+    const checked = {};
+    let sawInconclusive = false;
+
+    function checkOne(rule, actual, metric) {
+        const limit = rules[rule];
+        if (limit === undefined) return;
+        const row = VERDICT_MATRIX[rule];
+        const state = row ? row[source] : 'no';
+        if (state === 'yes' || state === 'needsHeap' || state === 'needsUasm') {
+            checked[rule] = true;
+            if (actual === null || actual === undefined) {
+                checked[rule] = false;
+                sawInconclusive = true;
+            } else if (!_isFiniteNum(actual)) {
+                // Non-finite metric routes to inconclusive (never pass).
+                // v1.5.1 hardening; applies uniformly across gates.
+                checked[rule] = false;
+                sawInconclusive = true;
+            } else if (actual > limit) {
+                violations.push({ rule: rule, metric: metric, actual: actual, limit: limit });
+            }
+        } else {
+            checked[rule] = false;
+            sawInconclusive = true;
+        }
+    }
+
+    checkOne('maxBytesPerFrame', agg.bytesPerFrame, 'bytesPerFrame');
+    checkOne('maxMajorsPerKFrame', agg.majorsPerKFrame, 'majorsPerKFrame');
+    checkOne('maxMinorsPerKFrame', agg.minorsPerKFrame, 'minorsPerKFrame');
+    checkOne('maxPauseMsPerFrame', agg.maxPauseMsPerFrame, 'maxPauseMsPerFrame');
+    checkOne('maxDroppedFrames', agg.droppedFrames, 'droppedFrames');
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (sawInconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        schema: 'lite-gc-report/1',
+        kind: 'frames-multi',
+        verdict: verdict,
+        source: source,
+        violations: violations,
+        checked: checked,
+        result: multiReport
+    };
+}
+
+/**
+ * Convenience: aggregateFrameReports + checkAggregateFramesReport,
+ * throwing GcBudgetError on fail or GcInconclusiveError on inconclusive
+ * (unless opts.allowInconclusive).
+ */
+function assertAggregateFramesReport(reports, rules, opts) {
+    const multi = aggregateFrameReports(reports);
+    const report = checkAggregateFramesReport(multi, rules);
+    if (report.verdict === 'fail') throw new GcBudgetError(report);
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
 
 export {
     VERSION,
@@ -3796,6 +4109,8 @@ export {
     compareOpsAsync, assertCompareOpsAsync,
     // Batch 10 (v1.7.0) -- multi-context aggregation.
     aggregateWorkerReports, checkAggregateReport, assertAggregateReport,
+    // Batch 11 (v1.8.0) -- multi-context frame aggregation.
+    aggregateFrameReports, checkAggregateFramesReport, assertAggregateFramesReport,
     GcBudgetError, GcInconclusiveError,
     GC_DEFAULT_RULES, GC_DEFAULT_DIFFERENTIAL_RULES, REP_POLICY_DEFAULTS,
     VERDICT_MATRIX,

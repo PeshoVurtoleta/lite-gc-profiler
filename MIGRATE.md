@@ -1,5 +1,92 @@
 # Migration notes
 
+## v1.8.0
+
+Batch 11: multi-context frame aggregation. **Additive only** -- no
+breaking changes to v1.7.x callers.
+
+### What's new
+
+Three functions on the main entry:
+
+- `aggregateFrameReports(reports, opts?)`
+- `checkAggregateFramesReport(multi, rules)`
+- `assertAggregateFramesReport(reports, rules, opts?)`
+
+Result schema: `'lite-gc-frames-multi/1'`.
+
+Rule vocabulary: same as `checkFrames` -- `maxBytesPerFrame`,
+`maxMajorsPerKFrame`, `maxMinorsPerKFrame`, `maxPauseMsPerFrame`,
+`maxDroppedFrames`. No new `VERDICT_MATRIX` rows.
+
+### When to reach for it
+
+If your CI runs `assertFrames` on a single scheduler in one context,
+nothing changes. Keep using `assertFrames`.
+
+If your render pipeline is distributed -- multi-worker OffscreenCanvas
+rendering, a physics thread + a render thread, N `worker_threads`
+running the same simulation -- and a per-thread gate would miss
+cross-context drops or retention, wrap your workers' `measureFrames`
+results and gate the aggregate:
+
+```js
+import { Worker } from 'node:worker_threads';
+import { assertAggregateFramesReport } from '@zakkster/lite-gc-profiler';
+
+const reports = await Promise.all(workerPaths.map(runOne));
+assertAggregateFramesReport(reports, {
+    maxBytesPerFrame: 512,
+    maxDroppedFrames: 5
+});
+```
+
+### What the aggregate reports and why
+
+- `bytesPerFrame`: frames-weighted, `total_bytes / total_frames`. Same
+  math as the v1.7.0 ops aggregator: a small-frames context with a
+  huge rate cannot swamp a large-frames context with a tiny rate.
+- `bytesPerFrameStable`: nuanced AND. `true` only when no context
+  reports `false` AND (every context reports the flag OR none do).
+  Mixed presence yields `false` -- silence from a lane that could
+  report is unknown provenance.
+- `majorsPerKFrame` / `minorsPerKFrame`: frames-weighted rate. `null`
+  if ANY context omitted or reported non-finite -- dilution guard.
+- `maxPauseMsPerFrame`: MAX across contexts. `null` if any missing.
+- `droppedFrames`: **SUM** across contexts. Frames dropped by
+  different contexts accumulate -- three contexts each dropping one
+  frame dropped three system-wide.
+- `asyncResidual`: SUM. Missing counts as zero because it's a smoke
+  signal, not a gated metric.
+- `source`: unanimous or `'mixed'` (yields `inconclusive`).
+
+### One field not aggregated: `frameTimes`
+
+Percentiles are not compositional. A system-wide p95 cannot be
+reconstructed from per-context summary p95s. The aggregate
+deliberately omits `frameTimes` rather than inventing a plausible-
+looking but wrong number. Per-context `frameTimes` are preserved in
+`perContext[i]` for manual inspection.
+
+If distribution stats matter to your gate, either (a) gate
+`maxDroppedFrames` on the aggregate and hold per-context
+`frameTimes` for logs, or (b) run one `measureFrames` on a
+representative single context rather than aggregating.
+
+### The v1.5.1 fail-closed discipline applies
+
+`checkAggregateFramesReport` uses the same rule-validation surface as
+`checkFrames`. Unknown rule keys throw `TypeError`. Non-finite
+thresholds throw `RangeError`. Non-finite aggregate metrics route to
+`inconclusive` (never `pass`).
+
+### No `measureFramesAcrossWorkers` -- same reasoning as v1.7.0
+
+Consistent with v1.7.0: no convenience primitive that owns worker
+spawning. The Node `worker_threads` and browser `Worker(URL...)` APIs
+differ meaningfully, and `globalThis.Worker` is `undefined` in Node.
+You bring the workers; the aggregator handles the semantic.
+
 ## v1.7.0
 
 Batch 10: multi-context aggregation. **Additive only** -- no breaking

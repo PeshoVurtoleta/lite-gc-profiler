@@ -1,5 +1,129 @@
 # Changelog
 
+## 1.8.0
+
+Batch 11: multi-context frame aggregation (G23). Three new functions --
+`aggregateFrameReports`, `checkAggregateFramesReport`,
+`assertAggregateFramesReport` -- extend v1.7.0's multi-context story to
+the render-loop lane. Additive; zero behaviour change for existing
+v1.7.x callers.
+
+### What's new
+
+- `aggregateFrameReports(reports, opts?)` -- weighted aggregation of
+  per-context frames results into a single `'lite-gc-frames-multi/1'`
+  report. Frames-weighted rates for `bytesPerFrame` /
+  `majorsPerKFrame` / `minorsPerKFrame`; MAX across contexts for
+  `maxPauseMsPerFrame`; SUM across contexts for `droppedFrames` and
+  `asyncResidual`; logical AND with provenance for
+  `bytesPerFrameStable`.
+
+- `checkAggregateFramesReport(multi, rules)` -- gate the aggregate
+  against the same rule vocabulary as `checkFrames`
+  (`maxBytesPerFrame`, `maxMajorsPerKFrame`, `maxMinorsPerKFrame`,
+  `maxPauseMsPerFrame`, `maxDroppedFrames`). Mixed-source aggregates
+  return `inconclusive` with `reason: 'source_mismatch'`.
+
+- `assertAggregateFramesReport(reports, rules, opts?)` -- convenience
+  form throwing `GcBudgetError` on fail or `GcInconclusiveError` on
+  inconclusive.
+
+### One field deliberately not carried into the aggregate
+
+`frameTimes` (`p50`/`p95`/`p99`/`max`) is present on each per-context
+report and preserved in `perContext[i]`, but the aggregate does NOT
+include it. A system-wide percentile cannot be reconstructed from
+per-context summary percentiles -- computing a global p95 requires
+every frame's work-time, not four contexts' p95s. The aggregate could
+invent a max-of-p95s or an average-of-p95s but neither would be a real
+percentile; it would be a number that reads plausible on the dashboard
+and lies on the gate. If a workload needs distribution stats, gate
+`maxDroppedFrames` on the aggregate and hold each context's
+`frameTimes` separately for inspection.
+
+### Dilution guard applied from day one
+
+The v1.7.1 hardening pass on the ops aggregator (G23.5 adversarial)
+closed a class of bug where a missing or non-finite rate metric on one
+context got silently averaged as zero, letting an unmeasurable context
+read the whole system cleaner than reality. That discipline is
+applied to the frames aggregator from day one: a missing or
+non-finite `majorsPerKFrame`, `minorsPerKFrame`, `maxPauseMsPerFrame`,
+or `droppedFrames` on ANY context marks the aggregate metric as `null`,
+which routes to `inconclusive` at gate time. Silently averaging a
+missing metric as zero is the failure mode we refuse.
+
+`asyncResidual` is the one exception: missing counts as zero because it
+is a smoke signal (bytes past `settle()`), not a gated metric. A lane
+that does not track it contributes no residual by definition.
+
+### Torture (G24.5)
+
+New torture file: `test/torture/g24-5-frames-multi.test.mjs`. Five axes:
+
+- **Axis AA -- dilution**: an unmeasurable context cannot dilute a
+  sibling's real numbers; the browser-lane case (source='heap', no
+  majors) still yields null, not zero; fully-populated inputs still
+  aggregate as weighted numbers.
+- **Axis AB -- stability provenance**: mixed present/absent yields
+  false, all-absent stays true (legacy lane), one false anywhere
+  degrades.
+- **Axis AC -- adversarial inputs**: NaN/Infinity never yields pass,
+  lying getter observed once, order-independent, does not mutate
+  inputs, mixed sources refuse to fabricate a verdict, genuine
+  over-budget still fails cleanly.
+- **Axis AD -- frames-specific**: `frameTimes` absent from aggregate
+  but preserved in `perContext`; `droppedFrames` sums (not averages);
+  `asyncResidual` sums.
+- **Axis R -- real cross-context round-trip**: two Node
+  `worker_threads` workers each running `measureFrames` with a
+  fast-sched polyfill scheduler, results shipped back via
+  `postMessage`, aggregate on main. Pins that the frames result shape
+  (with `frameTimes` and nested summary tree) survives structured
+  clone and that the aggregator handles genuine cross-context frame
+  results.
+
+### Full-suite tally
+
+**655 tests, all pass** under `--expose-gc`. 601 carried from v1.7.0 + 28
+standard aggregate-frames + 18 torture aggregate-frames.
+
+### Hardening of the new lane
+
+The frames aggregation lane carries the v1.7.0 dilution lesson correctly:
+unknown propagates as unknown through the frames-weighted rates AND through
+the `droppedFrames` SUM, so an unmeasurable context can neither dilute a rate
+nor vanish from a total. Cross-lane confusion is caught at the boundary
+(a frames report handed to `aggregateWorkerReports` throws naming the missing
+`ops` field), rule typos throw, overflow and mixed sources go inconclusive,
+inputs are never mutated, and a lying getter is read exactly once.
+
+One gap, in the single metric where the rule did not hold:
+
+- **A corrupt `asyncResidual` reading was folded in as zero.** Absence
+  legitimately counts as zero -- a lane that does not track residual has none,
+  and this is a smoke signal rather than a gated metric, so absence should not
+  poison the total. But a PRESENT non-finite value is a broken reading, not an
+  absent one, and summing it as zero made the aggregate under-report exactly
+  when something was wrong: one context with `NaN` residual beside one
+  reporting 1000 summed to 1000 and read as if nothing were unaccounted for.
+  Absence still counts as zero; corruption now yields `null`.
+  `AggregatedFramesMetrics.asyncResidual` is `number | null`.
+
+Pinned by `test/torture/g24-6-frames-multi-adversarial.test.mjs`
+(8 scenarios, axes AD-AE). Suite: 647 -> 655.
+
+### Cookbook
+
+Rebuilt from 10 recipes to 19, graded across four tiers, and extended to cover
+what the last three releases added. Public-API coverage went from 24 of 53
+exports to 42. New: a Recipe 0 that measures before it gates, the frames gate
+lane, both multi-context aggregation lanes (v1.7.0 ops and v1.8.0 frames, the
+latter previously unmentioned anywhere in the cookbook), the four CI
+formatters plus `explainDiff`, the repetition-policy lane, and a Pro tier on
+portable thresholds, triaging `inconclusive`, and differential gating. Every
+code sample was executed against this build.
+
 ## 1.7.0
 
 Batch 10: multi-context aggregation (G22). Three new functions --

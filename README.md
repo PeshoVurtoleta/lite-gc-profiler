@@ -900,6 +900,43 @@ The v1.5.1 gate-fail-closed discipline extends to `checkAggregateReport`:
 unknown rule keys throw, non-finite thresholds throw, non-finite aggregate
 metrics route to `inconclusive` (never `pass`).
 
+### Frames variant: `aggregateFrameReports` (v1.8.0)
+
+The same shape applies to the render-loop lane. Each context runs
+`measureFrames`, ships its result back, the aggregator produces a
+multi-frames report.
+
+```js
+import {
+    aggregateFrameReports, checkAggregateFramesReport, assertAggregateFramesReport
+} from '@zakkster/lite-gc-profiler';
+
+const reports = await Promise.all(workers.map(runOne));
+assertAggregateFramesReport(reports, {
+    maxBytesPerFrame: 512,
+    maxDroppedFrames: 5
+});
+```
+
+Semantics mirror the ops variant, with three frames-specific decisions:
+
+- **`droppedFrames`**: SUM across contexts (not averaged). Three
+  contexts each dropping one frame is three dropped frames
+  system-wide.
+- **`asyncResidual`**: SUM across contexts. Fire-and-forget growth
+  accumulates.
+- **`frameTimes`**: **deliberately dropped** from the aggregate.
+  Percentiles are not compositional -- a system-wide p95 cannot be
+  reconstructed from per-context summary p95s. `perContext[i]`
+  preserves the per-context distributions for manual inspection.
+
+The dilution guard from v1.7.1 applies from day one: a missing or
+non-finite rate metric (`majorsPerKFrame`, `minorsPerKFrame`,
+`maxPauseMsPerFrame`, `droppedFrames`) on ANY context marks the
+aggregate metric `null`, routing to `inconclusive` at gate time.
+Silently averaging a missing metric as zero would let an unmeasurable
+context read the whole system cleaner than reality.
+
 ## Baseline lock: guarding against silent regressions
 
 CI ergonomics: capture a known-good aggregate once, commit it as JSON, gate
@@ -1269,7 +1306,7 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 node --expose-gc --test test/*.mjs test/torture/*.mjs
 ```
 
-601 tests, all passing on this hardware. Torture tests (225 scenarios
+655 tests, all passing on this hardware. Torture tests (251 scenarios
 across axes A-W) enforce that adversarial inputs never silently pass, that
 real signal in noise always fails, that clean signal under hostile
 conditions always passes, and that self-consistency invariants hold across
