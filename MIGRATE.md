@@ -1,5 +1,72 @@
 # Migration notes
 
+## v1.9.0
+
+Batch 12: two fail-opens closed (H2, H1). **Additive only** -- no breaking
+changes to v1.8.x callers, with one behaviour change confined to
+`source: 'uasm'`, described below.
+
+### What's new
+
+Two fields on `summary.uasm`:
+
+- `granularityBytes: number | null` -- the smallest non-zero step observed
+  between consecutive uasm readings in the window. `null` when no step
+  occurred; that means *not measured*, and it is never `0`.
+- `belowGranularity: boolean` -- `true` when the window's net displacement is
+  not resolvable above that floor.
+
+One new inconclusive route: `reason: 'uasm_below_granularity'`, added to the
+report only when it applies.
+
+### The one behaviour change
+
+On `source: 'uasm'` **only**, `maxAllocRate` now routes to `inconclusive`
+instead of `pass` or `fail` when the window could not resolve growth above
+the channel's own quantum. The same applies to `maxExtraAllocRate` on a
+differential and to `maxAllocRate` under `gateReps`.
+
+If a uasm gate of yours turns inconclusive on upgrade, that gate was not
+measuring what it claimed. Two ways forward:
+
+1. **Sample more, or over a longer window**, until the workload moves the
+   channel by more than one quantum. This is usually the right fix and often
+   just means adding a couple more `await gc.sampleUasm()` calls.
+2. **Gate `heap` instead.** If the workload genuinely allocates less than one
+   uasm quantum across the whole window, `uasm` cannot answer your budget
+   question at that resolution and no amount of arithmetic will make it.
+
+`{ allowInconclusive: true }` remains available, but reach for it last: it
+turns the new signal back off.
+
+### What deliberately did NOT change
+
+- **`growthRate` is still the raw net/time figure.** It is not zeroed when
+  `belowGranularity` is true. Read the two together: the rate is the
+  measurement, the flag is whether the measurement resolves.
+- **Summaries produced by v1.2.0-v1.8.0 gate exactly as before.** The check
+  is `belowGranularity === true`, so a stored or hand-built summary that
+  predates the field is unaffected. Treating "field absent" as "unresolved"
+  would have turned every archived uasm artifact inconclusive overnight --
+  a breaking change wearing a safety fix's coat.
+- **Per-op and per-frame byte rules are untouched.** `maxBytesPerOp` and
+  `maxBytesPerFrame` share the `needsUasm` matrix cell but their actual
+  numbers come from heap deltas, so the uasm floor does not speak for them.
+- **node and Chrome `heap` gates are entirely unaffected.** H2 exists because
+  `measureUserAgentSpecificMemory()` quantizes; `process.memoryUsage()` and
+  `performance.memory` do not, in the way that matters here.
+
+### H1: no migration
+
+Report-path percentiles now verify order before sorting and sort only on
+violation. Purely internal; identical outputs, bounded time on large windows.
+
+### Tooling
+
+`npm run coverage` is new and is wired into `prepublishOnly`: the full suite
+under three floors (lines 95 / funcs 95 / branches 85), shipped files only.
+Consumers are unaffected -- this gates publishing, not installing.
+
 ## v1.8.0
 
 Batch 11: multi-context frame aggregation. **Additive only** -- no

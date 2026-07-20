@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -80,6 +80,35 @@ class DurationRing {
     clear() { this.head = 0; this.len = 0; }
 }
 
+/**
+ * H1 (v1.9.0): is a[0..n-1] already in non-decreasing order?
+ *
+ * One O(N) pass with early exit, used to skip an O(N log N) sort whose result
+ * would be the identity. Report-path only -- never called from a hot body.
+ *
+ * The predicate is written `!(prev <= cur)`, not `prev > cur`, and the
+ * difference is the whole safety argument:
+ *
+ *   - NaN. Every comparison involving NaN is false, so `prev > cur` would
+ *     return "already sorted" for [NaN, 1, 2] and leave it unsorted, while
+ *     TypedArray.prototype.sort moves NaN to the END. That would change
+ *     reported percentiles on poisoned input -- a fail-open of exactly the
+ *     shape this library exists to close. `!(prev <= cur)` is TRUE when either
+ *     side is NaN, so any NaN in the window forces the real sort and the
+ *     pre-change behaviour is preserved bit for bit.
+ *
+ *   - Signed zero. `-0 <= 0` and `0 <= -0` are both true, so [0, -0] is
+ *     treated as sorted and left alone where sort() would swap it. That is
+ *     deliberate and observationally inert: -0 === 0, JSON.stringify(-0) is
+ *     "0", and (-0).toFixed(3) is "0.000", so no report byte can differ.
+ */
+function _isSortedAscending(a, n) {
+    for (let i = 1; i < n; i++) {
+        if (!(a[i - 1] <= a[i])) return false;
+    }
+    return true;
+}
+
 // Nearest-rank percentile over the ring's valid values, using a preallocated scratch.
 function percentile(ring, scratch, q) {
     const n = ring.len;
@@ -92,7 +121,13 @@ function percentile(ring, scratch, q) {
     // percentile. This is correct only for as long as the ring stays a typed
     // array. If it ever becomes a plain Array, this needs an explicit
     // `(a, b) => a - b` comparator.
-    view.sort();
+    //
+    // H1: sorting an already-ordered window is the identity, so verify order
+    // first (O(N), early exit) and sort only on violation. The ring can hold
+    // up to MAX_RING_CAPACITY (2**24) doubles; at that size the difference
+    // between one linear pass and a full TimSort is the difference between a
+    // report you wait for and one you do not.
+    if (!_isSortedAscending(view, n)) view.sort();
     let idx = Math.ceil(q * n) - 1;
     if (idx < 0) idx = 0; else if (idx > n - 1) idx = n - 1;
     return view[idx];
@@ -173,6 +208,11 @@ class GcProfiler {
         // and zeros when the API is unavailable.
         this._uasmBytes = 0; this._uasmPeak = 0; this._uasmFirst = -1; this._uasmSamples = 0;
         this._uasmT0 = -1; this._uasmTPrev = -1;
+        // H2 (v1.9.0): smallest non-zero |delta| observed between consecutive
+        // uasm readings -- the measured granularity floor. Infinity means no
+        // non-zero delta has been seen yet, i.e. the channel has demonstrated
+        // no resolution at all in this window.
+        this._uasmMinDelta = Infinity;
 
         // frame anomaly heuristic
         this._frames = 0; this._longFrames = 0; this._frameEwma = 0;
@@ -616,6 +656,19 @@ class GcProfiler {
             if (self._uasmFirst < 0) {
                 self._uasmFirst = bytes;
                 self._uasmT0 = t;
+            } else {
+                // H2: measure the channel's own resolution from the channel.
+                // measureUserAgentSpecificMemory() reports quantized figures and
+                // the quantum is not contractual -- it varies by browser build,
+                // by isolate, and by what else the page is doing. So we never
+                // assume a constant: the smallest non-zero step this window
+                // actually produced IS the conservative floor. A window that
+                // never produced a non-zero step has not demonstrated that it
+                // can resolve anything, which is a different statement from
+                // "nothing was allocated" -- and the gate must not confuse them.
+                const d = bytes - self._uasmBytes;
+                const ad = d < 0 ? -d : d;
+                if (ad > 0 && ad < self._uasmMinDelta) self._uasmMinDelta = ad;
             }
             if (bytes > self._uasmPeak) self._uasmPeak = bytes;
             self._uasmBytes = bytes;
@@ -640,6 +693,34 @@ class GcProfiler {
     }
 
     summary(meta) {
+        // H2: resolve the uasm channel's granularity for this window.
+        //
+        // `_uasmGran` is the measured floor (null when the window produced no
+        // non-zero step -- nothing to derive a floor from).
+        //
+        // `_uasmBelow` answers one question: is the net displacement across
+        // this window large enough that quantization cannot explain it? Two
+        // ways to answer no, and both must route to inconclusive rather than
+        // to a verdict:
+        //
+        //   1. No floor at all. Every reading was identical. That looks like
+        //      "zero growth" and today gates PASS on it, but it is equally
+        //      consistent with real growth finer than the quantum. Passing is
+        //      a claim the channel did not earn.
+        //
+        //   2. Net displacement within one quantum. A flat workload whose true
+        //      footprint straddles a bucket boundary reports +1 quantum between
+        //      first and last sample. That is fabricated growth, and on a rule
+        //      that gates it is a fabricated FAIL.
+        //
+        // The comparison is `> gran`, not `>= gran`: a one-bucket difference is
+        // the smallest thing the channel can express, so it is the largest
+        // thing quantization alone can manufacture. Written as `!(net > gran)`
+        // so a NaN net resolves to "below" -- unresolvable, never verdictable.
+        const _uasmGran = this._uasmMinDelta === Infinity ? null : this._uasmMinDelta;
+        const _uasmNetRaw = this._uasmBytes - (this._uasmFirst < 0 ? 0 : this._uasmFirst);
+        const _uasmNet = _uasmNetRaw < 0 ? -_uasmNetRaw : _uasmNetRaw;
+        const _uasmBelow = _uasmGran === null || !(_uasmNet > _uasmGran);
         const s = {
             schema: 'lite-gc/1',
             source: this.source,
@@ -680,10 +761,26 @@ class GcProfiler {
                 // for a meaningful delta; falls to 0 with a single sample.
                 growthRate: (this._uasmSamples >= 2 && this._uasmTPrev > this._uasmT0)
                     ? ((this._uasmBytes - this._uasmFirst) * 1000 / (this._uasmTPrev - this._uasmT0))
-                    : 0
+                    : 0,
+                // H2 (v1.9.0). The measured quantum: smallest non-zero step
+                // between consecutive readings in this window, or null when the
+                // window produced no step at all. null is NOT zero -- it means
+                // "not measured", and it is rendered and gated as such.
+                granularityBytes: _uasmGran,
+                // True when this window's net displacement is not resolvable
+                // above the floor. `growthRate` above is deliberately left as
+                // the raw net/time figure: a measurement is never overwritten
+                // by an inference here. Silently rewriting an unresolvable rate
+                // to a clean-looking 0 is the same move as averaging a missing
+                // metric as zero, which the dilution guard exists to refuse.
+                // The flag carries the doubt; the gate acts on the flag.
+                belowGranularity: _uasmBelow
             } : {
                 supported: UASM_SUPPORTED,
-                bytes: 0, peak: 0, firstSample: 0, samples: 0, growthRate: 0
+                bytes: 0, peak: 0, firstSample: 0, samples: 0, growthRate: 0,
+                // No samples means nothing was resolved. Fail-closed by shape,
+                // though samples < 2 already blocks the gate on its own.
+                granularityBytes: null, belowGranularity: true
             },
             frames: { count: this._frames, long: this._longFrames },
             // Per-phase gc stats. Empty object when no phase() calls happened.
@@ -777,6 +874,10 @@ class GcProfiler {
         // uasm accumulators are windowed too
         this._uasmBytes = 0; this._uasmPeak = 0; this._uasmFirst = -1; this._uasmSamples = 0;
         this._uasmT0 = -1; this._uasmTPrev = -1;
+        // The granularity floor is a property of the window's readings, not of
+        // the machine. Carrying it across a reset would let a resolved window
+        // vouch for an unresolved one.
+        this._uasmMinDelta = Infinity;
         // the frame anomaly heuristic is windowed too
         this._frames = 0; this._longFrames = 0; this._frameEwma = 0;
         // phase attribution is windowed as well: intern table drops so that a
@@ -862,8 +963,54 @@ function isCheckable(rule, source, summary) {
     if (state === 'yes') return true;
     if (state === 'no') return false;
     if (state === 'needsHeap') return summary.heap && summary.heap.samples >= 2;
-    if (state === 'needsUasm') return summary.uasm && summary.uasm.samples >= 2;
+    if (state === 'needsUasm') {
+        if (!summary.uasm || !(summary.uasm.samples >= 2)) return false;
+        // H2 (v1.9.0): two samples are necessary but not sufficient on a
+        // quantized channel. maxAllocRate is the one rule here whose gated
+        // number IS uasm.growthRate, so it is the one rule that has to answer
+        // for the channel's resolution. When the window's net displacement sits
+        // inside one quantum, the rate is an artifact of bucketing and the
+        // honest verdict is 'inconclusive' -- never 'pass', never 'fail'.
+        //
+        // Scoped to maxAllocRate on purpose. maxBytesPerOp / maxBytesPerFrame
+        // also read 'needsUasm' in the matrix, but their actual numbers come
+        // from heap deltas (sampleUasm is async and cannot be awaited at a
+        // phase boundary), so the uasm floor does not speak to them.
+        if (rule === 'maxAllocRate' && summary.uasm.belowGranularity === true) return false;
+        return true;
+    }
     return false;
+}
+
+// H2: did the uasm granularity floor block a gate on this summary? Used only to
+// label an already-inconclusive verdict, so a stranger reading the report can
+// tell "the channel could not resolve it" apart from "you never sampled".
+// H2: fail-closed fold of belowGranularity across reps. A missing uasm block on
+// source='uasm' counts as unresolved -- absence of evidence is not evidence.
+function _anyRepBelowGranularity(source, summaries) {
+    if (source !== 'uasm' || !Array.isArray(summaries)) return false;
+    for (let i = 0; i < summaries.length; i++) {
+        const s = summaries[i];
+        const u = s && s.uasm;
+        if (!u || u.belowGranularity === true) return true;
+    }
+    return false;
+}
+
+function _uasmGranularityBlocked(summary, limit) {
+    // `limit` is the caller's threshold for the rule the floor actually governs.
+    // Both extra conditions matter. If the caller never set that rule, the floor
+    // blocked nothing and the label would send a reader to the wrong fix. If the
+    // sample count is under two, THAT is the blocker and the floor is incidental.
+    // A reason that is right most of the time is worse than no reason at all --
+    // it gets believed.
+    return limit !== undefined
+        && _isFiniteMetric(limit)
+        && !!summary
+        && summary.source === 'uasm'
+        && !!summary.uasm
+        && summary.uasm.samples >= 2
+        && summary.uasm.belowGranularity === true;
 }
 
 // Phase-scoped verifiability. Phases attribute GC events only in G2 -- heap and
@@ -1023,7 +1170,13 @@ function checkNoGc(summary, rules) {
     else if (anyUnchecked) verdict = 'inconclusive';
     else verdict = 'pass';
 
-    return { kind: 'gc', verdict, ok: verdict === 'pass', violations, checked, checkedByPhase, checkedByRegion, source };
+    const report = { kind: 'gc', verdict, ok: verdict === 'pass', violations, checked, checkedByPhase, checkedByRegion, source };
+    // Added only when it applies, so the report shape is unchanged for every
+    // caller who never touches the uasm channel.
+    if (verdict === 'inconclusive' && _uasmGranularityBlocked(summary, r.maxAllocRate)) {
+        report.reason = 'uasm_below_granularity';
+    }
+    return report;
 }
 
 class GcBudgetError extends Error {
@@ -1199,7 +1352,15 @@ function compareGc(control, candidate, rules) {
     else if (anyUnchecked) verdict = 'inconclusive';
     else verdict = 'pass';
 
-    return { kind: 'compare', verdict, ok: verdict === 'pass', violations, checked, source, controlSource, candidateSource };
+    const report = { kind: 'compare', verdict, ok: verdict === 'pass', violations, checked, source, controlSource, candidateSource };
+    // Either side unresolvable makes the delta unresolvable -- isCheckable is
+    // already consulted for both, so this only names the reason.
+    if (verdict === 'inconclusive'
+        && (_uasmGranularityBlocked(candidate, r.maxExtraAllocRate)
+            || _uasmGranularityBlocked(control, r.maxExtraAllocRate))) {
+        report.reason = 'uasm_below_granularity';
+    }
+    return report;
 }
 
 /**
@@ -1379,7 +1540,15 @@ function gateReps(summaries, rules, options) {
         source,
         heap: { samples: agg.heap.samples.max },
         // uasm samples also needed for source='uasm' verifiability check
-        uasm: { samples: agg.uasm ? agg.uasm.samples.max : 0 }
+        uasm: {
+            samples: agg.uasm ? agg.uasm.samples.max : 0,
+            // H2: ANY rep that could not resolve growth above its own floor
+            // makes the rep gate unresolvable. ANY, not most and not the
+            // median: a rep whose channel was blind contributes no evidence,
+            // and letting the resolved reps vouch for it is how a set of runs
+            // ends up greener than the runs it is made of.
+            belowGranularity: _anyRepBelowGranularity(source, summaries)
+        }
     };
 
     // Source-parameterized rule paths: maxAllocRate reads uasm.growthRate on
@@ -1425,7 +1594,7 @@ function gateReps(summaries, rules, options) {
     else if (anyUnchecked) verdict = 'inconclusive';
     else verdict = 'pass';
 
-    return {
+    const report = {
         kind: 'reps',
         verdict,
         ok: verdict === 'pass',
@@ -1437,6 +1606,13 @@ function gateReps(summaries, rules, options) {
         aggregate: agg,
         policy: appliedPolicy
     };
+    if (verdict === 'inconclusive'
+        && heapProbe.uasm.belowGranularity === true
+        && heapProbe.uasm.samples >= 2
+        && r.maxAllocRate !== undefined && _isFiniteMetric(r.maxAllocRate)) {
+        report.reason = 'uasm_below_granularity';
+    }
+    return report;
 }
 
 /**
@@ -2558,7 +2734,11 @@ function _framePercentiles(workTimes, count, scratch) {
     for (let i = 0; i < count; i++) scratch[i] = workTimes[i];
     // Float64Array.sort is in-place; TimSort in V8. One-off cost at result
     // assembly, not per-frame.
-    scratch.subarray(0, count).sort();
+    //
+    // H1: verify order first and sort only on violation. See
+    // _isSortedAscending for why the predicate is NaN-forcing.
+    const view = scratch.subarray(0, count);
+    if (!_isSortedAscending(view, count)) view.sort();
     const p50 = scratch[Math.floor(count * 0.50)];
     const p95 = scratch[Math.min(count - 1, Math.floor(count * 0.95))];
     const p99 = scratch[Math.min(count - 1, Math.floor(count * 0.99))];

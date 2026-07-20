@@ -5,3 +5,4 @@ node_modules/
 # macOS System Files
 .DS_Store
 /package-lock.json
+/test-bundle.js

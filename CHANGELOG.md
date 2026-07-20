@@ -1,5 +1,97 @@
 # Changelog
 
+## 1.9.0
+
+Batch 12: the two items carried from the original forward roadmap, closed
+before any new feature. H2 removes a live fail-open; H1 removes a report-path
+cost that grew with ring capacity. No new lane, no new gate vocabulary.
+
+### H2 -- the uasm granularity floor
+
+`measureUserAgentSpecificMemory` reports quantized bytes. Until now nothing in
+the package knew that, and `maxAllocRate` is gateable on the `uasm` source, so
+the channel was allowed to answer questions finer than it can resolve. Two
+shapes, both wrong, both now `inconclusive`:
+
+- **A flat workload straddling a bucket boundary** reports one quantum of
+  growth between first and last sample. That is fabricated growth, and on a
+  gating rule it was a fabricated FAIL.
+- **Every reading identical** looked like zero growth and gated PASS. It is
+  equally consistent with real growth finer than the quantum, so passing was a
+  claim the channel had not earned. This one is stricter than v1.8.0 and it is
+  the intended direction: on `uasm`, a clean run is not provably clean.
+
+`granularityBytes` is the smallest non-zero step observed in the window --
+measured, never assumed, because Chrome's quantum is not contractual -- and is
+`null`, never `0`, when nothing resolved. `belowGranularity` is true when no
+floor could be derived, or when net displacement across the window does not
+exceed one quantum. The comparison is `> gran` and not `>= gran` deliberately:
+one bucket is the smallest thing the channel can express, therefore the largest
+thing quantization alone can manufacture. It is written `!(net > gran)` so a
+NaN resolves to unresolved rather than to a verdict.
+
+`growthRate` is left RAW when the flag is set; the flag carries the doubt
+rather than the number being quietly rewritten. The floor governs
+`maxAllocRate` and nothing else, is windowed (a `reset()` does not let a
+resolved window vouch for the next one), folds across reps with ANY rather
+than majority, and poisons a differential from either side. Summaries produced
+before v1.9.0 gate exactly as they did before.
+
+### H1 -- bounded-time reporting
+
+Both report-path sorts -- `percentile()` over the GC pause ring and
+`_framePercentiles()` over frame work-times -- ran unconditionally. The ring
+holds up to `MAX_RING_CAPACITY` (2**24) doubles, and GC entries arrive
+near-ordered by `startTime`, so the common case was paying TimSort to confirm
+an order it already had.
+
+`_isSortedAscending()` is one O(N) pass with early exit; the sort runs only on
+violation. Measured on a 1,000,000-entry ring: **6.5 ms ordered against
+109.8 ms scrambled, zero sort calls on the ordered path**, with identical
+percentiles from both branches. The predicate is `!(a[i-1] <= a[i])` rather
+than `a[i-1] > a[i]` so that a NaN forces the real sort instead of being
+waved through as ordered.
+
+Nothing observable changes: skipping a sort is sound only where the sort would
+have been the identity, and the pins are split into branch pins (ordered input
+must not reach the sort, out-of-order input must) and output pins (percentiles
+are a function of the multiset, never of arrival order).
+
+Pinned by `test/torture/g25-5-uasm-granularity.test.mjs` (18 scenarios) and
+`g25-6-report-sorts.test.mjs` (9 scenarios). Suite: 675 -> 702.
+
+## 1.8.1
+
+Coverage law. No API change, no behaviour change; a patch by semver.
+
+`npm run coverage` runs the full suite under `--experimental-test-coverage`
+and fails below three floors -- 95% lines, 95% functions, 85% branches -- and
+replaces `npm test` in `prepublishOnly`, so a release cannot go out beneath
+them. A Coveralls badge now reports the same run in the README.
+
+Two exclusions carry the weight. `test/**` is excluded because test code is
+near-100% executed by definition, and letting it into the aggregate means the
+suite grades itself while the shipped-file number drifts unnoticed.
+`**/tmp/**` is excluded because several torture scenarios write throwaway
+fixture modules to a temp directory and execute them completely. The floors
+are therefore on **shipped files only**, which reads materially lower than an
+all-files run: 96.26% lines / 87.22% branches / 95.65% functions at v1.8.1,
+against 98.53 / 91.21 / 97.95 with test code folded in. Quoting the all-files
+number would be flattering and meaningless.
+
+`test/24-cli-gate.test.mjs` (20 scenarios) closes the hole the number was
+hiding: `bin/LiteGcGate.mjs` sat at 74% lines / 38% branch, with every usage
+path, the non-console formatters, the `--json` side channel, the multi-rep
+route, the whole baseline flow and all three infrastructure-error exits pinned
+by nothing. A gate whose own gatekeeper is untested is the fail-open shape
+TORTURE.md exists to kill. CLI lines 74 -> 99.15%; `Register.mjs` -> 100%.
+
+Floors move only by the ratchet rule -- measured minus one, and only when
+exceeded by at least 2 points across three consecutive full runs on both
+machines, on the shipped-file basis. Coverage is a guardrail against
+regression here, not a target to chase; coverage-driven tests that assert
+nothing remain a non-goal.
+
 ## 1.8.0
 
 Batch 11: multi-context frame aggregation (G23). Three new functions --

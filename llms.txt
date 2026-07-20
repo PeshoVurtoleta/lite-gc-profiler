@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.8.0
+# @zakkster/lite-gc-profiler v1.9.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -52,6 +52,18 @@ test-helpers/explain and the lite-gc-gate CLI.
   `inconclusive`, never `pass`. Do not pass rule keys a lane does not
   implement. Rule thresholds are read exactly once, so a getter cannot
   return one value to validation and another to the comparison.
+- `uasm` is quantized and the quantum is not contractual (v1.9.0). Each
+  window derives its own floor -- `summary.uasm.granularityBytes`, the
+  smallest non-zero step between consecutive readings, or `null` when no
+  step occurred (null means NOT MEASURED; never render or compare it as
+  0). `summary.uasm.belowGranularity` is true when the window's net
+  displacement sits inside one quantum or no floor was measured at all;
+  `maxAllocRate` on `source: 'uasm'` then routes to `inconclusive` with
+  `reason: 'uasm_below_granularity'` -- never pass, never fail. Same on
+  `maxExtraAllocRate` (a delta is only as resolvable as its worse side)
+  and on `gateReps` (ANY blind rep makes the set unresolvable).
+  `growthRate` stays the RAW net/time figure and is not zeroed under the
+  flag: the rate is the measurement, the flag is whether it resolves.
 - One measurement at a time. Overlapping/nested `measureOps`,
   `measureFrames` or `measureOpsAsync` throws/rejects "already in
   flight" -- all lanes share one heap. Measure sequentially. The guard

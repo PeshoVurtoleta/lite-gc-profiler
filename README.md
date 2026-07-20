@@ -6,8 +6,8 @@
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-gc-profiler?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-gc-profiler)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
 [![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-gc-profiler?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-gc-profiler)
-[![Coverage Status](https://coveralls.io/repos/github/PeshoVurtoleta/lite-gc-profiler/badge.svg?branch=main)](https://coveralls.io/github/PeshoVurtoleta/lite-gc-profiler?branch=main)
 ![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
+[![Coverage Status](https://coveralls.io/repos/github/PeshoVurtoleta/lite-gc-profiler/badge.svg?branch=main)](https://coveralls.io/github/PeshoVurtoleta/lite-gc-profiler?branch=main)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE.txt)
 [![deps](https://img.shields.io/badge/dependencies-0-3fb950)](#install)
@@ -72,10 +72,52 @@ not cross-origin-isolated. `summary.uasm` is always present, whether or not
 you opted in -- shape:
 
 ```
-{ supported, bytes, peak, firstSample, samples, growthRate }
+{ supported, bytes, peak, firstSample, samples, growthRate,
+  granularityBytes, belowGranularity }
 ```
 
 `growthRate` is 0 with a single sample; needs two points for a delta.
+
+#### The granularity floor (v1.9.0)
+
+`measureUserAgentSpecificMemory()` returns **quantized** figures, and the
+quantum is not contractual -- it varies by browser build, by isolate, and by
+what else the page is doing. Treating those readings as exact opened the gate
+in both directions:
+
+- **A run of identical readings** reports `growthRate: 0` and used to gate
+  green. But "every reading was identical" is equally consistent with real
+  growth finer than the quantum. That is a pass the channel never earned.
+- **A flat workload sitting on a bucket boundary** reports one whole quantum
+  of change between first and last sample. Over a short window that is
+  megabytes per second of growth that never happened, and CI goes red on a
+  workload that allocated nothing.
+
+So the profiler now measures the channel's resolution *from the channel*:
+
+- `granularityBytes` -- the smallest non-zero step observed between
+  consecutive readings in this window. That is the conservative floor. It is
+  `null`, never `0`, when no step occurred at all: `null` means *not
+  measured*, while a floor of zero bytes would claim perfect resolution.
+- `belowGranularity` -- `true` when the window's net displacement is not
+  resolvable above that floor, either because no floor was measured or
+  because the net change sits inside a single quantum.
+
+When `belowGranularity` is true, `maxAllocRate` on `source: 'uasm'` routes to
+**`inconclusive`** with `reason: 'uasm_below_granularity'` -- never `pass`,
+never `fail`. The same rule holds for `maxExtraAllocRate` on a differential
+(a delta is only as resolvable as its worse side) and for `gateReps` (**any**
+blind rep makes the set unresolvable; resolved reps do not vouch for it).
+
+`growthRate` itself is left as measured, not rewritten to 0. Silently
+replacing an unresolvable rate with a clean-looking zero is the same move as
+averaging a missing metric as zero, which the dilution guard exists to refuse.
+The flag carries the doubt; the gate acts on the flag.
+
+The fix: sample more times, or across a longer window, until the workload
+moves the channel by more than one quantum. If it never does, the honest
+reading is that `uasm` cannot answer your budget question at that resolution
+-- gate `heap` instead, or widen the budget to something the channel can see.
 
 ## Subpaths
 
@@ -306,7 +348,9 @@ Which rules each source can actually verify:
 
 "needs heap" means the rule is verifiable iff `summary.heap.samples >= 2`.
 "needs uasm" means the rule is verifiable iff `summary.uasm.samples >= 2`
-(computing a growth rate requires at least two measurements). Feed samples
+(computing a growth rate requires at least two measurements) **and**, since
+v1.9.0, iff those samples actually resolved growth above the channel's own
+quantum -- see the granularity floor above. Feed samples
 with `gc.sampleHeap(now, process.memoryUsage().heapUsed)` in node, let the
 browser path sample `performance.memory` automatically for `heap`, or call
 `await gc.sampleUasm()` a few times per window for `uasm`.
@@ -1304,10 +1348,42 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 ## Testing
 
 ```
-node --expose-gc --test test/*.mjs test/torture/*.mjs
+npm test          # 702 tests
+npm run coverage  # the same suite, under the coverage law
 ```
 
-655 tests, all passing on this hardware. Torture tests (251 scenarios
+702 tests, all passing on this hardware.
+
+### The coverage law
+
+`npm run coverage` runs the full suite with `--experimental-test-coverage`
+and **fails the process** below any of three floors:
+
+| metric    | floor |
+| --------- | :---: |
+| lines     |  95%  |
+| functions |  95%  |
+| branches  |  85%  |
+
+It is wired into `prepublishOnly`, so a release cannot go out under the
+floors.
+
+Two exclusions matter. `test/**` is excluded because test code is
+near-100% executed by definition -- letting it into the aggregate means the
+suite grades itself and the shipped-file number silently drifts upward.
+`**/tmp/**` is excluded for the same reason: several torture scenarios write
+throwaway fixture modules to a temp directory and execute them completely.
+The floors above are therefore **shipped files only**, which is a materially
+different (and lower) number than an all-files run reports.
+
+Floors move only by the ratchet rule -- measured minus one, and only when
+exceeded by at least 2 points across three consecutive full runs on both
+machines, on the shipped-file basis. Coverage is a guardrail here, not a
+target to chase.
+
+### Torture
+
+Torture tests (278 scenarios
 across axes A-W) enforce that adversarial inputs never silently pass, that
 real signal in noise always fails, that clean signal under hostile
 conditions always passes, and that self-consistency invariants hold across

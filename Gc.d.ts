@@ -1,4 +1,4 @@
-export const VERSION: '1.8.0';
+export const VERSION: '1.9.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -91,8 +91,37 @@ export interface UasmStat {
     firstSample: number;
     /** Number of successful samples. */
     samples: number;
-    /** Bytes/sec across the sampled window; 0 when samples < 2. */
+    /**
+     * Bytes/sec across the sampled window; 0 when samples < 2.
+     *
+     * Since v1.9.0 this is deliberately NOT zeroed when `belowGranularity` is
+     * true. The measurement is reported as measured; the flag carries the
+     * doubt and the gate acts on the flag. Read them together.
+     */
     growthRate: number;
+    /**
+     * (v1.9.0) The channel's measured quantum for this window: the smallest
+     * non-zero step observed between consecutive readings.
+     *
+     * `null` -- not measured. No non-zero step occurred, so there is no floor
+     * to report. Never rendered or compared as 0: a floor of zero bytes would
+     * claim perfect resolution, which is the opposite of what happened.
+     *
+     * Derived per window rather than assumed, because
+     * measureUserAgentSpecificMemory()'s quantum is not contractual -- it
+     * varies by browser build, by isolate, and by page activity.
+     */
+    granularityBytes: number | null;
+    /**
+     * (v1.9.0) True when this window's net displacement is not resolvable
+     * above the floor -- either no floor was measured at all, or the net
+     * change sits within a single quantum and so could have been manufactured
+     * by bucketing alone.
+     *
+     * When true, `maxAllocRate` on `source: 'uasm'` routes to 'inconclusive'
+     * with `reason: 'uasm_below_granularity'`. Never 'pass', never 'fail'.
+     */
+    belowGranularity: boolean;
 }
 
 export interface GcSummary {
@@ -347,6 +376,14 @@ export interface GcGateResult {
      */
     checkedByRegion: Record<string, Partial<Record<GcRuleName, boolean>>>;
     source: GcSource;
+    /**
+     * (v1.9.0) Present only on 'inconclusive', and only when the cause is
+     * nameable. Currently one value: 'uasm_below_granularity' -- the uasm
+     * channel could not resolve growth above its own quantum, so maxAllocRate
+     * was withheld rather than guessed. Absent otherwise, so the report shape
+     * is unchanged for every caller who never touches the uasm channel.
+     */
+    reason?: 'uasm_below_granularity' | (string & {});
 }
 
 export const GC_DEFAULT_RULES: GcRules;
@@ -356,8 +393,11 @@ export const GC_DEFAULT_RULES: GcRules;
  *   'yes'       -- always verifiable on this source
  *   'no'        -- never verifiable on this source
  *   'needsHeap' -- verifiable iff summary.heap.samples >= 2
+ *   'needsUasm' -- verifiable iff summary.uasm.samples >= 2, and (v1.9.0, for
+ *                  maxAllocRate only) the window resolved growth above its own
+ *                  granularity floor
  */
-export type GcVerifiability = 'yes' | 'no' | 'needsHeap';
+export type GcVerifiability = 'yes' | 'no' | 'needsHeap' | 'needsUasm';
 export const VERDICT_MATRIX: Readonly<Record<GcRuleName, Readonly<Record<GcSource, GcVerifiability>>>>;
 
 export function checkNoGc(summary: GcSummary, rules?: GcRules): GcGateResult;
@@ -409,8 +449,13 @@ export interface GcDifferentialResult {
     source: GcSource | 'mixed';
     controlSource: GcSource;
     candidateSource: GcSource;
-    /** Populated when verdict is 'inconclusive' due to source_mismatch. */
-    reason?: string;
+    /**
+     * Populated when verdict is 'inconclusive'. 'source_mismatch' when control
+     * and candidate disagree on source; (v1.9.0) 'uasm_below_granularity' when
+     * either side failed to resolve growth above its granularity floor -- a
+     * delta is only as resolvable as its worse side.
+     */
+    reason?: 'source_mismatch' | 'uasm_below_granularity' | (string & {});
 }
 
 export const GC_DEFAULT_DIFFERENTIAL_RULES: GcDifferentialRules;
@@ -487,8 +532,13 @@ export interface GcRepGateResult {
     aggregate: GcAggregate;
     /** Applied policy per rule the caller set. */
     policy: Partial<Record<GcRuleName, GcRepPolicy>>;
-    /** Populated when verdict is 'inconclusive' due to mixed_sources. */
-    reason?: string;
+    /**
+     * Populated when verdict is 'inconclusive'. 'mixed_sources' when the reps
+     * do not share one source; (v1.9.0) 'uasm_below_granularity' when ANY rep
+     * failed to resolve growth above its floor -- resolved reps do not vouch
+     * for a blind one.
+     */
+    reason?: 'mixed_sources' | 'uasm_below_granularity' | (string & {});
 }
 
 /** D4-approved defaults per rule. */

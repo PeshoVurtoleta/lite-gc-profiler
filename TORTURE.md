@@ -1,6 +1,6 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 251 torture scenarios shipped across v1.1.0 through v1.8.0
+**Status:** 278 torture scenarios shipped across v1.1.0 through v1.9.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
@@ -382,8 +382,85 @@ order-independence, no input mutation, an overflowing accumulator routed
 to inconclusive rather than reported, and mixed sources refusing to
 fabricate a comparable verdict.
 
-**Total shipped: 251 torture scenarios + 3 global invariants + 3 CLI
-integration scenarios (G16.5).** Full suite: 655 tests.
+### G25.5 -- uasm granularity floor (v1.9.0, H2)
+
+`test/torture/g25-5-uasm-granularity.test.mjs` -- **18 scenarios**, axes
+A-D.
+
+The attack: `measureUserAgentSpecificMemory()` reports quantized figures and
+the quantum is not contractual. Through v1.8.0 every uasm reading was treated
+as exact, which opened `maxAllocRate` in both directions on the one rule
+whose gated number is `uasm.growthRate`.
+
+**Axis A (6)** must be inconclusive. A run of identical readings -- the
+false-pass case, and the reason H2 was classed a live fail-open: `growthRate`
+0 gated green, when "every reading was identical" is equally consistent with
+real growth finer than the quantum. A flat workload crossing one bucket
+boundary -- the false-fail case, ~2 MB/s of fabricated growth against a 1
+MB/s budget. A single sample. Then the propagation pins: an unresolved
+candidate poisons a differential, an unresolved control poisons it too, and
+the rep gate folds `belowGranularity` with **ANY** rather than majority --
+three resolved reps must not vouch for one blind one.
+
+**Axis B (2)** must still fail. Twenty quanta of genuine growth, and the
+boundary case of floor-plus-one-byte. H2 must not become a blanket amnesty
+for the uasm lane.
+
+**Axis C (3)** must still pass. A resolved, clean run; a uniformly resolved
+rep set; and the back-compat pin -- a summary that predates the field is
+gated exactly as it was, because treating "field absent" as "unresolved"
+would turn every archived v1.2.0-v1.8.0 uasm artifact inconclusive
+overnight, which is a breaking change wearing a safety fix's coat.
+
+**Axis D (7)** invariants: the floor is the smallest non-zero |delta| and
+comes from the magnitude, not the sign; it is `null` and never `0` when
+nothing resolved; `growthRate` is left RAW under the flag (pinned so that
+zeroing it, if ever wanted, is a deliberate change); the floor is windowed
+and `reset()` does not let a resolved window vouch for the next; a zero delta
+never becomes the floor; the reason label appears only where it applies; and
+the floor gates `maxAllocRate` alone, not the heap-derived per-op lanes that
+share its `needsUasm` matrix cell.
+
+The scoping pin in this file caught a real defect during development: the
+first implementation labelled every uasm inconclusive with
+`uasm_below_granularity`, including a kind-rule inconclusive that granularity
+had nothing to do with. A reason that is right most of the time is worse than
+no reason, because it gets believed.
+
+### G25.6 -- Bounded-time reporting (v1.9.0, H1)
+
+`test/torture/g25-6-report-sorts.test.mjs` -- **9 scenarios**, axis D.
+
+Both report-path percentile sites now verify order in one O(N) pass and sort
+only on violation. Skipping a sort is sound only if the sort would have been
+the identity, so the pins split into branch pins and output pins.
+
+**Branch pins (4)**: ordered work-times must not reach the sort; descending
+ones must (without this, the first pin also passes against a build that
+simply deleted both sorts); a single frame never sorts; and the
+instrumentation itself is pinned -- `Float64Array.prototype.sort` is filtered
+by CALL SITE rather than array length, because the duration-ring percentile
+fires in the same window with a run-dependent length, and if the filter ever
+stops distinguishing the two sites the branch pins go quietly vacuous.
+
+**Output pins (5)**: ascending input produces the correct order statistics
+*via the skip path* -- the load-bearing pin, since wrong skipping shows up
+here as wrong numbers; shuffled input produces the same statistics via the
+sort path; the two paths agree with each other on the same multiset; the
+percentiles stay monotonic on both; and a tightly clustered window reports
+the cluster.
+
+Not pinned, and recorded as such in the file header: the NaN case. The
+predicate is written `!(prev <= cur)` precisely so that a NaN forces the real
+sort -- with `prev > cur`, `[NaN, 1, 2]` would be called sorted and left
+alone where `sort()` moves NaN to the end, shifting every percentile. No
+public path can put a NaN into either buffer today, so the guarantee rests on
+the predicate's shape. If a lane ever admits caller-supplied durations, that
+is the first test to write.
+
+**Total shipped: 278 torture scenarios + 3 global invariants + 3 CLI
+integration scenarios (G16.5).** Full suite: 702 tests, under a publish-gated
+coverage law (lines 95 / funcs 95 / branches 85, shipped files only).
 
 ---
 
