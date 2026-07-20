@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.9.0
+# @zakkster/lite-gc-profiler v1.9.1
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -64,6 +64,12 @@ test-helpers/explain and the lite-gc-gate CLI.
   and on `gateReps` (ANY blind rep makes the set unresolvable).
   `growthRate` stays the RAW net/time figure and is not zeroed under the
   flag: the rate is the measurement, the flag is whether it resolves.
+- Triage for the third verdict lives in `INCONCLUSIVE.md` (shipped).
+  Reason codes: `source_mismatch`, `mixed_sources`, `fingerprint_mismatch`,
+  `no_comparable_metrics`, `invalid_baseline`, `partial_report`,
+  `uasm_below_granularity`. `GcInconclusiveError.message` names the cause
+  and one next step; do not resolve an unexpected `inconclusive` by
+  setting `allowInconclusive` -- that is the escape hatch, not the fix.
 - One measurement at a time. Overlapping/nested `measureOps`,
   `measureFrames` or `measureOpsAsync` throws/rejects "already in
   flight" -- all lanes share one heap. Measure sequentially. The guard

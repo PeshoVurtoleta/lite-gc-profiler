@@ -1,5 +1,37 @@
 # Migration notes
 
+## v1.9.1
+
+Support surface. **Docs, templates and error-message text only** -- no API
+change, no behaviour change, nothing to migrate.
+
+### What's new
+
+- **`INCONCLUSIVE.md`**, shipped in the package. The triage table for the
+  third verdict: every reason code, what it means, and the fix. Promoted out
+  of COOKBOOK Recipe 16 to where a first-run `inconclusive` actually lands,
+  and expanded to cover all seven reason codes plus the null/NaN cases.
+- **Error messages now name a next step.** `GcInconclusiveError` picks an
+  actionable hint from what the report knows (source, reason code) and points
+  at `INCONCLUSIVE.md`. The `source: 'uasm'` construction error now explains
+  that cross-origin isolation is a response-header decision, and names the
+  two headers.
+- **A 60-second quickstart** at the top of the README, ending in `gateBadge`
+  output so the payoff is visible before the concepts are.
+- **Issue templates** for false pass, false fail-or-inconclusive, and docs.
+  The false-pass template requires the report JSON, because that is the field
+  that makes the class diagnosable at all.
+
+### If you match on error message text
+
+`GcInconclusiveError.message` is longer than it was. The parts that were
+already there are unchanged and still in the same order -- the source, the
+list of unverifiable rules, and the `allowInconclusive` mention -- so
+substring matching on those still works. The hint is inserted between the
+rule list and the `allowInconclusive` sentence.
+
+Matching on the *exact* full string was never supported and is not now.
+
 ## v1.9.0
 
 Batch 12: two fail-opens closed (H2, H1). **Additive only** -- no breaking

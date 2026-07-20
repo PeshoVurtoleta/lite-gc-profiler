@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.9.0';
+const VERSION = '1.9.1';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -186,7 +186,12 @@ class GcProfiler {
             throw new RangeError("GcProfiler: source must be one of 'auto', 'gc', 'heap', 'uasm', 'none'");
         }
         if (requested === 'uasm' && !UASM_SUPPORTED) {
-            throw new RangeError('GcProfiler: source=uasm requires performance.measureUserAgentSpecificMemory and crossOriginIsolated');
+            throw new RangeError('GcProfiler: source=uasm requires '
+                + 'performance.measureUserAgentSpecificMemory and crossOriginIsolated. '
+                + 'That API is Chrome-only and is exposed only to cross-origin-isolated '
+                + 'pages: serve the document with Cross-Origin-Opener-Policy: same-origin '
+                + 'and Cross-Origin-Embedder-Policy: require-corp, then check '
+                + 'globalThis.crossOriginIsolated === true. In node, use source:\'gc\'.');
         }
         this._source = requested;                                      // 'auto' resolved lazily in the getter
 
@@ -1179,6 +1184,52 @@ function checkNoGc(summary, rules) {
     return report;
 }
 
+// v1.9.1: one actionable sentence per cause, keyed on what the report knows.
+// Deliberately short -- an error message is not documentation, it is a
+// signpost, and INCONCLUSIVE.md is where the road goes.
+function _inconclusiveHint(report, src) {
+    const reason = report.reason;
+    if (reason === 'uasm_below_granularity') {
+        return 'The uasm channel could not resolve growth above its own quantum'
+            + ' (summary.uasm.granularityBytes): sample more times or across a'
+            + ' longer window, or gate source:\'heap\' instead.';
+    }
+    if (reason === 'source_mismatch') {
+        return 'Control and candidate were measured on different sources;'
+            + ' measure both sides the same way.';
+    }
+    if (reason === 'mixed_sources') {
+        return 'The reps do not share one source; run them all in one runtime.';
+    }
+    if (reason === 'fingerprint_mismatch') {
+        return 'The baseline was captured on a different machine or runtime;'
+            + ' re-capture it here, or gate ratios instead of absolutes.';
+    }
+    if (reason === 'no_comparable_metrics') {
+        return 'The baseline shares no metric with this run; it predates the'
+            + ' metrics you are gating. Re-capture it.';
+    }
+    if (reason === 'invalid_baseline') {
+        return 'The baseline is malformed or from an incompatible schema;'
+            + ' re-capture rather than hand-editing it.';
+    }
+    if (src === 'none') {
+        return 'This runtime exposes no GC and no heap channel (Firefox,'
+            + ' Safari, or a stripped sandbox), so no byte or event rule can be'
+            + ' answered here. Run the gate in node or Chrome, or gate the'
+            + ' frame lane, which works everywhere.';
+    }
+    if (src === 'heap' || src === 'uasm') {
+        return 'Event-kind rules (maxMajor/maxMinor/maxPauseMs/maxTotalMs) need'
+            + ' real GC events, which this source does not expose; gate'
+            + ' maxAllocRate here, or run the same gate in node. If a byte rule'
+            + ' is unverified, feed at least two samples.';
+    }
+    return 'Byte rules need at least two heap samples to form a delta;'
+        + ' call sampleHeap() twice, or use measureOps/measureFrames,'
+        + ' which sample for you.';
+}
+
 class GcBudgetError extends Error {
     constructor(report) {
         super('GC budget exceeded: ' + report.violations.map((v) => v.reason).join('; '));
@@ -1205,10 +1256,16 @@ class GcInconclusiveError extends Error {
         }
         const reason = report.reason ? ' (' + report.reason + ')' : '';
         const src = report.source || 'unknown';
+        // v1.9.1: name the next step, not just the failure. This is the error
+        // a first-time user is most likely to meet, and "cannot verify" with
+        // no route forward is what sends people to allowInconclusive -- which
+        // turns this library into every other profiler, one that always says
+        // yes. The hint is chosen from whatever the report actually knows.
         super('GC gate inconclusive on source=' + src + reason
             + ': cannot verify rule(s) [' + un.join(', ') + ']. '
-            + 'Pass { allowInconclusive: true } to accept, '
-            + 'or gate only on rules this source can answer.');
+            + _inconclusiveHint(report, src)
+            + ' See INCONCLUSIVE.md for the full triage table. '
+            + 'Pass { allowInconclusive: true } to accept deliberately.');
         this.name = 'GcInconclusiveError';
         this.report = report;
     }

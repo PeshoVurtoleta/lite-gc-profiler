@@ -25,6 +25,78 @@ methods (`sampleHeap`, `markFrame`) allocate nothing.
 
 Single-file ESM, no dependencies, MIT.
 
+## 60 seconds
+
+Install, measure, gate. No configuration, no setup file.
+
+```
+npm i -D @zakkster/lite-gc-profiler
+```
+
+```js
+// save as probe.mjs, run with:  node --expose-gc probe.mjs
+import { measureOps } from '@zakkster/lite-gc-profiler';
+
+const kept = [];
+const leaky = (i) => { kept.push({ id: i }); };   // retains one object per call
+const clean = (i) => i * 2;                       // retains nothing
+
+console.log('leaky:', measureOps(leaky, { ops: 10_000, warmup: 500, stabilize: true }).bytesPerOp);
+console.log('clean:', measureOps(clean, { ops: 10_000, warmup: 500, stabilize: true }).bytesPerOp);
+```
+
+```
+leaky: 43.5
+clean: 0.3
+```
+
+Your exact numbers will differ -- pointer compression alone changes object
+widths between builds -- but the shape holds everywhere: tens of bytes for the
+leak, essentially zero for the clean function.
+
+That is bytes **retained** per call -- the live-heap difference across two
+forced collections, not bytes allocated. Transient garbage reads as zero,
+correctly: the collector's whole job is to make it free.
+
+Now turn the gap into something CI can act on. `assertOps` measures and gates
+in one call -- it takes the function, the rules, then the options:
+
+```js
+import { assertOps } from '@zakkster/lite-gc-profiler';
+
+assertOps(clean, { maxBytesPerOp: 1 }, { ops: 10_000, warmup: 500, stabilize: true });
+// throws GcBudgetError if it regresses; returns the report if it does not
+```
+
+And put the outcome somewhere people see it:
+
+```js
+import { measureOps, checkOps } from '@zakkster/lite-gc-profiler';
+import { gateBadge } from '@zakkster/lite-gc-profiler/explain';
+
+const result = measureOps(clean, { ops: 10_000, warmup: 500, stabilize: true });
+console.log(gateBadge(checkOps(result, { maxBytesPerOp: 1 })));
+// gc gate: pass
+```
+
+`gateBadge(report, { format: 'shields-json' })` emits a shields.io endpoint
+payload, and `{ format: 'svg' }` a self-contained badge you can commit.
+
+<!-- GCFORGE F1 SLOT: when the phase-timeline view exists, one screenshot goes
+     here. Per ROADMAP-GCFORGE F1 exit criteria and FINAL roadmap section 4 --
+     it explains the library faster than the next three paragraphs do. Nothing
+     in this package depends on GCForge; this is a one-line change when it
+     lands. -->
+
+**Three verdicts, not two.** `pass` means no violation. `fail` means a budget
+was exceeded. **`inconclusive` means the gate could not verify** -- and it
+will never quietly report that as `pass`. If your first run lands there, that
+is working as designed: **[INCONCLUSIVE.md](./INCONCLUSIVE.md)** has the
+triage table, and nearly every cause has a one-line fix.
+
+Next: [COOKBOOK.md](./COOKBOOK.md) -- nineteen recipes, starting from
+"just show me a number".
+
 ## The claim, made falsifiable
 
 The zero-GC claim in a package's README should mean something. This library
@@ -357,6 +429,9 @@ browser path sample `performance.memory` automatically for `heap`, or call
 
 The matrix is exported as `VERDICT_MATRIX` for tools that want to render it
 or filter rules to the current source.
+
+Got `inconclusive` and not sure what to do? **[INCONCLUSIVE.md](./INCONCLUSIVE.md)**
+is the triage table: every reason code, what it means, and the fix.
 
 ### Errors
 
@@ -1348,11 +1423,11 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 ## Testing
 
 ```
-npm test          # 702 tests
+npm test          # 711 tests
 npm run coverage  # the same suite, under the coverage law
 ```
 
-702 tests, all passing on this hardware.
+711 tests, all passing on this hardware.
 
 ### The coverage law
 

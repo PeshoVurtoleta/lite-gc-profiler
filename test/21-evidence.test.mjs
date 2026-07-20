@@ -11,6 +11,44 @@ import {
 } from '../Gc.js';
 import { explainReport, explainDiff, gateBadge } from '../Explain.js';
 
+// Deterministic fixtures for the evidence lane.
+//
+// These tests are about the NARRATOR -- explainReport/explainDiff/gateBadge are
+// documented as pure gate-report formatters that never measure. Building their
+// fixtures from live measurements coupled string assertions to whatever the
+// host machine's heap did, and it broke exactly as you would expect: a noop
+// over 200 ops exceeded a 1024 B/op control threshold on one machine (V8
+// self-noise divided by only 200 ops is enormous), while a 64-slot array
+// retained under 50 B/op on another (pointer compression halves a tagged slot),
+// so a test asserting `fail` got `pass`. Same suite precedent as the CLI
+// baseline leg: no test here may gate on ambient noise unless noise is the
+// thing under test.
+//
+// The gate functions are still the real ones -- only the measured input is
+// fixed -- so a report shape change cannot silently pass these by. The
+// conformance test at the bottom of this file pins the fixtures against a real
+// measurement so they cannot drift.
+
+const opsResult = (bytesPerOp) => ({
+    schema: 'lite-gc-ops/1', ops: 2000, warmupOps: 200, source: 'gc',
+    bytesPerOp, opsPerSec: 326255, elapsedMs: 6.13
+});
+
+// The async lane reports more than the sync one: it CAN see GC events, because
+// it yields to the event loop between ops, and it carries the stabilize flag
+// and the async-residual smoke signal.
+const opsAsyncResult = (bytesPerOp) => ({
+    schema: 'lite-gc-ops-async/1', ops: 200, warmupOps: 20, source: 'gc',
+    bytesPerOp, bytesPerOpStable: true, majorsPerKOp: 0, minorsPerKOp: 1.4,
+    maxPauseMsPerOp: 0.02, asyncResidual: 0, opsPerSec: 41000, elapsedMs: 4.9
+});
+
+const framesResult = (droppedFrames) => ({
+    schema: 'lite-gc-frames/1', frames: 60, warmupFrames: 10, source: 'gc',
+    bytesPerFrame: 12.4, bytesPerFrameStable: true, droppedFrames,
+    asyncResidual: 0, frameTimes: { p50: 0.31, p95: 0.8, p99: 1.02, max: 1.4 }
+});
+
 const noop = (i) => i | 0;
 const fastSched = (cb) => setTimeout(cb, 0);
 
@@ -19,18 +57,14 @@ const fastSched = (cb) => setTimeout(cb, 0);
 // -----------------------------------------------------------------------------
 
 test('explainReport: sync ops pass renders header + verified count', () => {
-    const r = measureOps(noop, { ops: 200, warmup: 40, stabilize: true });
-    const rep = checkOps(r, { maxBytesPerOp: 512 });
+    const rep = checkOps(opsResult(5.272), { maxBytesPerOp: 512 });
     const out = explainReport(rep);
     assert.match(out, /gc-gate:\s+PASS\s+--\s+ops/);
     assert.match(out, /verified/);
 });
 
 test('explainReport: sync ops fail names the rule and shows actual/limit/delta', () => {
-    const sink = [];
-    const leak = measureOps((i) => { sink.push(new Array(64).fill(i)); },
-        { ops: 200, warmup: 40, stabilize: true });
-    const rep = checkOps(leak, { maxBytesPerOp: 50 });
+    const rep = checkOps(opsResult(5000), { maxBytesPerOp: 50 });
     assert.equal(rep.verdict, 'fail');
     const out = explainReport(rep);
     assert.match(out, /gc-gate:\s+FAIL\s+--\s+ops/);
@@ -53,8 +87,7 @@ test('explainReport: source=none produces INCONCLUSIVE with a Cannot verify bloc
 });
 
 test('explainReport: frames pass includes Run block with source and stabilized flag', async () => {
-    const r = await measureFrames(noop, { frames: 60, warmup: 10, scheduler: fastSched });
-    const rep = checkFrames(r, { maxDroppedFrames: 30 });
+    const rep = checkFrames(framesResult(0), { maxDroppedFrames: 30 });
     const out = explainReport(rep);
     assert.match(out, /gc-gate:\s+PASS\s+--\s+frames/);
     assert.match(out, /Run:/);
@@ -65,8 +98,7 @@ test('explainReport: frames pass includes Run block with source and stabilized f
 });
 
 test('explainReport: ops-async pass includes stabilized:yes on --expose-gc', async () => {
-    const r = await measureOpsAsync(async (i) => i | 0, { ops: 100, warmup: 20 });
-    const rep = checkOpsAsync(r, { maxBytesPerOp: 512 });
+    const rep = checkOpsAsync(opsAsyncResult(6.4), { maxBytesPerOp: 512 });
     const out = explainReport(rep);
     assert.match(out, /gc-gate:\s+PASS\s+--\s+ops-async/);
     assert.match(out, /stabilized:\s+yes/);
@@ -153,16 +185,11 @@ test('explainReport: rejects an unknown schema value', () => {
 // -----------------------------------------------------------------------------
 
 test('explainDiff: names control + candidate verdicts and per-metric deltas', () => {
-    const clean = measureOps(noop, { ops: 200, warmup: 40, stabilize: true });
-    const cleanRep = checkOps(clean, { maxBytesPerOp: 1024 });
-    const sink = [];
-    const leaky = measureOps((i) => { sink.push(new Array(64).fill(i)); },
-        { ops: 200, warmup: 40, stabilize: true });
-    const leakyRep = checkOps(leaky, { maxBytesPerOp: 1024 });
+    const cleanRep = checkOps(opsResult(5.272), { maxBytesPerOp: 1024 });
+    const leakyRep = checkOps(opsResult(5000), { maxBytesPerOp: 1024 });
     const out = explainDiff(cleanRep, leakyRep);
     assert.match(out, /Control:\s+PASS/);
-    // leaky may pass or fail vs 1024 threshold; assert the verdict tag is one of them.
-    assert.match(out, /Candidate:\s+(PASS|FAIL|INCONCLUSIVE)/);
+    assert.match(out, /Candidate:\s+FAIL/);
 });
 
 test('explainDiff: kind mismatch is surfaced in the header, not thrown', () => {
@@ -242,4 +269,61 @@ test('gateBadge: unknown format throws RangeError', () => {
 test('gateBadge: rejects non-report inputs', () => {
     assert.throws(() => gateBadge(null), TypeError);
     assert.throws(() => gateBadge({}), TypeError);
+});
+
+// ---------------------------------------------------------------------------
+// Fixture conformance. The tests above trade a live measurement for a fixed
+// one so their verdicts are deterministic on every machine. That trade is only
+// safe while the fixtures still look like something the library actually
+// produces, so this pins them against a real run: if a lane gains, drops or
+// retypes a field, the fixtures are stale and this fails rather than the
+// narrator quietly being tested against a shape that no longer exists.
+// ---------------------------------------------------------------------------
+
+test('fixtures: opsResult matches the shape measureOps really returns', () => {
+    const real = measureOps(noop, { ops: 500, warmup: 50, stabilize: true });
+    const fixture = opsResult(5.272);
+    for (const key of Object.keys(fixture)) {
+        assert.ok(key in real, 'fixture carries "' + key + '" but a real ops result does not');
+        assert.equal(typeof fixture[key], typeof real[key],
+            'fixture "' + key + '" is ' + typeof fixture[key] + ', real is ' + typeof real[key]);
+    }
+    // and the real thing still gates through the same path
+    assert.ok(['pass', 'fail', 'inconclusive'].includes(checkOps(real, { maxBytesPerOp: 4096 }).verdict));
+});
+
+test('fixtures: framesResult matches the shape measureFrames really returns', async () => {
+    const real = await measureFrames(noop, { frames: 60, warmup: 10, scheduler: fastSched });
+    const fixture = framesResult(0);
+    for (const key of Object.keys(fixture)) {
+        assert.ok(key in real, 'fixture carries "' + key + '" but a real frames result does not');
+        assert.equal(typeof fixture[key], typeof real[key],
+            'fixture "' + key + '" is ' + typeof fixture[key] + ', real is ' + typeof real[key]);
+    }
+});
+
+test('fixtures: opsAsyncResult matches the shape measureOpsAsync really returns', async () => {
+    const real = await measureOpsAsync(async (i) => i | 0, { ops: 100, warmup: 20 });
+    const fixture = opsAsyncResult(6.4);
+    for (const key of Object.keys(fixture)) {
+        assert.ok(key in real, 'fixture carries "' + key + '" but a real ops-async result does not');
+        assert.equal(typeof fixture[key], typeof real[key],
+            'fixture "' + key + '" is ' + typeof fixture[key] + ', real is ' + typeof real[key]);
+    }
+});
+
+test('the narrator treats a live report exactly like a fixed one', () => {
+    // The end-to-end leg, asserting only what holds for ANY verdict -- this is
+    // the one test here allowed to touch a real measurement, and it is written
+    // so no machine's heap behaviour can decide whether it passes.
+    const real = measureOps(noop, { ops: 500, warmup: 50, stabilize: true });
+    const rep = checkOps(real, { maxBytesPerOp: 4096 });
+    const out = explainReport(rep, { color: false });
+    // A passing sync-ops report narrates minimally -- header plus the verified
+    // count, no Run block -- so anything beyond the header would be asserting
+    // on the verdict again, which is the trap this whole file just climbed out
+    // of. Header shape and the absence of placeholders is what is universal.
+    assert.match(out, /gc-gate:\s+(PASS|FAIL|INCONCLUSIVE)\s+--\s+ops/);
+    assert.ok(out.length > 0);
+    assert.ok(!/undefined|NaN/.test(out), 'live report narrated a placeholder:\n' + out);
 });

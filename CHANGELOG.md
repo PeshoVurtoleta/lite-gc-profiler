@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.9.1
+
+Support surface, and a test-suite fix. No API change, no behaviour change.
+
+### For people meeting the library for the first time
+
+`INCONCLUSIVE.md` promotes the cookbook's triage table to where a first-run
+`inconclusive` actually lands. Issue templates split false-pass from
+false-fail/inconclusive from docs, and the false-pass template asks for the
+report JSON, because that is the artifact worth having. `test/25-error-messages.test.mjs`
+pins the three errors a first run is most likely to hit -- missing
+`--expose-gc`, `source: 'none'`, and "already in flight" -- so they keep
+naming the offence and the fix rather than drifting into stack traces.
+
+### Test-suite fix: the evidence lane stopped gating on the host machine
+
+Three tests in `test/21-evidence.test.mjs` built their fixtures by running a
+live measurement and then asserting a specific verdict. The subject under test
+is the narrator -- `explainReport` / `explainDiff` are documented as pure
+formatters that never measure -- so the measurement was scaffolding, and it was
+the flakiest scaffolding available:
+
+- a noop over 200 ops exceeded a 1024 B/op control threshold, because V8's
+  fixed self-noise divided by only 200 ops is enormous, so `Control: PASS`
+  read `FAIL`;
+- a 64-slot array retained under 50 B/op on a machine with pointer
+  compression, where a tagged slot is half as wide, so a test asserting
+  `fail` got `pass`;
+- `measureOpsAsync` over 100 ops measured 713 B/op against a 512 limit --
+  the async lane's own promise machinery amortized over too few ops -- which
+  failed everywhere, not just on one machine.
+
+All three now gate the real `checkOps` / `checkOpsAsync` / `checkFrames`
+functions against fixed result objects, so the report shape stays authentic
+while the verdict stops depending on what the host heap happened to do. Two
+conformance tests pin the fixtures against live `measureOps` /
+`measureOpsAsync` results -- if a lane gains, drops or retypes a field the
+fixtures are stale and the suite says so, rather than testing the narrator
+against a shape that no longer exists. That guard immediately caught a fixture
+inventing `bytesPerOpStable` on the sync lane, which only the async and frames
+lanes report. One end-to-end test still narrates a real measurement, asserting
+only what holds for every verdict.
+
+Same precedent as the CLI baseline leg in v1.8.1: no test in this suite may
+gate on ambient noise unless noise is the thing under test. Suite: 702 -> 715.
+
 ## 1.9.0
 
 Batch 12: the two items carried from the original forward roadmap, closed
