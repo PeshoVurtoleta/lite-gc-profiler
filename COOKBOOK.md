@@ -13,7 +13,7 @@ Recipes are graded in four tiers:
 - **Working (6-14)** -- comparing against a control, locking a baseline,
   narrating failures, render loops, worker heaps, allocator hunts, and
   getting the result into a CI log a human will read.
-- **Pro (15-18)** -- what to do when a threshold that passes on your
+- **Pro (15-21)** -- what to do when a threshold that passes on your
   laptop fails on the runner, how to triage `inconclusive` instead of
   suppressing it, and how to gate when no absolute number is portable.
 
@@ -63,6 +63,9 @@ out of it if you have.
 16. [Pro: triaging inconclusive instead of suppressing it](#recipe-16-pro-triaging-inconclusive-instead-of-suppressing-it)
 17. [Pro: gating when no absolute number is portable](#recipe-17-pro-gating-when-no-absolute-number-is-portable)
 18. [Flaky workloads: gating across repetitions](#recipe-18-flaky-workloads----gating-across-repetitions)
+19. [Comparing two measured windows](#recipe-19-comparing-two-measured-windows)
+20. [What your source can and cannot verify](#recipe-20-what-your-source-can-and-cannot-verify)
+21. [Catching a leak the heap cannot see](#recipe-21-catching-a-leak-the-heap-cannot-see)
 
 **CLI**
 
@@ -600,6 +603,18 @@ npx lite-gc-gate run test/gc-window.mjs --reps 3 --baseline gc-baseline.json
 
 Where `test/gc-window.mjs` is a target script that runs your workload
 once (the CLI's `--reps` handles the repetition and aggregation).
+
+`checkAgainstBaseline(current, baseline, opts?)` is the same comparison
+without the throw -- it returns the report so you can narrate it, archive it,
+or decide for yourself. Reach for it when a baseline miss should annotate a PR
+rather than stop a build:
+
+```js
+import { checkAgainstBaseline, formatMarkdown } from '@zakkster/lite-gc-profiler';
+
+const report = checkAgainstBaseline(aggregateGc(summaries), baseline);
+if (report.verdict !== 'pass') fs.writeFileSync('gc-drift.md', formatMarkdown(report));
+```
 
 **Gotchas.**
 
@@ -1159,6 +1174,10 @@ that means nothing is worse than a red one.
 | `reason: 'no_comparable_metrics'` | the baseline and the current run share no metric | regenerate the baseline; it predates the metrics you are gating |
 | aggregate metric is `null` | some context omitted or broke that metric | find the context; a `measureOps` report legitimately has no GC rates |
 | metric is `NaN`/`Infinity` | the measurement itself broke | check for a mocked timer or a patched `process.memoryUsage` |
+| `uasm.belowGranularity: true` on `maxAllocRate` | the browser's memory readings are quantized coarser than the growth you asked about | measure a longer window, or gate a differential instead of an absolute rate (Recipe 17) |
+
+`INCONCLUSIVE.md` in the package root is this table with more room and worked
+examples; point a colleague there rather than re-explaining it.
 
 **Code.** The escape hatch exists, and it should be loud:
 
@@ -1277,6 +1296,238 @@ repetitions:
 - An odd repetition count makes `'median'` unambiguous.
 - `REP_POLICY_DEFAULTS` documents the shipped defaults; read it rather
   than guessing what an omitted policy does.
+
+---
+
+## Recipe 19: Comparing two measured windows
+
+**Goal.** The differential idea from Recipe 17, applied to the base window
+lane rather than to ops or frames -- "did this refactor make the whole
+startup sequence collect more?"
+
+**Primitive.** `compareGc` for the report, `assertCompare` to throw.
+
+**Code.**
+
+```js
+import { GcProfiler, compareGc, assertCompare, GC_DEFAULT_DIFFERENTIAL_RULES }
+    from '@zakkster/lite-gc-profiler';
+
+async function windowOf(work) {
+    const gc = new GcProfiler(256).start();
+    await work();
+    await gc.settle();
+    gc.stop();
+    return gc.summary();
+}
+
+const control   = await windowOf(oldStartup);
+const candidate = await windowOf(newStartup);
+
+const report = compareGc(control, candidate, { maxExtraMajor: 0, maxExtraPauseMs: 2 });
+// or, to throw on regression:
+assertCompare(control, candidate, GC_DEFAULT_DIFFERENTIAL_RULES, 'startup');
+```
+
+**Reading the verdict.** The report carries both sources, not just one:
+
+```js
+{
+    kind: 'compare', verdict: 'fail', ok: false,
+    violations: [ /* maxExtraMajor: candidate had 2 more major collections */ ],
+    checked: { maxExtraMajor: true },
+    source: 'gc', controlSource: 'gc', candidateSource: 'gc'
+}
+```
+
+`controlSource` and `candidateSource` are reported separately on purpose. If
+they differ the verdict is `inconclusive`, because a delta between two
+different measurement channels is not a delta at all. Check them before you
+believe a green result from a run that crossed machines or environments.
+
+**Gotchas.**
+
+- Measure the two windows in the same process, back to back, and never
+  concurrently -- they share one heap, and the whole reason a differential
+  ports across machines is that both halves paid the same floor.
+- `GC_DEFAULT_DIFFERENTIAL_RULES` is `{ maxExtraMajor: 0 }` -- a sensible
+  default meaning "no new major collections", and a good starting point
+  before you tune. Its absolute counterpart `GC_DEFAULT_RULES` is
+  `{ maxMajor: 0 }`.
+- The control should be the previous implementation, not an empty function.
+  Comparing real work against a noop measures the work.
+
+---
+
+## Recipe 20: What your source can and cannot verify
+
+**Goal.** Answer "why is this rule inconclusive?" structurally instead of by
+trial and error -- and know before you write a gate whether the environment
+you will run it in can enforce it.
+
+**Primitive.** `VERDICT_MATRIX`, the exported table the gate itself consults.
+
+**Code.**
+
+```js
+import { VERDICT_MATRIX } from '@zakkster/lite-gc-profiler';
+
+console.log(VERDICT_MATRIX.maxMajor);
+// { gc: 'yes', heap: 'no', uasm: 'no', none: 'no' }
+
+console.log(VERDICT_MATRIX.maxBytesPerOp);
+// { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' }
+```
+
+**Reading it.** Four sources, and every rule has a verdict for each:
+
+| Source | Where | What it sees |
+| --- | --- | --- |
+| `gc` | node | precise `perf_hooks` GC entries, plus the process heap |
+| `heap` | Chrome | `performance.memory` heap-drop heuristic -- no GC event stream |
+| `uasm` | Chrome, cross-origin isolated | `measureUserAgentSpecificMemory`, accurate but coarsely quantized |
+| `none` | anywhere else | frame anomalies only |
+
+And three answers:
+
+- `'yes'` -- this source can verify this rule outright.
+- `'no'` -- it cannot, ever. The rule returns `inconclusive`, never `pass`.
+- `'needsHeap'` / `'needsUasm'` / `'needsExternal'` -- it can, provided that
+  channel actually produced samples in your window. No samples, no verdict.
+
+This is why `maxMajor` is meaningless in a browser: only node has a real GC
+event stream. Counting collections in Chrome is not a thing the platform
+exposes, so the matrix says `no` rather than guessing from heap drops.
+
+**The uasm quantization floor (v1.9.0).** `uasm` is accurate but reports in
+buckets, and from v1.9.0 the library refuses to answer questions finer than
+the bucket. On `maxAllocRate` you will now see `inconclusive` in two cases
+that used to return a verdict:
+
+- **Every reading identical.** That looks like zero growth and used to pass.
+  It is equally consistent with real growth smaller than one quantum, so
+  passing was a claim the channel had not earned.
+- **Net movement within one bucket.** A flat workload straddling a boundary
+  reports one quantum of growth. That is quantization, not your code, and it
+  used to be a fabricated failure.
+
+The summary carries the evidence: `uasm.granularityBytes` is the smallest
+non-zero step actually observed in the window -- measured, never assumed,
+because the quantum is not contractual -- and `uasm.belowGranularity` is the
+flag that routed the rule to `inconclusive`. If you need a verdict on that
+lane, either measure long enough for real growth to clear a bucket, or gate a
+differential where the floor cancels (Recipe 17).
+
+**The GC kind constants.** `GC_MINOR` (1), `GC_MAJOR` (4), `GC_INCREMENTAL`
+(8) and `GC_WEAKCB` (16) are the bit values behind `summary.gc.minor` and
+friends. You need them only when injecting synthetic events into a profiler
+in your own tests:
+
+```js
+import { GcProfiler, GC_MAJOR } from '@zakkster/lite-gc-profiler';
+const gc = new GcProfiler(32);
+gc.record(GC_MAJOR, 5.0, performance.now());   // duration ms, start time
+```
+
+Minor collections are scavenges of the young generation and are cheap and
+constant in a healthy program; majors are stop-the-world and are what
+`maxMajor: 0` is really about. Gating minors to zero is almost always a
+mis-sized gate rather than a goal.
+
+**Gotchas.**
+
+- `VERSION` is exported, and pinning it in your own test is the cheapest way
+  to notice that a dependency bump changed the verdict semantics under you --
+  this package's own suite does exactly that.
+- The matrix is the gate's own table, not documentation about it, so it
+  cannot drift from behaviour. When a rule surprises you, print the row.
+- A rule your lane does not implement throws rather than being ignored.
+  `VERDICT_MATRIX` tells you which rules exist; the lane tells you which of
+  them it accepts.
+
+---
+
+## Recipe 21: Catching a leak the heap cannot see
+
+**Goal.** Gate `ArrayBuffer` and typed-array backing stores -- ring buffers,
+audio buffers, image data, WASM memory -- which do not live on the V8 heap and
+are therefore invisible to every heap-based rule in this package.
+
+**Why it exists.** Measured, on this build: forty retained `Float64Array`s of
+2 MB each.
+
+```
+heap.used delta            ~0.00 MB     <-- the V8 heap barely moves
+arrayBuffers.growthBytes   41.9 MB
+maxAllocRate gate          pass         <-- 80 MB leaked, gate green
+maxArrayBuffersGrowth      fail         <-- caught
+```
+
+A typed array's *wrapper* is on the heap and costs a couple of hundred bytes;
+its backing store is off-heap. So a ring buffer that gets re-allocated every
+frame instead of reused can bloat a process indefinitely while `bytesPerOp`
+and `maxAllocRate` stay clean. If your hot path uses pre-allocated typed
+arrays, this is the rule that verifies the "pre-allocated" part.
+
+**Primitive.** `maxArrayBuffersGrowth`, plus `GcProfiler.forceSettle()`.
+
+**Code.**
+
+```js
+import { GcProfiler, checkNoGc } from '@zakkster/lite-gc-profiler';
+
+const gc = new GcProfiler(256).start();
+
+gc.forceSettle();                                    // anchor
+let mu = process.memoryUsage();
+gc.sampleHeap(performance.now(), mu.heapUsed, mu);   // pass the WHOLE reading
+
+await runWorkload();
+
+gc.forceSettle();                                    // anchor
+mu = process.memoryUsage();
+gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+gc.stop();
+
+const report = checkNoGc(gc.summary(), { maxArrayBuffersGrowth: 8 * 1024 * 1024 });
+```
+
+Two things are load-bearing. `sampleHeap` needs the whole `memoryUsage()`
+object as its third argument -- omit it and the external channel reports
+`supported: false`, which correctly gates `inconclusive` rather than
+pretending zero growth. And `forceSettle()` must bracket the window, because
+backing stores allocated shortly before a collection are not reliably
+reclaimed by it.
+
+**Reading the verdict.**
+
+```js
+summary.arrayBuffers === {
+    supported: true, samples: 2, bytes: 42018283, peak: 42018283,
+    firstSample: 75243, growthBytes: 41943040,
+    settled: true          // forceSettle() bracketed this window
+}
+```
+
+`settled: false` routes `maxArrayBuffersGrowth` to `inconclusive`. That is the
+package refusing to gate on a number it measured but cannot stand behind:
+without the forced anchors an identical clean workload measured -0.20 MB on
+one run and +9.17 MB on the next, in separate processes.
+
+**Gotchas.**
+
+- **`maxExternalGrowth` does not exist as a gate, on purpose.** `summary.external`
+  is reported for diagnosis and rejects gating with an error explaining why:
+  `process.memoryUsage().external` reconciles lazily, so a window that
+  allocated and correctly *dropped* 12 MB of typed arrays still reported the
+  full 12 MB in the *following* window, while `arrayBuffers` correctly read
+  ~0. Gating that would fail clean code at full magnitude. Gate
+  `arrayBuffers`; read `external` when you are diagnosing.
+- Node only. The browser has no equivalent reading, so the matrix says `no`
+  for `heap` and `uasm` rather than guessing.
+- This is not leak detection. It tells you backing-store bytes grew across a
+  window; it does not tell you what retains them. `@zakkster/lite-leak` owns
+  that question.
 
 ---
 

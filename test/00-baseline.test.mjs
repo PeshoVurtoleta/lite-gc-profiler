@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as api from '../Gc.js';
 
-const EXPECTED_VERSION = '1.9.1';
+const EXPECTED_VERSION = '1.9.2';
 
 test('VERSION constant matches expected release version', () => {
     assert.equal(api.VERSION, EXPECTED_VERSION,

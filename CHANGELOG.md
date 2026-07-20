@@ -1,5 +1,81 @@
 # Changelog
 
+## 1.9.2
+
+Coverage patch. **Tests and documentation only -- no API change, no
+behaviour change, nothing to migrate.**
+
+Branch coverage on the two smallest shipped modules was the weakest point in
+the suite: both sat at 100% lines and neither had ever been called with an
+options object, so the entire options path was executed only in its default
+shape. Lines were green while the interesting half of each branch had never
+run.
+
+### What's new
+
+- `TestHelpers.js`: 58.8% -> **100% branches**. Six pins covering the option
+  lanes on both helpers -- an explicit `capacity` reaching the profiler, a
+  non-positive `capacity` falling back to 256 instead of throwing (a raw
+  `new GcProfiler(0)` is a `RangeError`, so the guard is load-bearing), the
+  `rules` option surviving the trip into `checkNoGc`, and a body that
+  sabotages `settle()` failing to take the harness down with it.
+
+- `Register.mjs`: 83.3% -> **100% branches**. The `process.exit()` lane with
+  no `LITE_GC_GATE_REPORT_PATH` set: with nowhere to write, the handler must
+  return before touching the filesystem. An unguarded write there would turn a
+  clean exit into a crash for anyone preloading the hook during development,
+  which the module header explicitly invites.
+
+- Suite total 711 -> 718. Aggregate branch coverage 87.8% -> 88.5%.
+
+### One torture pin repaired
+
+`test/torture/g25-6-report-sorts.test.mjs` asserted frame percentiles within
+5 ms of durations produced by a busy-wait spaced 3 ms apart. A requested burn
+is a floor, never a ceiling -- the scheduler adds delay the library cannot
+prevent -- and under the parallel file execution `node:test` uses, a 27 ms
+burn measured 33.5 ms and the pin failed on a correct implementation.
+
+A tolerance has to sit below half the spacing or it cannot tell one order
+statistic from its neighbour, so the fix is wider spacing rather than a looser
+bound: five frames 20 ms apart, 9 ms tolerance, roughly the same wall-clock
+cost. The pin now discriminates as strongly as before and survives load.
+
+### Cookbook: 53/53
+
+Two recipes close the last gaps in public-API coverage, which reaches
+**53 of 53 exports** from 42.
+
+- **Recipe 19 -- comparing two measured windows.** `compareGc` /
+  `assertCompare`, the differential applied to the base window lane rather
+  than to ops or frames. It is the only lane whose differential had no recipe.
+  Covers why `controlSource` and `candidateSource` are reported separately: a
+  delta between two different measurement channels is not a delta.
+- **Recipe 20 -- what your source can and cannot verify.** `VERDICT_MATRIX` is
+  the gate's own table, so printing the row for a surprising rule answers
+  "why is this inconclusive" structurally instead of by trial and error. This
+  is also where the v1.9.0 uasm quantization floor is finally documented for
+  users: on `maxAllocRate`, identical readings and sub-bucket movement both
+  now return `inconclusive`, with `granularityBytes` and `belowGranularity`
+  carrying the evidence.
+
+Recipe 7 gains `checkAgainstBaseline`, the non-throwing form, for when a
+baseline miss should annotate a PR rather than stop a build. Recipe 16's
+triage table gains the `belowGranularity` row and points at `INCONCLUSIVE.md`.
+Every code sample was executed against this build.
+
+### Test-suite fix carried forward
+
+The three evidence-lane tests that gated on the host machine in v1.9.1 --
+a noop over 200 ops exceeding a 1024 B/op control threshold, a 64-slot array
+retaining under 50 B/op where pointer compression halves a tagged slot, and
+`measureOpsAsync` over 100 ops measuring 713 B/op against a 512 limit -- were
+still present unchanged. They now gate the real `checkOps` / `checkOpsAsync` /
+`checkFrames` against fixed result objects, with two conformance tests pinning
+those fixtures against live results so they cannot drift, and one end-to-end
+test still narrating a real measurement while asserting only what holds for
+every verdict. Suite: 718 -> 722.
+
 ## 1.9.1
 
 Support surface, and a test-suite fix. No API change, no behaviour change.

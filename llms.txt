@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.9.1
+# @zakkster/lite-gc-profiler v1.9.2
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -64,6 +64,11 @@ test-helpers/explain and the lite-gc-gate CLI.
   and on `gateReps` (ANY blind rep makes the set unresolvable).
   `growthRate` stays the RAW net/time figure and is not zeroed under the
   flag: the rate is the measurement, the flag is whether it resolves.
+- `withGcGate` / `measureGc` accept `{ capacity, allowInconclusive, rules }`.
+  A non-positive `capacity` falls back to 256 rather than throwing (a raw
+  `new GcProfiler(0)` is a RangeError). Both helpers hand the live profiler to
+  the body, and both swallow a `settle()` failure so a broken cleanup cannot
+  replace the real verdict with an error from the harness.
 - Triage for the third verdict lives in `INCONCLUSIVE.md` (shipped).
   Reason codes: `source_mismatch`, `mixed_sources`, `fingerprint_mismatch`,
   `no_comparable_metrics`, `invalid_baseline`, `partial_report`,

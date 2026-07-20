@@ -265,3 +265,23 @@ test('Register: unwritable report path on the hard-exit lane surfaces the partia
     assert.equal(res.status, 0);
     assert.match(res.stderr, /failed to write partial report on exit/);
 });
+
+test('Register: process.exit with no report path stays silent and does not fail the target', () => {
+    // The exit-lane guard: with no LITE_GC_GATE_REPORT_PATH there is nowhere to
+    // write, so the handler must return before touching the filesystem. Cheap
+    // to get wrong -- an unguarded writeFileSync(undefined, ...) would throw
+    // inside a process.exit handler, turning a clean exit into a crash in
+    // anyone who preloads the register hook during development, which the
+    // module header explicitly invites.
+    const res = spawnSync(process.execPath, [
+        '--expose-gc',
+        '--import', 'data:text/javascript,import ' + JSON.stringify('file://' + REGISTER),
+        '-e', 'process.exit(0)'
+    ], {
+        encoding: 'utf8',
+        cwd: PKG_ROOT,
+        env: (() => { const e = Object.assign({}, process.env); delete e.LITE_GC_GATE_REPORT_PATH; return e; })()
+    });
+    assert.equal(res.status, 0, 'the target must exit cleanly');
+    assert.equal(res.stderr, '', 'nothing to write is not an error and must not be reported as one');
+});

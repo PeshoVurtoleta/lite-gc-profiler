@@ -1423,11 +1423,11 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 ## Testing
 
 ```
-npm test          # 711 tests
+npm test          # 722 tests
 npm run coverage  # the same suite, under the coverage law
 ```
 
-711 tests, all passing on this hardware.
+722 tests, all passing on this hardware.
 
 ### The coverage law
 
@@ -1442,6 +1442,14 @@ and **fails the process** below any of three floors:
 
 It is wired into `prepublishOnly`, so a release cannot go out under the
 floors.
+
+The floors are a ratchet, not a target. A file can sit at 100% lines and
+still hide untaken branches -- v1.9.1 shipped `TestHelpers.js` at 100% lines
+and 58.8% branches, because every existing test called the helpers without an
+options object, so the whole options path ran only in its default shape. That
+is the coverage failure worth caring about: not an unvisited line, but a
+visited line whose interesting side was never taken. Both helper modules are
+at 100% branches as of v1.9.2.
 
 Two exclusions matter. `test/**` is excluded because test code is
 near-100% executed by definition -- letting it into the aggregate means the
