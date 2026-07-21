@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.9.2
+# @zakkster/lite-gc-profiler v1.10.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -64,11 +64,18 @@ test-helpers/explain and the lite-gc-gate CLI.
   and on `gateReps` (ANY blind rep makes the set unresolvable).
   `growthRate` stays the RAW net/time figure and is not zeroed under the
   flag: the rate is the measurement, the flag is whether it resolves.
-- `withGcGate` / `measureGc` accept `{ capacity, allowInconclusive, rules }`.
-  A non-positive `capacity` falls back to 256 rather than throwing (a raw
-  `new GcProfiler(0)` is a RangeError). Both helpers hand the live profiler to
-  the body, and both swallow a `settle()` failure so a broken cleanup cannot
-  replace the real verdict with an error from the harness.
+- `maxArrayBuffersGrowth` (v1.10.0) gates net growth of ArrayBuffer backing
+  stores, which live OUTSIDE the V8 heap and are invisible to `maxAllocRate`
+  (measured blind spot: 152x). Node/`source:'gc'` only. Requires
+  `stabilize:'deep'` on measureOps, or `gc.forceSettle()` before each sample
+  on the manual path; otherwise `summary.arrayBuffers.settled` is false and
+  the rule is inconclusive. There is NO `maxExternalGrowth` -- passing it
+  throws; `summary.external` is diagnostic only because it reconciles lazily.
+- `summary.gc.foreignForced` (v1.10.0, node only) counts forced collections
+  the library did NOT cause. Non-zero means something else collected inside
+  the measured window and the numbers are polluted. Diagnostic; not gated.
+- Unknown rule keys throw on EVERY lane including `checkNoGc` as of v1.10.0
+  (before that, `checkNoGc` silently ignored them and returned `pass`).
 - Triage for the third verdict lives in `INCONCLUSIVE.md` (shipped).
   Reason codes: `source_mismatch`, `mixed_sources`, `fingerprint_mismatch`,
   `no_comparable_metrics`, `invalid_baseline`, `partial_report`,

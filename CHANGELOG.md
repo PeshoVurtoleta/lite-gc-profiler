@@ -1,5 +1,92 @@
 # Changelog
 
+## 1.10.0
+
+Batch 13: the external-memory channel (G25), a parity gate, and rule-key
+validation. One new gateable rule; nothing existing changes shape.
+
+### G25 -- ArrayBuffer and external memory
+
+Every memory reading in this package came from `heapUsed` or
+`usedJSHeapSize`. Typed-array backing stores do not live there: an
+`ArrayBuffer`'s wrapper costs a couple of hundred bytes on the V8 heap while
+its store sits outside it. So the signature data structure of a zero-GC
+codebase -- a pre-allocated `Float64Array` ring -- could be re-allocated every
+frame, bloat a process without limit, and pass every gate this package
+offered. Measured on this build: forty retained 2 MB `Float64Array`s move
+`heap.used` by ~0.00 MB and `arrayBuffers.growthBytes` by 41.9 MB. The
+alloc-rate gate reads `pass`; `maxArrayBuffersGrowth` reads `fail`.
+
+`summary.arrayBuffers` and `summary.external` fold into the same
+`process.memoryUsage()` call `sampleHeap` already pays for, so node costs
+nothing extra. `maxArrayBuffersGrowth` is gateable through a fourth matrix
+state, `needsExternal`, which requires the channel to be supported, to have
+at least two samples, and to be **settled**.
+
+`GcProfiler.forceSettle()` is that opt-in, and it forces two collections
+rather than one -- not superstition: with a single collection an identical
+clean workload measured -0.20 MB of growth on one run and +9.17 MB on the
+next, in separate processes, because stores allocated shortly before a
+collection are not reliably reclaimed by it. Without `forceSettle()` the
+channel reports `settled: false` and the rule routes to `inconclusive` rather
+than to a number that flaps.
+
+`maxExternalGrowth` is deliberately **not** gateable and says so in its own
+error rather than reporting an unknown rule. `process.memoryUsage().external`
+reconciles lazily: a window that allocated and correctly dropped ~12 MB of
+typed arrays still reported the full ~12 MB in the following window, while
+`arrayBuffers` correctly read ~0. Gating that would fail clean workloads at
+full magnitude. `summary.external` carries `gateable: false` and exists for
+diagnosis.
+
+Pinned by `test/torture/g26-5-external-memory.test.mjs` (16 scenarios).
+
+### Torture fix: a rate rule was a hardware detector
+
+`g26-5-external-memory` shared one rule set across five assertions, and it
+included `maxAllocRate: 200 MB/s`. That rule is `allocBytes * 1000 /
+elapsedMs`, and these windows are a few milliseconds long, so its denominator
+is really "how fast does this host run the loop". Measured on one box, the
+identical workload produced 31, 11 and 5 MB/s across three consecutive runs --
+windows of 3.9, 5.9 and 13.1 ms. On an M4 the same workload cleared 200 MB/s,
+the co-rule fired, and `[axis A] an unsettled window routes to inconclusive`
+got `fail` instead: a second violation had appeared that had nothing to do
+with the routing under test. Axis B's exactly-one-violation pin was one step
+behind it.
+
+The four routing assertions now gate only the rule whose routing they are
+about. Axis B keeps the co-rule, because its pin IS the conjunction -- exactly
+one rule fires and it is the external one -- but at a threshold no host can
+reach; the substantive claim, that `heapUsed` barely moves for a multi-MB
+backing-store leak, is measured directly in bytes by the sibling axis B test
+rather than inferred from a threshold. Verified by re-running the file with
+the co-rule threshold set to 1 byte/sec, which is an arbitrarily fast machine:
+the routing tests are unaffected.
+
+### Parity and rule-key gates
+
+`test/27-parity.test.mjs` (7 scenarios) checks the export surface against
+`Gc.d.ts`, `llms.txt` and the README, so docs drift fails the suite rather
+than shipping. `test/26-rule-key-validation.test.mjs` (7 scenarios) pins that
+every lane rejects rule keys it does not implement -- a silently-ignored rule
+makes a gate pass everything, which is the failure mode this package exists
+to prevent.
+
+### Cookbook
+
+Recipe 21 documents the external channel, with the measured blind-spot
+numbers, the `forceSettle()` requirement, and why `external` is read but never
+gated. Recipe 20's matrix table gains the `needsExternal` state. Coverage
+holds at **53 of 53 exports**. Every sample was executed against this build.
+
+### Carried forward
+
+The v1.9.2 evidence-lane fixtures and cookbook Recipes 19-20 were absent from
+this branch and are restored: three narrator tests were again gating on live
+measurements with absolute thresholds at 100-200 ops, which is how a
+string-formatting test comes to depend on the host machine's heap.
+Suite: 722 -> 745.
+
 ## 1.9.2
 
 Coverage patch. **Tests and documentation only -- no API change, no

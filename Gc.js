@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.9.2';
+const VERSION = '1.10.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -200,12 +200,34 @@ class GcProfiler {
 
         this._count = 0; this._sumMs = 0; this._maxMs = 0;
         this._minor = 0; this._major = 0; this._incremental = 0; this._weakcb = 0;
+        // v1.10.0 forced-GC provenance. `_forced` counts collections carrying
+        // node's FORCED flag; `_ownForced` counts the ones THIS library caused,
+        // incremented at each internal globalThis.gc() call. The reportable
+        // number is the difference -- see the summary block for why a raw
+        // forced count is close to useless.
+        this._forced = 0; this._ownForced = 0;
+        // G25: a sample is "settled" only if TWO forced collections preceded it.
+        // One is not enough -- measured on node 22, a single forced collection
+        // leaves recently-allocated ArrayBuffer backing stores unreclaimed
+        // often enough that a clean workload reports multi-megabyte growth on
+        // some runs and negative growth on others. A gate on a channel that
+        // flaky is not a gate.
+        this._settlesSinceSample = 0; this._extAllSettled = true;
 
         // heap sampling (browser, or explicit usedBytes elsewhere)
         this._heapActive = false;
         this._heapPrev = -1; this._heapPeak = 0; this._heapFirst = -1; this._heapSamples = 0;
         this._allocBytes = 0; this._gcDrops = 0; this._freedBytes = 0;
         this._tPrev = -1; this._elapsedMs = 0;
+
+        // G25 (v1.10.0): external / ArrayBuffer backing-store accounting.
+        // These live OUTSIDE the V8 heap, so heapUsed cannot see them: a
+        // retained 9.4 MB of Float64Array backing stores moves heapUsed by
+        // ~62 KB, a 152x blind spot in the one number maxAllocRate gates on.
+        // Fed from the same process.memoryUsage() object sampleHeap is already
+        // handed, so there is no extra syscall.
+        this._abPrev = -1; this._abPeak = 0; this._abFirst = -1; this._extSamples = 0;
+        this._extPrev = -1; this._extPeak = 0; this._extFirst = -1;
 
         // uasm sampling (G12). Populated by sampleUasm() calls; independent
         // of heap sampling -- both can run concurrently on a cross-origin-
@@ -335,7 +357,12 @@ class GcProfiler {
                 // Guard the object, not the expression: a null detail must fall through.
                 const d = e.detail;
                 const kind = (d && d.kind !== undefined) ? d.kind : e.kind;
-                self._record(kind, e.duration, e.startTime);
+                // v1.10.0: node tags a collection triggered by global.gc() with
+                // the FORCED flag (bit 2). Organic collections read 0 or
+                // SCHEDULE_IDLE. Verified on node 22: exactly one entry per
+                // global.gc() call, flags === 4.
+                const flags = (d && typeof d.flags === 'number') ? d.flags : 0;
+                self._record(kind, e.duration, e.startTime, flags);
             }
             self._batchCount++;
         });
@@ -350,8 +377,9 @@ class GcProfiler {
         return this;
     }
 
-    _record(kind, durationMs, startTime) {
+    _record(kind, durationMs, startTime, flags) {
         this._dur.push(durationMs);
+        if ((flags & _GC_FLAG_FORCED) !== 0) this._forced++;
         this._count++; this._sumMs += durationMs;
         if (durationMs > this._maxMs) this._maxMs = durationMs;
         if (kind === GC_MINOR) this._minor++;
@@ -607,8 +635,17 @@ class GcProfiler {
      *
      * @param {number} [now]        timestamp in ms; defaults to performance.now().
      * @param {number} [usedBytes]  explicit used-heap figure; overrides performance.memory.
+     * @param {object} [memUsage]   (v1.10.0) the process.memoryUsage() object this
+     *                              reading came from. Its `external` and
+     *                              `arrayBuffers` fields feed the G25 channel.
+     *                              Pass the SAME object you took heapUsed from:
+     *                                  const mu = process.memoryUsage();
+     *                                  gc.sampleHeap(now, mu.heapUsed, mu);
+     *                              Omitting it leaves the external channel
+     *                              unsampled, which reports as unsupported
+     *                              rather than as zero.
      */
-    sampleHeap(now, usedBytes) {
+    sampleHeap(now, usedBytes, memUsage) {
         let used = usedBytes;
         if (used === undefined) {
             if (!HEAP_SUPPORTED || !this._wantHeap) return this;
@@ -624,6 +661,12 @@ class GcProfiler {
         if (typeof used !== 'number' || !isFinite(used)) return this;
         const t = now === undefined ? (typeof performance !== 'undefined' ? performance.now() : 0) : now;
         this._heapActive = true;
+        // G25: fold the external channel HERE, above the first-sample early
+        // return. Doing it at the end of the method skipped sample one, which
+        // made every growth delta read 0 from a one-sample window -- a channel
+        // that reports "no growth" because it never looked. The two channels
+        // must advance in lockstep or their sample counts disagree.
+        this._sampleExternal(memUsage);
         if (this._heapFirst < 0) {
             this._heapFirst = used; this._heapPeak = used; this._heapPrev = used;
             this._tPrev = t; this._heapSamples = 1; return this;
@@ -636,6 +679,65 @@ class GcProfiler {
         if (used > this._heapPeak) this._heapPeak = used;
         this._heapPrev = used; this._tPrev = t; this._heapSamples++;
         return this;
+    }
+
+    /**
+     * G25 (v1.10.0): force the external channel to a settled state.
+     *
+     * Two collections, not one. The second is not superstition: with a single
+     * forced collection, an identical clean workload measured -0.20 MB of
+     * ArrayBuffer growth on one run and +9.17 MB on the next, in separate
+     * processes. Backing stores allocated shortly before the collection are
+     * not reliably reclaimed by it.
+     *
+     * The profiler counts its own forced collections, so calling this is what
+     * makes the NEXT external sample eligible to be gated. Without it,
+     * `summary.arrayBuffers.settled` is false and `maxArrayBuffersGrowth`
+     * routes to inconclusive rather than reporting a number that flaps.
+     *
+     * No-op without --expose-gc, which leaves samples unsettled -- correctly.
+     */
+    forceSettle() {
+        if (typeof globalThis.gc !== 'function') return this;
+        globalThis.gc(); this._ownForced++; this._settlesSinceSample++;
+        globalThis.gc(); this._ownForced++; this._settlesSinceSample++;
+        return this;
+    }
+
+    /**
+     * G25: fold one process.memoryUsage() reading into the external channel.
+     * Private -- it rides along with sampleHeap so the two channels can never
+     * disagree about how many samples a window contains.
+     *
+     * Both fields are validated independently. A runtime that reports one but
+     * not the other (or a mocked memoryUsage) must not poison the channel it
+     * did report, and a non-finite reading is dropped exactly as sampleHeap
+     * drops a bad heap reading: leaving _prev alone keeps the next delta
+     * measured against the last VALID value instead of against NaN.
+     */
+    _sampleExternal(memUsage) {
+        if (!memUsage || typeof memUsage !== 'object') return;
+        const ab = memUsage.arrayBuffers;
+        const ext = memUsage.external;
+        const abOk = typeof ab === 'number' && isFinite(ab);
+        const extOk = typeof ext === 'number' && isFinite(ext);
+        if (!abOk && !extOk) return;
+        // Every sample must be preceded by its own pair of forced collections.
+        // One settled sample and one unsettled one still yields an unsettled
+        // DELTA, so this folds with AND across the window.
+        if (this._settlesSinceSample < 2) this._extAllSettled = false;
+        this._settlesSinceSample = 0;
+        if (abOk) {
+            if (this._abFirst < 0) { this._abFirst = ab; this._abPeak = ab; }
+            else if (ab > this._abPeak) this._abPeak = ab;
+            this._abPrev = ab;
+        }
+        if (extOk) {
+            if (this._extFirst < 0) { this._extFirst = ext; this._extPeak = ext; }
+            else if (ext > this._extPeak) this._extPeak = ext;
+            this._extPrev = ext;
+        }
+        this._extSamples++;
     }
 
     /**
@@ -737,7 +839,30 @@ class GcProfiler {
                 avgMs: this._count ? this._sumMs / this._count : 0,
                 p99Ms: percentile(this._dur, this._scratch, 0.99),
                 minor: this._minor, major: this._major,
-                incremental: this._incremental, weakcb: this._weakcb
+                incremental: this._incremental, weakcb: this._weakcb,
+                // v1.10.0 forced-GC provenance (node only; 0 elsewhere).
+                //
+                // A raw `forced` count would be close to useless, because this
+                // library forces collections itself: measureOps(stabilize:true)
+                // produces two FORCED entries of its own, so a user reading
+                // `forced: 3` cannot tell which one was theirs. Attribution by
+                // time window does not help either -- a stray global.gc() DURING
+                // stabilize is indistinguishable from the anchor.
+                //
+                // So we report the difference. The library knows how many it
+                // forced, because it made the calls. A non-zero foreignForced
+                // means exactly one thing: SOMEONE ELSE COLLECTED INSIDE YOUR
+                // MEASURED WINDOW, and these numbers are polluted. That is
+                // actionable; "forced: 3" is not.
+                //
+                // Diagnostic only -- no rule gates on it. Clamped at zero
+                // because the 1:1 entry-per-call relationship is empirical
+                // (verified on node 22), not contractual: a build that emitted
+                // two entries per forced collection should read as "none
+                // foreign", never as a negative count.
+                forced: this._forced,
+                ownForced: this._ownForced,
+                foreignForced: this._forced > this._ownForced ? this._forced - this._ownForced : 0
             },
             heap: (HEAP_SUPPORTED || this._heapActive) ? {
                 supported: true,
@@ -786,6 +911,41 @@ class GcProfiler {
                 // No samples means nothing was resolved. Fail-closed by shape,
                 // though samples < 2 already blocks the gate on its own.
                 granularityBytes: null, belowGranularity: true
+            },
+            // G25 (v1.10.0). ArrayBuffer backing stores, measured outside the
+            // V8 heap. This is the gateable half of the external channel:
+            // prompt, precise, and it moves only when backing stores are
+            // actually retained.
+            arrayBuffers: this._extSamples > 0 && this._abFirst >= 0 ? {
+                supported: true,
+                bytes: this._abPrev,
+                peak: this._abPeak,
+                firstSample: this._abFirst,
+                samples: this._extSamples,
+                growthBytes: this._abPrev - this._abFirst,
+                // True only when every sample in this window was preceded by a
+                // pair of forced collections (see forceSettle). The gate reads
+                // this, not just the sample count: an unsettled growth figure
+                // is noise wearing a number's clothes.
+                settled: this._extSamples >= 2 && this._extAllSettled
+            } : {
+                supported: false, bytes: 0, peak: 0, firstSample: 0, samples: 0,
+                growthBytes: 0, settled: false
+            },
+            // The wider `external` figure: ArrayBuffers PLUS everything else
+            // V8 accounts for outside its heap. Reported, never gated -- see
+            // _UNGATED_RULES for the measurement that decided that.
+            external: this._extSamples > 0 && this._extFirst >= 0 ? {
+                supported: true,
+                bytes: this._extPrev,
+                peak: this._extPeak,
+                firstSample: this._extFirst,
+                samples: this._extSamples,
+                growthBytes: this._extPrev - this._extFirst,
+                gateable: false
+            } : {
+                supported: false, bytes: 0, peak: 0, firstSample: 0, samples: 0,
+                growthBytes: 0, gateable: false
             },
             frames: { count: this._frames, long: this._longFrames },
             // Per-phase gc stats. Empty object when no phase() calls happened.
@@ -883,6 +1043,11 @@ class GcProfiler {
         // the machine. Carrying it across a reset would let a resolved window
         // vouch for an unresolved one.
         this._uasmMinDelta = Infinity;
+        this._forced = 0; this._ownForced = 0;
+        this._settlesSinceSample = 0; this._extAllSettled = true;
+        // G25 accumulators are windowed for the same reason.
+        this._abPrev = -1; this._abPeak = 0; this._abFirst = -1; this._extSamples = 0;
+        this._extPrev = -1; this._extPeak = 0; this._extFirst = -1;
         // the frame anomaly heuristic is windowed too
         this._frames = 0; this._longFrames = 0; this._frameEwma = 0;
         // phase attribution is windowed as well: intern table drops so that a
@@ -927,6 +1092,10 @@ class GcProfiler {
 }
 
 // ---- budget gate ----
+// node's NODE_PERFORMANCE_GC_FLAGS_FORCED. A collection triggered by
+// global.gc() carries this bit; organic ones read 0 or SCHEDULE_IDLE (64).
+const _GC_FLAG_FORCED = 4;
+
 const GC_DEFAULT_RULES = { maxMajor: 0 };   // any full-heap GC in the window is a failure
 
 // Verifiability matrix: for each rule, whether the given source can answer it.
@@ -958,7 +1127,29 @@ const VERDICT_MATRIX = {
     maxMajorsPerKFrame:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxMinorsPerKFrame:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxPauseMsPerFrame:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
-    maxDroppedFrames:    { gc: 'yes',       heap: 'yes',       uasm: 'yes',       none: 'yes' }
+    maxDroppedFrames:    { gc: 'yes',       heap: 'yes',       uasm: 'yes',       none: 'yes' },
+    // G25 (v1.10.0). ArrayBuffer backing stores live outside the V8 heap, and
+    // process.memoryUsage() is the only channel that reports them. Chrome's
+    // performance.memory has no equivalent field, so 'heap' is 'no' rather
+    // than 'needsHeap'. 'uasm' is 'no' for a subtler reason:
+    // measureUserAgentSpecificMemory INCLUDES some external memory in its
+    // total but cannot separate it, so a uasm figure can neither confirm nor
+    // deny an ArrayBuffer budget. The matrix must not pretend otherwise.
+    maxArrayBuffersGrowth: { gc: 'needsExternal', heap: 'no', uasm: 'no', none: 'no' }
+};
+
+// G25: rules that were specified, measured, and deliberately NOT shipped as
+// gates. Keyed by name so the fail-closed unknown-rule error can explain
+// itself instead of just saying "unknown" to someone following the roadmap.
+const _UNGATED_RULES = {
+    maxExternalGrowth:
+        'process.memoryUsage().external reconciles lazily: after a window that '
+        + 'allocated and correctly DROPPED ~12 MB of typed arrays, the next '
+        + "window's external delta still reported the full ~12 MB, while "
+        + 'arrayBuffers correctly read ~0. Gating that would fail clean '
+        + 'workloads at full magnitude. summary.external is reported for '
+        + 'diagnosis; gate maxArrayBuffersGrowth instead, which is prompt and '
+        + 'precise for retained backing stores.'
 };
 
 function isCheckable(rule, source, summary) {
@@ -968,6 +1159,16 @@ function isCheckable(rule, source, summary) {
     if (state === 'yes') return true;
     if (state === 'no') return false;
     if (state === 'needsHeap') return summary.heap && summary.heap.samples >= 2;
+    // G25: two external samples are needed for a growth delta, exactly as two
+    // heap samples are needed for a rate. A run that never passed memoryUsage()
+    // to sampleHeap reports supported:false and lands here as unverifiable --
+    // which is the honest answer, not zero growth.
+    if (state === 'needsExternal') {
+        return !!summary.arrayBuffers
+            && summary.arrayBuffers.supported === true
+            && summary.arrayBuffers.samples >= 2
+            && summary.arrayBuffers.settled === true;
+    }
     if (state === 'needsUasm') {
         if (!summary.uasm || !(summary.uasm.samples >= 2)) return false;
         // H2 (v1.9.0): two samples are necessary but not sufficient on a
@@ -992,6 +1193,16 @@ function isCheckable(rule, source, summary) {
 // tell "the channel could not resolve it" apart from "you never sampled".
 // H2: fail-closed fold of belowGranularity across reps. A missing uasm block on
 // source='uasm' counts as unresolved -- absence of evidence is not evidence.
+// G25: did every rep sample the external channel? Fail-closed on absence.
+function _allRepsSampledExternal(summaries) {
+    if (!Array.isArray(summaries) || summaries.length === 0) return false;
+    for (let i = 0; i < summaries.length; i++) {
+        const ab = summaries[i] && summaries[i].arrayBuffers;
+        if (!ab || ab.supported !== true || !(ab.samples >= 2) || ab.settled !== true) return false;
+    }
+    return true;
+}
+
 function _anyRepBelowGranularity(source, summaries) {
     if (source !== 'uasm' || !Array.isArray(summaries)) return false;
     for (let i = 0; i < summaries.length; i++) {
@@ -1053,6 +1264,29 @@ function _evalRules(rules, gcStat, heapStat, summary, scope, checkFn, violations
         if (!ok) anyUnchecked = true;
         else if (gcStat.major > _mMajor) violations.push({ metric: prefix + 'major', limit: _mMajor, actual: gcStat.major, reason: (scope ? '[' + scope + '] ' : '') + gcStat.major + ' major GC(s) > ' + _mMajor });
     }
+    const _mAbGrowth = rules.maxArrayBuffersGrowth;
+    if (_mAbGrowth !== undefined) {
+        // Phase-scoped evaluation cannot answer this: external accounting is
+        // global, exactly as heap deltas are, so checkFn returns false at
+        // phase scope and the rule lands inconclusive there rather than
+        // borrowing the whole-window number and calling it a phase's.
+        const ok = checkFn('maxArrayBuffersGrowth', source, summary) && _isFiniteMetric(_mAbGrowth);
+        checked.maxArrayBuffersGrowth = ok;
+        if (!ok) anyUnchecked = true;
+        else {
+            const grown = summary.arrayBuffers.growthBytes;
+            if (grown > _mAbGrowth) {
+                violations.push({
+                    metric: (scope ? 'phases.' + scope + '.' : '') + 'arrayBuffers.growthBytes',
+                    limit: _mAbGrowth,
+                    actual: grown,
+                    reason: (scope ? '[' + scope + '] ' : '')
+                        + 'ArrayBuffer backing stores grew ' + grown + ' B > ' + _mAbGrowth + ' B'
+                        + ' (outside the JS heap: heapUsed and maxAllocRate cannot see this)'
+                });
+            }
+        }
+    }
     const _mMinor = rules.maxMinor;
     if (_mMinor !== undefined) {
         const ok = checkFn('maxMinor', source, summary) && _isFiniteMetric(_mMinor);
@@ -1113,8 +1347,68 @@ function _evalRules(rules, gcStat, heapStat, summary, scope, checkFn, violations
  * A phase rule referencing a phase that was never declared is inconclusive: the
  * gate cannot verify a claim about a phase that did not happen.
  */
+// Structural keys on a checkNoGc rules object that are containers, not rules.
+const _GC_STRUCTURAL_KEYS = { phases: true, perRegion: true };
+
+/**
+ * v1.10.0: reject unknown keys on the checkNoGc lane.
+ *
+ * The ops and frames lanes have rejected unknown rule keys since v1.5.1, and
+ * llms.txt has claimed the behaviour is universal. It was not: checkNoGc read
+ * only the property names it knew and ignored the rest, so
+ *
+ *     checkNoGc(summary, { maxMajors: 0 })      // note the plural typo
+ *
+ * returned verdict 'pass' with an EMPTY checked map -- a gate that verified
+ * nothing, reporting green, on the package's primary lane. Same class of bug
+ * as H2, found the same way: by writing the thing that would have caught it.
+ *
+ * Recursive, because a typo inside `phases: { warmup: {...} }` was equally
+ * silent.
+ */
+function _validateGcRuleKeys(fnName, rules, path) {
+    if (rules === null || rules === undefined || typeof rules !== 'object') return;
+    for (const key of Object.keys(rules)) {
+        if (rules[key] === undefined) continue;
+        if (_GC_STRUCTURAL_KEYS[key] && !path) {
+            const container = rules[key];
+            if (container && typeof container === 'object') {
+                for (const scope of Object.keys(container)) {
+                    _validateGcRuleKeys(fnName, container[scope], key + '.' + scope);
+                }
+            }
+            continue;
+        }
+        if (VERDICT_MATRIX[key]) continue;
+        const where = path ? ' (under ' + path + ')' : '';
+        if (_UNGATED_RULES[key]) {
+            throw new TypeError(
+                fnName + ': rule "' + key + '"' + where
+                + ' is measured but deliberately not gateable. ' + _UNGATED_RULES[key]
+            );
+        }
+        const known = Object.keys(VERDICT_MATRIX);
+        const lower = key.toLowerCase();
+        let hint = '';
+        for (let i = 0; i < known.length; i++) {
+            const k = known[i].toLowerCase();
+            if (k === lower || k === lower.replace(/s$/, '')
+                || k.replace(/[^a-z]/g, '') === lower.replace(/[^a-z]/g, '')) {
+                hint = ' Did you mean ' + known[i] + '?';
+                break;
+            }
+        }
+        throw new TypeError(
+            fnName + ': unknown rule "' + key + '"' + where + '.' + hint
+            + ' Known rules: ' + known.join(', ') + '.'
+            + ' Unknown keys are rejected because a silently-ignored rule makes the gate pass everything.'
+        );
+    }
+}
+
 function checkNoGc(summary, rules) {
     const r = rules === undefined ? GC_DEFAULT_RULES : rules;
+    _validateGcRuleKeys('checkNoGc', r, '');
     const source = summary.source;
     const violations = [];
     const checked = {};
@@ -1500,6 +1794,7 @@ function aggregateGc(summaries) {
     const gcMetrics = ['major', 'minor', 'incremental', 'weakcb', 'maxMs', 'totalMs', 'p99Ms', 'count'];
     const heapMetrics = ['allocRateBytesPerSec', 'allocBytes', 'gcDrops', 'samples'];
     const uasmMetrics = ['growthRate', 'bytes', 'peak', 'samples'];
+    const abMetrics = ['growthBytes', 'bytes', 'peak', 'samples'];
 
     const gc = {};
     for (const m of gcMetrics) gc[m] = _stats(_extract(summaries, 'gc.' + m));
@@ -1507,8 +1802,17 @@ function aggregateGc(summaries) {
     for (const m of heapMetrics) heap[m] = _stats(_extract(summaries, 'heap.' + m));
     const uasm = {};
     for (const m of uasmMetrics) uasm[m] = _stats(_extract(summaries, 'uasm.' + m));
+    // G25 (v1.10.0). Without this block, RULE_TO_STATS_PATH resolved
+    // agg.arrayBuffers to undefined and gateReps crashed on the first
+    // maxArrayBuffersGrowth rep gate -- a new rule that worked on the single
+    // lane and threw on the rep lane. Adding a rule means adding it to every
+    // lane that can be handed it.
+    const arrayBuffers = {};
+    for (const m of abMetrics) arrayBuffers[m] = _stats(_extract(summaries, 'arrayBuffers.' + m));
+    const external = {};
+    for (const m of abMetrics) external[m] = _stats(_extract(summaries, 'external.' + m));
 
-    return { reps, sources, gc, heap, uasm, perRep: summaries };
+    return { reps, sources, gc, heap, uasm, arrayBuffers, external, perRep: summaries };
 }
 
 // Given a rule (e.g. maxMajor), an aggregate, a policy, and the underlying
@@ -1542,7 +1846,8 @@ const RULE_TO_STATS_PATH = {
     maxMinor: ['gc', 'minor'],
     maxPauseMs: ['gc', 'maxMs'],
     maxTotalMs: ['gc', 'totalMs'],
-    maxAllocRate: ['heap', 'allocRateBytesPerSec']
+    maxAllocRate: ['heap', 'allocRateBytesPerSec'],
+    maxArrayBuffersGrowth: ['arrayBuffers', 'growthBytes']
 };
 
 /**
@@ -1596,6 +1901,14 @@ function gateReps(summaries, rules, options) {
     const heapProbe = {
         source,
         heap: { samples: agg.heap.samples.max },
+        // G25: reps can only gate ArrayBuffer growth if EVERY rep sampled the
+        // channel. min, not max -- one rep that never passed memoryUsage()
+        // contributes no evidence, and letting the sampled reps cover for it
+        // is the same dilution the null-is-not-zero rule refuses elsewhere.
+        arrayBuffers: (function () {
+            const ok = _allRepsSampledExternal(summaries);
+            return { supported: ok, samples: ok ? 2 : 0, settled: ok };
+        })(),
         // uasm samples also needed for source='uasm' verifiability check
         uasm: {
             samples: agg.uasm ? agg.uasm.samples.max : 0,
@@ -2192,7 +2505,14 @@ function measureOps(fn, opts) {
     // under --expose-gc. Throwing at measurement time (not construction)
     // keeps the guard on the CI path where it matters, and lets code that
     // never opts in stay portable to runtimes without --expose-gc.
-    const stabilize = opts.stabilize === true;
+    // v1.10.0: 'deep' means two forced collections per anchor instead of one,
+    // which is what the G25 external channel needs to be gateable. Opt-in:
+    // it changes bytesPerOp (measured: 25.9 -> 38.8 on a clean fixture,
+    // because a more thorough start-anchor lowers the baseline), and silently
+    // shifting a gated metric under existing thresholds is not a thing this
+    // package does.
+    const stabilizeDeep = opts.stabilize === 'deep';
+    const stabilize = opts.stabilize === true || stabilizeDeep;
     if (stabilize && typeof globalThis.gc !== 'function') {
         throw new RangeError(
             'measureOps: opts.stabilize:true requires node --expose-gc ' +
@@ -2217,11 +2537,18 @@ function measureOps(fn, opts) {
     const isNode = typeof process !== 'undefined' && process.memoryUsage;
     const canSampleMemory = source !== 'none';
     function sampleBoundary() {
+        // Deep mode settles before EVERY boundary, including the warmup one.
+        // A growth delta is only settled if both ends are, and the first
+        // sample is one of the ends.
+        if (stabilizeDeep) gc.forceSettle();
         const t = typeof performance !== 'undefined' ? performance.now() : 0;
         if (!canSampleMemory) return { t, used: -1 };
         if (isNode) {
-            const used = process.memoryUsage().heapUsed;
-            gc.sampleHeap(t, used);
+            // G25: one memoryUsage() call, both channels. The object is already
+            // allocated by node; reading two more fields off it costs nothing.
+            const mu = process.memoryUsage();
+            const used = mu.heapUsed;
+            gc.sampleHeap(t, used, mu);
             return { t, used };
         }
         gc.sampleHeap(t);
@@ -2250,7 +2577,7 @@ function measureOps(fn, opts) {
         // 'steady' clean for gate rules.
         if (stabilize) {
             gc.phase('stabilize');
-            globalThis.gc();
+            globalThis.gc(); gc._ownForced++; gc._settlesSinceSample++;
         }
 
         // STEADY phase -- what gets gated.
@@ -2267,7 +2594,7 @@ function measureOps(fn, opts) {
         // emit GC events but the phase boundary keeps the shape consistent).
         if (stabilize) {
             gc.phase('stabilize');
-            globalThis.gc();
+            globalThis.gc(); gc._ownForced++; gc._settlesSinceSample++;
             gc.phase('steady');
         }
 
@@ -2401,6 +2728,15 @@ function _validateRules(fnName, rules, knownRules) {
     for (const key of Object.keys(rules)) {
         if (rules[key] === undefined) continue;          // explicit undefined == rule omitted
         if (knownRules.indexOf(key) === -1) {
+            // A rule we measured and deliberately did not ship gets its reason,
+            // not a bare "unknown". Someone reaching for it read a roadmap or a
+            // changelog and deserves the finding rather than a shrug.
+            if (_UNGATED_RULES[key]) {
+                throw new TypeError(
+                    fnName + ': rule "' + key + '" is measured but deliberately not gateable. '
+                    + _UNGATED_RULES[key]
+                );
+            }
             // Suggest the intended rule when the key looks like a casing/plural slip.
             const lower = key.toLowerCase();
             let hint = '';
@@ -2927,6 +3263,15 @@ function measureFrames(fn, opts) {
     // stabilize:false opts out and falls back to the slope estimate, which is
     // flagged bytesPerFrameStable:false in the result.
     const hasForceableGc = typeof globalThis.gc === 'function';
+    if (opts.stabilize === 'deep') {
+        throw new RangeError(
+            "measureFrames: opts.stabilize:'deep' is measureOps-only in v1.10.0. "
+            + 'Rejected rather than downgraded to plain stabilize, because a '
+            + 'silently weaker anchor would make maxArrayBuffersGrowth read '
+            + 'unsettled numbers. Use measureOps for external-memory gating, '
+            + 'or drive GcProfiler directly and call forceSettle() yourself.'
+        );
+    }
     if (opts.stabilize === true && !hasForceableGc) {
         return Promise.reject(new RangeError(
             'measureFrames: opts.stabilize:true requires node --expose-gc ' +
@@ -3002,7 +3347,7 @@ function measureFrames(fn, opts) {
                 // out before the retained-bytes baseline is read.
                 if (stabilize) {
                     gc.phase('stabilize');
-                    globalThis.gc();
+                    globalThis.gc(); gc._ownForced++; gc._settlesSinceSample++;
                 }
                 gc.phase('steady');
                 inSteady = true;
@@ -3087,7 +3432,7 @@ function measureFrames(fn, opts) {
             if (canSampleMemory) {
                 if (stabilize && isNode && heapSampleCount >= 1) {
                     gc.phase('stabilize');
-                    globalThis.gc();
+                    globalThis.gc(); gc._ownForced++; gc._settlesSinceSample++;
                     const liveEnd = process.memoryUsage().heapUsed;
                     const liveStart = heapSamples[0];
                     const bpf = (liveEnd - liveStart) / frames;
@@ -3388,6 +3733,15 @@ async function measureOpsAsync(fn, opts) {
     // GC is available (node --expose-gc); explicit true throws if unavailable
     // rather than silently downgrading.
     const hasForceableGc = typeof globalThis.gc === 'function';
+    if (opts.stabilize === 'deep') {
+        throw new RangeError(
+            "measureOpsAsync: opts.stabilize:'deep' is measureOps-only in v1.10.0. "
+            + 'Rejected rather than downgraded to plain stabilize, because a '
+            + 'silently weaker anchor would make maxArrayBuffersGrowth read '
+            + 'unsettled numbers. Use measureOps for external-memory gating, '
+            + 'or drive GcProfiler directly and call forceSettle() yourself.'
+        );
+    }
     if (opts.stabilize === true && !hasForceableGc) {
         throw new RangeError(
             'measureOpsAsync: opts.stabilize:true requires node --expose-gc ' +
@@ -3425,7 +3779,7 @@ async function measureOpsAsync(fn, opts) {
         // kind rules (majors/minors/pause) stay clean.
         if (stabilize && canSampleMemory && isNode) {
             gc.phase('stabilize');
-            globalThis.gc();
+            globalThis.gc(); gc._ownForced++; gc._settlesSinceSample++;
             liveStart = process.memoryUsage().heapUsed;
         } else if (canSampleMemory && isNode) {
             rawStartUsed = process.memoryUsage().heapUsed;
@@ -3466,7 +3820,7 @@ async function measureOpsAsync(fn, opts) {
         if (canSampleMemory && isNode) {
             if (stabilize && liveStart >= 0) {
                 gc.phase('stabilize');
-                globalThis.gc();
+                globalThis.gc(); gc._ownForced++; gc._settlesSinceSample++;
                 const liveEnd = process.memoryUsage().heapUsed;
                 const bpo = (liveEnd - liveStart) / ops;
                 bytesPerOp = bpo > 0 ? bpo : 0;

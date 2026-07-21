@@ -22,6 +22,9 @@ So: find your line in the table, apply the fix, and keep the gate honest.
 | `checked: { maxAllocRate: false }`, `source: 'gc'` or `'heap'` | fewer than two heap samples, so there is no delta to compute a rate from | call `sampleHeap()` at least twice, or use `measureOps` / `measureFrames`, which sample for you |
 | `checked: { maxMajor: false }`, `source: 'heap'` or `'uasm'` | event-kind rules need real GC events; Chrome exposes bytes, not kinds | gate `maxAllocRate` instead, or run the same gate in node where kinds exist |
 | `reason: 'uasm_below_granularity'` | the `uasm` channel could not resolve growth above its own quantum | sample more times or over a longer window; if it still cannot, gate `source: 'heap'` — see below |
+| `checked: { maxArrayBuffersGrowth: false }`, `settled: false` | the window was not anchored by two forced collections, so the growth figure is not trustworthy | use `stabilize: 'deep'` on `measureOps`, or call `gc.forceSettle()` before each `sampleHeap` on the manual path |
+| `checked: { maxArrayBuffersGrowth: false }`, `supported: false` | `process.memoryUsage()` was never passed to `sampleHeap` | pass it as the third argument: `gc.sampleHeap(t, mu.heapUsed, mu)` |
+| `checked: { maxArrayBuffersGrowth: false }`, `source` is not `'gc'` | only node reports external memory | run the external gate under node; Chrome and uasm cannot answer it |
 | `reason: 'source_mismatch'` | `compareGc` got a control and candidate measured on different sources | measure both sides the same way; a node control cannot certify a browser candidate |
 | `reason: 'mixed_sources'` | `gateReps` got reps that do not share one source | run all reps in one runtime |
 | `reason: 'fingerprint_mismatch'` | the baseline was captured on a different machine or runtime | re-capture the baseline here, or gate ratios instead of absolutes (COOKBOOK Recipe 17) |

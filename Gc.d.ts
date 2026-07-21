@@ -1,4 +1,11 @@
-export const VERSION: '1.9.2';
+/** Shape of node's process.memoryUsage() return value (structural). */
+export interface NodeMemoryUsageLike {
+    heapUsed?: number;
+    external?: number;
+    arrayBuffers?: number;
+}
+
+export const VERSION: '1.10.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -29,6 +36,16 @@ export interface GcStat {
     incremental: number;
     /** Weak-callback processing events. */
     weakcb: number;
+    /** v1.10.0: collections carrying node's FORCED flag. 0 off node. */
+    forced?: number;
+    /** v1.10.0: forced collections THIS library caused (its own anchors). */
+    ownForced?: number;
+    /**
+     * v1.10.0: `forced - ownForced`, clamped at 0. Non-zero means something
+     * outside the library collected inside your measured window, so the
+     * numbers are polluted. Diagnostic; no rule gates on it.
+     */
+    foreignForced?: number;
 }
 
 export interface HeapStat {
@@ -124,6 +141,32 @@ export interface UasmStat {
     belowGranularity: boolean;
 }
 
+/** G25 (v1.10.0): ArrayBuffer backing-store accounting, measured outside the V8 heap. */
+export interface GcArrayBuffersStats {
+    supported: boolean;
+    bytes: number;
+    peak: number;
+    firstSample: number;
+    samples: number;
+    /** Net growth across the window (last - first). Can be negative. */
+    growthBytes: number;
+    /**
+     * True only when every sample was preceded by two forced collections.
+     * `maxArrayBuffersGrowth` is inconclusive unless this is true -- one
+     * collection does not reliably reclaim recently-allocated backing stores.
+     */
+    settled: boolean;
+}
+
+/**
+ * The wider external figure. Reported for diagnosis, never gated: it
+ * reconciles lazily and can carry a previous window's transients at full
+ * magnitude. Gate `arrayBuffers` instead.
+ */
+export interface GcExternalStats extends Omit<GcArrayBuffersStats, 'settled'> {
+    gateable: false;
+}
+
 export interface GcSummary {
     schema: 'lite-gc/1';
     /**
@@ -135,6 +178,10 @@ export interface GcSummary {
     gc: GcStat;
     heap: HeapStat;
     uasm: UasmStat;
+    /** G25 (v1.10.0). Gateable via maxArrayBuffersGrowth on source 'gc'. */
+    arrayBuffers: GcArrayBuffersStats;
+    /** G25 (v1.10.0). Diagnostic only -- see GcExternalStats. */
+    external: GcExternalStats;
     frames: { count: number; long: number };
     /**
      * Per-phase snapshots. Empty object when no phase() calls happened. A phase
@@ -288,7 +335,14 @@ export class GcProfiler {
      * Elsewhere pass a figure explicitly, e.g. process.memoryUsage().heapUsed.
      * Zero-allocation; a no-op if neither a figure nor performance.memory is available.
      */
-    sampleHeap(now?: number, usedBytes?: number): this;
+    sampleHeap(now?: number, usedBytes?: number, memUsage?: NodeMemoryUsageLike): this;
+
+    /**
+     * v1.10.0: two forced collections, marking the next external sample as
+     * settled. Required before samples that `maxArrayBuffersGrowth` will gate.
+     * No-op without --expose-gc, which leaves samples unsettled.
+     */
+    forceSettle(): this;
 
     /**
      * Take a UASM measurement via performance.measureUserAgentSpecificMemory().
@@ -328,6 +382,18 @@ export interface GcRulesBase {
     maxTotalMs?: number;
     /** Max allowed allocation rate (bytes/sec), from the heap path. */
     maxAllocRate?: number;
+    /**
+     * v1.10.0 (G25): max net growth in ArrayBuffer backing stores, in bytes,
+     * across the measured window. Catches retained typed-array storage, which
+     * lives outside the V8 heap and is invisible to maxAllocRate.
+     *
+     * Node only (`source: 'gc'`), and inconclusive unless the window is
+     * settled -- see GcArrayBuffersStats.settled.
+     *
+     * There is deliberately no `maxExternalGrowth`: passing one throws, with
+     * the measurement that disqualified it.
+     */
+    maxArrayBuffersGrowth?: number;
 }
 
 export type GcRuleName = keyof GcRulesBase;
@@ -715,7 +781,13 @@ export interface MeasureOpsOptions {
      * Adds a `stabilize` phase to the summary shape. Recommended for
      * cold-CI zero-alloc gates; see README for guidance. Default false.
      */
-    stabilize?: boolean;
+    /**
+     * true  -- one forced collection per anchor.
+     * 'deep' -- two per anchor (v1.10.0). Required for maxArrayBuffersGrowth;
+     *           changes bytesPerOp, so it is opt-in. measureOps only; the
+     *           frames and async lanes reject it rather than downgrade.
+     */
+    stabilize?: boolean | 'deep';
     /** For assert*Ops only: skip throw on inconclusive. */
     allowInconclusive?: boolean;
 }

@@ -93,28 +93,15 @@ async function runFrames(targets) {
 
 // A well-separated multiset: 3ms apart, so ordinary scheduler noise cannot
 // reorder adjacent entries and the order statistics are known in advance.
-// v1.9.2: the spacing here is load-bearing and was too tight.
-//
-// These frames are produced by a busy-wait, so a requested duration is a FLOOR,
-// never a ceiling -- the scheduler can add arbitrary delay on top and nothing
-// in this library can prevent it. The original fixture used 3 ms spacing with a
-// 5 ms tolerance, which is only sound while overshoot stays under 1.5 ms. Under
-// the parallel file execution node:test uses, a 27 ms burn was measured at
-// 33.5 ms and the pin failed on a correct implementation.
-//
-// A tolerance must sit below HALF the spacing or it cannot tell one order
-// statistic from its neighbour, so the fix is wider spacing rather than a
-// looser bound: 20 ms apart, 9 ms tolerance. Five frames instead of ten keeps
-// the wall-clock cost about the same.
-const SPREAD = [0, 20, 40, 60, 80];
+const SPREAD = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27];
 // A fixed permutation of SPREAD. Fixed, not random: a torture pin that fails
 // one run in fifty is a pin nobody trusts.
-const SHUFFLED = [60, 0, 80, 20, 40];
+const SHUFFLED = [15, 0, 27, 9, 3, 24, 6, 21, 12, 18];
 
-// Nearest-rank over 5 entries, matching _framePercentiles' index arithmetic:
-// p50 -> idx 2 (=40ms), p95 -> idx 4 (=80ms), p99 -> idx 4, max -> idx 4.
-const EXPECT = { p50: 40, p95: 80, p99: 80, max: 80 };
-const TOL_MS = 9;
+// Nearest-rank over 10 entries, matching _framePercentiles' index arithmetic:
+// p50 -> idx 5 (=15ms), p95 -> idx 9 (=27ms), p99 -> idx 9, max -> idx 9.
+const EXPECT = { p50: 15, p95: 27, p99: 27, max: 27 };
+const TOL_MS = 5;
 
 function assertNear(actual, expected, label) {
     assert.ok(Math.abs(actual - expected) <= TOL_MS,

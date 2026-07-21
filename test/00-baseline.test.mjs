@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as api from '../Gc.js';
 
-const EXPECTED_VERSION = '1.9.2';
+const EXPECTED_VERSION = '1.10.0';
 
 test('VERSION constant matches expected release version', () => {
     assert.equal(api.VERSION, EXPECTED_VERSION,
@@ -51,8 +51,14 @@ test('GcProfiler instantiates and exposes the expected surface', () => {
 });
 
 test('VERDICT_MATRIX is a plain data table (no functions, no undefined cells)', () => {
-    const sources = ['gc', 'heap', 'none'];
-    const states = ['yes', 'no', 'needsHeap'];
+    // All four source columns, not three: the 'uasm' column went unchecked
+    // from v1.2.0 to v1.10.0, so a malformed cell there would not have been
+    // caught here. Every state isCheckable() implements must appear in this
+    // list, and vice versa -- a state in the table that isCheckable does not
+    // handle falls through to `return false`, silently making a gateable rule
+    // permanently inconclusive.
+    const sources = ['gc', 'heap', 'uasm', 'none'];
+    const states = ['yes', 'no', 'needsHeap', 'needsUasm', 'needsExternal'];
     for (const rule in api.VERDICT_MATRIX) {
         const row = api.VERDICT_MATRIX[rule];
         for (const src of sources) {

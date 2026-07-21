@@ -1,6 +1,6 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 278 torture scenarios shipped across v1.1.0 through v1.9.2
+**Status:** 294 torture scenarios shipped across v1.1.0 through v1.10.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
@@ -458,9 +458,28 @@ public path can put a NaN into either buffer today, so the guarantee rests on
 the predicate's shape. If a lane ever admits caller-supplied durations, that
 is the first test to write.
 
-**Total shipped: 278 torture scenarios + 3 global invariants + 3 CLI
-integration scenarios (G16.5).** Full suite: 722 tests, under a publish-gated
+**Total shipped: 294 torture scenarios + 3 global invariants + 3 CLI
+integration scenarios (G16.5).** Full suite: 745 tests, under a publish-gated
 coverage law (lines 95 / funcs 95 / branches 85, shipped files only).
+
+**G26.5 (v1.10.0) -- external memory + forced-GC provenance.** 16 scenarios
+across axes A-D. Pins the 152x blind spot (a 9.4 MB backing-store leak moves
+`heapUsed` by 62 KB), the settle protocol that makes the channel gateable
+(a single forced collection produced -0.20 MB and +9.17 MB growth on the same
+clean fixture in separate processes), the refusal to gate `external` at all,
+and the rejection -- not downgrade -- of `stabilize:'deep'` on the lanes that
+cannot honour it.
+
+Plus 7 scenarios in `test/26-rule-key-validation.test.mjs` for the fail-open
+closed in v1.10.0: `checkNoGc` silently ignored unknown rule keys and returned
+`pass` with an empty `checked` map, including keys nested under `phases` and
+`perRegion`.
+
+Plus 7 in `test/27-parity.test.mjs`, which makes the export/docs contract
+executable: runtime exports vs `.d.ts` in both directions, every gateable rule
+present in the README, every inconclusive reason code present in
+INCONCLUSIVE.md, no doc linking to a file outside `files[]`, and version
+lockstep across every surface that states it.
 
 Torture count is unchanged at v1.9.1: that release adds 9 support-surface
 tests (`test/25-error-messages.test.mjs`) which pin what error messages must

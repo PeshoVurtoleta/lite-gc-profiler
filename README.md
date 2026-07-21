@@ -82,6 +82,43 @@ console.log(gateBadge(checkOps(result, { maxBytesPerOp: 1 })));
 `gateBadge(report, { format: 'shields-json' })` emits a shields.io endpoint
 payload, and `{ format: 'svg' }` a self-contained badge you can commit.
 
+### Memory the heap gate cannot see (v1.10.0)
+
+`maxAllocRate` gates `heapUsed`. ArrayBuffer backing stores do not live there
+-- they live outside the V8 heap, and `heapUsed` barely moves when they leak.
+Measured on node 22: **300 retained `Float64Array(4096)` is 9.4 MB of backing
+store and shifts `heapUsed` by 62 KB. A 152x blind spot.** If your hot path
+owns a preallocated typed-array ring, that is the shape of leak your gate has
+been unable to see.
+
+```js
+import { measureOps, checkNoGc } from '@zakkster/lite-gc-profiler';
+
+const result = measureOps(pushFrame, { ops: 300, warmup: 50, stabilize: 'deep' });
+checkNoGc(result.summary, {
+    maxAllocRate: 50 * 1024 * 1024,
+    maxArrayBuffersGrowth: 1024 * 1024      // net growth in backing stores
+});
+```
+
+Two things to know:
+
+- **`stabilize: 'deep'` is required.** One forced collection does not reliably
+  reclaim recently-allocated backing stores: the same clean fixture measured
+  -0.20 MB growth on one run and +9.17 MB on the next. Deep mode collects
+  twice per anchor, which makes the channel deterministic. Without it,
+  `summary.arrayBuffers.settled` is false and the rule reports **inconclusive**
+  rather than a number that flaps. Deep mode changes `bytesPerOp`, which is why
+  it is opt-in rather than the default.
+- **Node only.** Chrome's `performance.memory` has no external field, and
+  `measureUserAgentSpecificMemory` folds external memory into a total it cannot
+  decompose. On those sources the rule is inconclusive, never `pass`.
+
+`summary.external` carries the wider figure for diagnosis but is **not
+gateable**: it reconciles lazily, and after a window that allocated and
+correctly dropped ~12 MB of typed arrays the next window still reported the
+full ~12 MB. Passing `maxExternalGrowth` throws, and names that measurement.
+
 <!-- GCFORGE F1 SLOT: when the phase-timeline view exists, one screenshot goes
      here. Per ROADMAP-GCFORGE F1 exit criteria and FINAL roadmap section 4 --
      it explains the library faster than the next three paragraphs do. Nothing
@@ -1423,11 +1460,11 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 ## Testing
 
 ```
-npm test          # 722 tests
+npm test          # 745 tests
 npm run coverage  # the same suite, under the coverage law
 ```
 
-722 tests, all passing on this hardware.
+745 tests, all passing on this hardware.
 
 ### The coverage law
 
@@ -1442,14 +1479,6 @@ and **fails the process** below any of three floors:
 
 It is wired into `prepublishOnly`, so a release cannot go out under the
 floors.
-
-The floors are a ratchet, not a target. A file can sit at 100% lines and
-still hide untaken branches -- v1.9.1 shipped `TestHelpers.js` at 100% lines
-and 58.8% branches, because every existing test called the helpers without an
-options object, so the whole options path ran only in its default shape. That
-is the coverage failure worth caring about: not an unvisited line, but a
-visited line whose interesting side was never taken. Both helper modules are
-at 100% branches as of v1.9.2.
 
 Two exclusions matter. `test/**` is excluded because test code is
 near-100% executed by definition -- letting it into the aggregate means the
@@ -1466,7 +1495,7 @@ target to chase.
 
 ### Torture
 
-Torture tests (278 scenarios
+Torture tests (294 scenarios
 across axes A-W) enforce that adversarial inputs never silently pass, that
 real signal in noise always fails, that clean signal under hostile
 conditions always passes, and that self-consistency invariants hold across

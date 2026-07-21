@@ -1,5 +1,60 @@
 # Migration notes
 
+## v1.10.0
+
+Additive, with **one behaviour change** worth reading before you upgrade.
+
+### Breaking-ish: unknown rule keys now throw on `checkNoGc`
+
+Before v1.10.0, `checkNoGc` silently ignored rule keys it did not recognise:
+
+```js
+checkNoGc(summary, { maxMajors: 0 });     // plural typo
+// -> { verdict: 'pass', checked: {} }    // verified NOTHING, reported green
+```
+
+The ops and frames lanes have rejected unknown keys since v1.5.1; the primary
+lane never did, and `llms.txt` documented the behaviour as universal. It now
+is, including keys nested under `phases` and `perRegion`.
+
+**If you upgrade and start seeing `TypeError: checkNoGc: unknown rule "..."`,
+that gate was not gating.** The error names the closest real rule.
+
+### New: gating memory the heap channel cannot see (G25)
+
+`maxArrayBuffersGrowth` gates net growth of ArrayBuffer backing stores. See
+the README section; the short version is that it needs `stabilize: 'deep'`
+(or `forceSettle()`), it is node-only, and it is inconclusive rather than
+`pass` wherever it cannot verify.
+
+`summary` gains `arrayBuffers` and `external` blocks. Both are always present,
+so consumers reading the envelope by shape are unaffected.
+
+There is deliberately **no `maxExternalGrowth`**; passing one throws with the
+measurement that disqualified it.
+
+### New: `stabilize: 'deep'`
+
+Two forced collections per anchor instead of one. **This changes
+`bytesPerOp`** (measured: 25.9 -> 38.8 on a clean fixture, because a more
+thorough start anchor lowers the baseline), which is exactly why it is opt-in
+and why plain `stabilize: true` is untouched. Existing thresholds keep their
+meaning unless you opt in.
+
+`measureFrames` and `measureOpsAsync` reject `'deep'` with a `RangeError`
+rather than downgrading silently.
+
+### New: forced-GC provenance
+
+`summary.gc` gains `forced`, `ownForced` and `foreignForced` (node only).
+Non-zero `foreignForced` means something outside the library forced a
+collection inside your measured window. Diagnostic; nothing gates on it.
+
+Note that on the synchronous lanes the observer may not have delivered GC
+entries by the time `summary()` is taken -- the same caveat that already
+applies to `gc.count` and friends -- so treat `forced: 0` there as "not yet
+observed" rather than "none happened".
+
 ## v1.9.1
 
 Support surface. **Docs, templates and error-message text only** -- no API
