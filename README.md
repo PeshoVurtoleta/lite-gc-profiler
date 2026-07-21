@@ -1460,11 +1460,11 @@ share `test/torture/harness.mjs` (a helper file, not a test).
 ## Testing
 
 ```
-npm test          # 752 tests
+npm test          # 770 tests
 npm run coverage  # the same suite, under the coverage law
 ```
 
-752 tests, all passing on this hardware.
+770 tests, all passing on this hardware.
 
 ### The coverage law
 

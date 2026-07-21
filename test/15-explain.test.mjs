@@ -103,3 +103,41 @@ test('explain sampling can run during ordinary code without throwing', async () 
     assert.ok(Array.isArray(result.topStacks));
     assert.ok(x > 0);
 });
+
+// ---------------------------------------------------------------------------
+// Option handling. These are the documented defaults, and until now nothing
+// executed the fallback side of any of them -- so the sampler could have been
+// silently running at a different interval than the README promises.
+// ---------------------------------------------------------------------------
+
+test('startExplainSampling: options object is optional', async () => {
+    const h = startExplainSampling();
+    assert.equal(typeof h.stop, 'function');
+    await h.stop();
+});
+
+test('startExplainSampling: intervalBytes <= 0 falls back to the 512 KB default', async () => {
+    // A zero or negative interval would mean "sample on every byte" or worse,
+    // so the guard must reject it rather than pass it to the inspector.
+    for (const bad of [0, -1, -4096]) {
+        const r = await startExplainSampling({ intervalBytes: bad }).stop();
+        assert.equal(r.samplingInterval, 512 * 1024,
+            'intervalBytes ' + bad + ' must fall back to 512 KB, not be passed to the inspector');
+    }
+});
+
+test('startExplainSampling: topN <= 0 falls back to the documented default of 10', async () => {
+    for (const bad of [0, -5]) {
+        const r = await startExplainSampling({ topN: bad }).stop();
+        assert.equal(r.topN, 10, 'topN ' + bad + ' must fall back to 10, not be honoured');
+    }
+});
+
+test('startExplainSampling: non-numeric options are treated as absent, not coerced', async () => {
+    // 'lots' > 0 is false and null > 0 is false, so both must take the default
+    // rather than reaching the inspector as NaN.
+    const r = await startExplainSampling({ intervalBytes: 'lots', topN: null }).stop();
+    assert.equal(r.samplingInterval, 512 * 1024);
+    assert.equal(r.topN, 10);
+    assert.ok(Array.isArray(r.topStacks));
+});

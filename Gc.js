@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.10.1';
+const VERSION = '1.10.2';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)

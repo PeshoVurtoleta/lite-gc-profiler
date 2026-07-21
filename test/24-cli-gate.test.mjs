@@ -16,7 +16,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, readFileSync, mkdtempSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdtempSync, existsSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +27,7 @@ const CLI = resolve(PKG_ROOT, 'bin/LiteGcGate.mjs');
 const REGISTER = resolve(PKG_ROOT, 'Register.mjs');
 const CLEAN = resolve(HERE, 'fixtures/TargetClean.mjs');
 const DIRTY = resolve(HERE, 'fixtures/TargetDirty.mjs');
+const TRUNCATED = resolve(HERE, 'fixtures/TargetTruncatedReport.mjs');
 
 function cli(args, opts) {
     return spawnSync(process.execPath, [CLI].concat(args),
@@ -284,4 +285,26 @@ test('Register: process.exit with no report path stays silent and does not fail 
     });
     assert.equal(res.status, 0, 'the target must exit cleanly');
     assert.equal(res.stderr, '', 'nothing to write is not an error and must not be reported as one');
+});
+
+// ---------------------------------------------------------------------------
+// A report file that exists but is not JSON.
+//
+// The gate reads its verdict from a file the target process wrote. If that file
+// is truncated, half-flushed, or clobbered by something else, JSON.parse throws.
+// The pin is that this becomes an INFRASTRUCTURE error naming the parse failure
+// -- not a crash, and emphatically not a clean pass. A gate that treats an
+// unreadable report as "nothing to complain about" is the fail-open shape this
+// whole suite exists to prevent.
+// ---------------------------------------------------------------------------
+
+test('CLI: a truncated report file is an infrastructure error, never a pass', () => {
+    // The target exits 0 having written a half-flushed report -- the shape a
+    // process killed mid-write leaves behind.
+    const r = cli(['run', TRUNCATED]);
+    const out = (r.stdout || '') + (r.stderr || '');
+    assert.notEqual(r.status, 0, 'an unreadable report must not exit 0');
+    assert.match(out, /could not parse report/i,
+        'the failure must name the parse rather than surfacing a raw stack; got: ' + out.slice(0, 200));
+    assert.doesNotMatch(out, /\bPASS\b/, 'an unparseable report must never narrate a pass');
 });

@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.10.2
+
+Patch. Tests and gate floors only -- no API change, no behaviour change.
+
+### The evidence lane's hint paths were never executed
+
+`explainReport` and `explainDiff` carry rule-specific hints and a per-metric
+comparison table that render only when the report contains concrete evidence
+for them. None of it ran. The narrator could have been saying anything, or
+nothing, in exactly the situations where a stranger most needs a sentence of
+help: an unstabilized reading, a non-zero async residual, a comparison across
+mismatched sources.
+
+`test/28-explain-hints.test.mjs` (13 scenarios) pins what the narration SAYS
+given specific evidence -- that the unstabilized hint names `--expose-gc` as
+the fix rather than only the problem, that a residual is described as inexact
+attribution rather than implied to be a leak, that a source-mismatched diff is
+called not comparable, that an improvement reads `(-7)` and not `7`, and that
+an unchanged metric is not decorated with `(+0)`. Each fixture goes through the
+real check/compare functions, so a report-shape change cannot slip past.
+
+Both silence cases are pinned too: a stabilized reading must not be told to
+stabilize, and a zero residual must produce neither the run line nor the hint.
+
+One structural note worth recording, because it is not obvious and it bounds
+what can be tested. `_hints()` reads `report.result || report.candidate`, so a
+hint can only appear on a report carrying one of those. `checkOpsAsync` and
+`checkFrames` carry `.result`; `compareOps` carries `.candidate`; `checkOps`
+and `compareFrames` carry **neither**, so hints are structurally unreachable
+on those two. `compareFrames` looks like an oversight rather than a decision --
+a frames comparison cannot currently raise the source-mismatch hint that an
+ops comparison can.
+
+Explain.js: 91.73% -> **100% lines**, 87.65% -> 93.71% branch.
+
+### An unparseable report is an infrastructure error, not a pass
+
+`bin/LiteGcGate.mjs` catches a `JSON.parse` failure on the report file, and
+nothing exercised it. `test/fixtures/TargetTruncatedReport.mjs` registers an
+exit handler that runs after Register's own -- so the report is written
+correctly and then clobbered with a half-written object, which is the shape a
+process killed mid-flush leaves behind. The gate's `existsSync` check passes
+and the parse then throws. Pinned: exit 3, the message names the parse, and
+the word PASS never appears. A gate that reads an unreadable report as "no
+complaints" is the fail-open shape this suite exists to prevent.
+
+### Sampler option defaults
+
+`startExplainSampling`'s fallbacks were unexecuted, so the sampler could have
+been running at an interval the README does not promise. Pinned: a missing
+options object, `intervalBytes` of 0 or negative falling back to 512 KB rather
+than reaching the inspector, `topN <= 0` falling back to 10, and non-numeric
+values (`'lots'`, `null`) treated as absent rather than coerced to NaN.
+
+### Coverage floors ratcheted
+
+Lines 95 -> **96**, branches 85 -> **88**; functions stays at 95. This is the
+ratchet rule finally applied: measured minus one, on the shipped-file basis
+(97.48 / 89.52 / 96.47).
+
+Recorded honestly, because it bears on how much this buys: **the new floor
+would not have caught the regression that made v1.10.1 necessary.** Reverting
+`test/12-test-helper.test.mjs` to its pre-1.9.2 state drops branch coverage
+only to 89.11 -- above 88, so the gate still passes. `TestHelpers.js` is small
+enough that losing 41 points of its branch coverage moves the aggregate by
+0.41. An aggregate floor cannot defend per-file coverage, and raising it far
+enough to try would leave no working margin. The floors are worth having
+against broad regressions; a per-file guard is a separate problem and is not
+solved here.
+
+Suite: 752 -> 770.
+
 ## 1.10.1
 
 Patch. No API change, no behaviour change -- everything here was found after

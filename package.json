@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-gc-profiler",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "description": "Zero-dependency GC and heap profiler that makes the zero-GC claim falsifiable: three-state verdicts, phases, regions, differential and rep-aware gating, baselines, CLI, and explain mode. precise garbage-collection events in node (perf_hooks), a heap-drop heuristic in Chrome, and long-frame anomaly detection everywhere else.",
   "type": "module",
   "main": "./Gc.js",
@@ -65,7 +65,7 @@
   "sideEffects": false,
   "scripts": {
     "test": "node --expose-gc --test 'test/*.test.mjs' 'test/torture/*.test.mjs'",
-    "coverage": "node --expose-gc --test --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-exclude='**/tmp/**' --test-coverage-lines=95 --test-coverage-functions=95 --test-coverage-branches=85 'test/*.test.mjs' 'test/torture/*.test.mjs'",
+    "coverage": "node --expose-gc --test --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-exclude='**/tmp/**' --test-coverage-lines=96 --test-coverage-functions=95 --test-coverage-branches=88 'test/*.test.mjs' 'test/torture/*.test.mjs'",
     "bundle-check": "npx esbuild Gc.js --bundle --format=esm --outfile=test-bundle.js",
     "prepublishOnly": "npm run coverage && npm run bundle-check",
     "typecheck": "npx --yes tsc --noEmit --strict Gc.d.ts Explain.d.ts index.d.ts"
