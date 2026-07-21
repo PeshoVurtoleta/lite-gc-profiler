@@ -344,6 +344,7 @@
 <div class="wrap">
     <header>
         <h1>lite-gc-profiler <span class="v">&mdash; prove the zero-GC claim</span></h1>
+<p style="--pad: 0"><a href="./verdicts.html">three verdicts, not two &rarr;</a> &mdash; what this runtime can and cannot answer, including the amber one.</p>
         <p class="sub">
             The same particle workload runs two ways. <b class="c-bad">Leaky</b> allocates a fresh
             array of objects every frame; <b class="c-ink">Pooled</b> mutates one preallocated typed
@@ -564,10 +565,15 @@
         document.getElementById('modeLeaky').classList.toggle('active', m === 'leaky');
         gc.reset();
         scopeReset();
-        $verdict.dataset.v = m === 'pooled' ? 'ok' : 'bad';
+        // The lamp reports the GATE, not the button. Setting it from the
+        // selected mode meant this page showed a green light for a workload
+        // nothing had measured yet -- a staged verdict, in a demo for a library
+        // whose entire argument is that verdicts must be earned. Selecting a
+        // mode now clears it back to "not gated".
+        $verdict.dataset.v = 'idle';
         $verdictMsg.textContent = m === 'pooled'
-            ? 'Pooled: no allocation on the hot path.'
-            : 'Leaky: a fresh array of objects every frame. Watch the heap climb and collapse.';
+            ? 'Pooled: no allocation on the hot path. Run the gate to find out.'
+            : 'Leaky: a fresh array of objects every frame. Run the gate to find out.';
     }
 
     document.getElementById('modePooled').addEventListener('click', () => setMode('pooled'));
@@ -676,7 +682,7 @@
     setMode('pooled');
     requestAnimationFrame(frame);
 
-    // -------- v1.6.0 evidence lane: assertFrames + explainReport + gateBadge --------
+    // -------- v1.6.0 evidence lane (verdict lamp wired in v1.10.0): assertFrames + explainReport + gateBadge --------
     //
     // The scope canvas above is the LIVE view -- honest but informal. The gate
     // panel below is the FORMAL primitive: the same measureFrames /
@@ -717,6 +723,14 @@
         leakySink.push(new Array(64).fill(i));           // portable typed-slot payload
     }
 
+    const VERDICT_LAMP = { pass: 'ok', fail: 'bad', inconclusive: 'warn' };
+    const VERDICT_MSG = {
+        pass: 'pass \u2014 the budget held.',
+        fail: 'fail \u2014 a budget was exceeded. See the explanation below.',
+        inconclusive: 'inconclusive \u2014 this runtime could not verify the rule. '
+            + 'That is an answer, not a failure: see INCONCLUSIVE.md.'
+    };
+
     $gateRun.addEventListener('click', async () => {
         $gateRun.disabled = true;
         $gateExplain.textContent = 'Running gate on the "' + mode + '" workload…';
@@ -730,8 +744,16 @@
             const report = checkFrames(result, { maxBytesPerFrame: 512 });
             $gateBadge.innerHTML = gateBadge(report, { format: 'svg' });
             $gateExplain.textContent = explainReport(report);
+
+            // Three states, because the gate has three. 'inconclusive' lands on
+            // the amber lamp that has been defined in the stylesheet since this
+            // page was written and was never once reachable.
+            $verdict.dataset.v = VERDICT_LAMP[report.verdict] || 'idle';
+            $verdictMsg.textContent = VERDICT_MSG[report.verdict] || report.verdict;
         } catch (err) {
             $gateBadge.innerHTML = '';
+            $verdict.dataset.v = 'idle';
+            $verdictMsg.textContent = 'The gate itself failed to run \u2014 that is not a verdict.';
             $gateExplain.textContent = 'Gate raised an error:\n' + (err && err.stack || String(err));
         } finally {
             $gateRun.disabled = false;

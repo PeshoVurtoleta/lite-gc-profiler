@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@zakkster/lite-gc-profiler &mdash; three verdicts, not two</title>
+<style>
+    :root {
+        --bg: #0a1410;
+        --bg: oklch(0.16 0.03 155);
+        --panel: #12201a;
+        --panel: oklch(0.21 0.035 155);
+        --grid: rgba(90, 190, 140, 0.16);
+        --grid: oklch(0.55 0.11 155 / 0.16);
+        --ink: #a8f0c8;
+        --ink: oklch(0.88 0.16 155);
+        --ink-dim: #79b795;
+        --ink-dim: oklch(0.66 0.10 155);
+        --ink-faint: #5c8a72;
+        --ink-faint: oklch(0.52 0.07 155);
+        --warn: #f0b657;
+        --warn: oklch(0.82 0.15 68);
+        --bad: #f0736a;
+        --bad: oklch(0.72 0.18 25);
+        --edge: rgba(76, 128, 100, 0.5);
+        --edge: oklch(0.42 0.06 155 / 0.5);
+        --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+        margin: 0;
+        padding: 1.5rem 1.25rem 4rem;
+        background-color: var(--bg);
+        background-image:
+            repeating-linear-gradient(0deg, var(--grid) 0 1px, transparent 1px 2.5rem),
+            repeating-linear-gradient(90deg, var(--grid) 0 1px, transparent 1px 2.5rem);
+        color: var(--ink-dim);
+        font-family: var(--mono);
+        font-size: 0.875rem;
+        line-height: 1.6;
+    }
+
+    main { max-width: 60rem; margin: 0 auto; }
+
+    h1 { margin: 0 0 0.25rem; font-size: 1.25rem; color: var(--ink); font-weight: 600; }
+    h2 { margin: 0 0 0.75rem; font-size: 0.9375rem; color: var(--ink); font-weight: 600; }
+    p  { margin: 0 0 0.75rem; max-width: 58ch; }
+
+    .sub { color: var(--ink-faint); margin-bottom: 1.25rem; }
+    code { color: var(--ink); }
+    b { color: var(--ink); font-weight: 600; }
+
+    /* ---- scene tabs ---- */
+    #tabs { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.25rem; }
+
+    button {
+        font-family: inherit;
+        font-size: 0.8125rem;
+        color: var(--ink-dim);
+        background: var(--panel);
+        border: 1px solid var(--edge);
+        border-radius: 0.25rem;
+        padding: 0.4rem 0.8rem;
+        cursor: pointer;
+    }
+
+    button[aria-pressed="true"] { color: var(--bg); background: var(--ink); border-color: var(--ink); }
+    button:disabled { opacity: 0.45; cursor: default; }
+
+    @media (hover: hover) {
+        button:not(:disabled, [aria-pressed="true"]):hover { border-color: var(--ink-dim); color: var(--ink); }
+    }
+
+    .scene { display: none; }
+    .scene.on { display: block; }
+
+    .panel {
+        background: var(--panel);
+        border: 1px solid var(--edge);
+        border-radius: 0.375rem;
+        padding: 1rem 1.125rem;
+        margin-bottom: 1rem;
+    }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+
+    /* ---- the lamp. three states, because there are three verdicts ---- */
+    .verdict { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+
+    .lamp {
+        width: 0.75rem; height: 0.75rem; border-radius: 50%;
+        background: var(--ink-faint); flex: none;
+    }
+
+    .verdict[data-v="pass"] .lamp { background: var(--ink); box-shadow: 0 0 0.5rem var(--ink); }
+    .verdict[data-v="fail"] .lamp { background: var(--bad); box-shadow: 0 0 0.5rem var(--bad); }
+    .verdict[data-v="inconclusive"] .lamp { background: var(--warn); box-shadow: 0 0 0.5rem var(--warn); }
+
+    .verdict[data-v="pass"] .vtext { color: var(--ink); }
+    .verdict[data-v="fail"] .vtext { color: var(--bad); }
+    .verdict[data-v="inconclusive"] .vtext { color: var(--warn); }
+
+    .vtext { font-weight: 600; letter-spacing: 0.04em; }
+
+    pre {
+        margin: 0.75rem 0 0;
+        padding: 0.75rem;
+        background: var(--bg);
+        border: 1px solid var(--edge);
+        border-radius: 0.25rem;
+        color: var(--ink-dim);
+        font-size: 0.8125rem;
+        overflow-x: auto;
+        white-space: pre-wrap;
+        min-height: 1.5rem;
+    }
+
+    table { border-collapse: collapse; width: 100%; font-size: 0.8125rem; }
+    th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--edge); }
+    th { color: var(--ink); font-weight: 600; }
+    td:first-child { color: var(--ink); }
+
+    .yes { color: var(--ink); }
+    .no  { color: var(--warn); }
+
+    .env {
+        font-size: 0.8125rem;
+        color: var(--ink-faint);
+        border-left: 2px solid var(--edge);
+        padding-left: 0.75rem;
+        margin-bottom: 1.25rem;
+    }
+
+    .env b { color: var(--ink); }
+    a { color: var(--ink); }
+</style>
+</head>
+<body>
+<main>
+    <h1>three verdicts, not two</h1>
+    <p class="sub">
+        Every lamp on this page is set from <code>report.verdict</code>. Nothing here is
+        staged &mdash; if a gate cannot answer, you will see it refuse.
+    </p>
+
+    <div class="env" id="env">detecting runtime&hellip;</div>
+
+    <nav id="tabs">
+        <button data-scene="gate" aria-pressed="true">1 &middot; the gate</button>
+        <button data-scene="external" aria-pressed="false">2 &middot; the blind spot</button>
+        <button data-scene="matrix" aria-pressed="false">3 &middot; what this browser can answer</button>
+    </nav>
+
+    <!-- ================= scene 1 ================= -->
+    <section class="scene on" data-scene="gate">
+        <div class="panel">
+            <h2>Run the same gate on two workloads</h2>
+            <p>
+                Both run through <code>measureFrames</code>. The rule set is identical.
+                The only difference is whether the frame body keeps what it allocates.
+            </p>
+            <div class="controls">
+                <button id="runPooled">run pooled</button>
+                <button id="runLeaky">run leaky</button>
+                <button id="runKinds">gate on GC kinds</button>
+            </div>
+
+            <div class="verdict" id="v1">
+                <span class="lamp"></span>
+                <span class="vtext" id="v1text">idle</span>
+                <span id="v1badge"></span>
+            </div>
+            <pre id="out1">Press a button. The third one asks a question this runtime may not be able to answer.</pre>
+        </div>
+    </section>
+
+    <!-- ================= scene 2 ================= -->
+    <section class="scene" data-scene="external">
+        <div class="panel">
+            <h2>The 152&times; blind spot</h2>
+            <p>
+                <code>ArrayBuffer</code> backing stores live outside the JS heap. Measured on
+                node 22, retaining 9.4&nbsp;MB of them moves <code>heapUsed</code> by 62&nbsp;KB.
+                Every byte rule in this library gated on that one number until v1.10.0.
+            </p>
+            <p>
+                <code>maxArrayBuffersGrowth</code> closes it &mdash; but only where
+                <code>process.memoryUsage()</code> exists. In a browser there is no such channel,
+                so the honest answer is not <b>pass</b>.
+            </p>
+            <div class="controls">
+                <button id="runLeakAb">retain 300 &times; 32 KB</button>
+            </div>
+
+            <div class="verdict" id="v2">
+                <span class="lamp"></span>
+                <span class="vtext" id="v2text">idle</span>
+            </div>
+            <pre id="out2">A gate that answered this in a browser would be guessing.</pre>
+        </div>
+    </section>
+
+    <!-- ================= scene 3 ================= -->
+    <section class="scene" data-scene="matrix">
+        <div class="panel">
+            <h2>What this browser can actually answer</h2>
+            <p>
+                Computed live by asking the real gate, one rule at a time, against a summary
+                taken from this runtime. Not a table copied out of the docs.
+            </p>
+            <div class="controls">
+                <button id="runMatrix">probe every rule</button>
+            </div>
+            <table id="mtable">
+                <thead><tr><th>rule</th><th>verifiable here</th><th>if not, why</th></tr></thead>
+                <tbody id="mbody"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <p class="sub">
+        Triage for anything amber lives in
+        <a href="../INCONCLUSIVE.md">INCONCLUSIVE.md</a>.
+    </p>
+</main>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-gc-profiler": "../index.js",
+    "@zakkster/lite-gc-profiler/explain": "../Explain.js"
+  }
+}
+</script>
+<script type="module">
+    import { GcProfiler, measureFrames, checkFrames, checkNoGc } from '@zakkster/lite-gc-profiler';
+    import { explainReport, gateBadge } from '@zakkster/lite-gc-profiler/explain';
+
+    const FRAMES = 40;
+    const WARMUP = 6;
+    const KB = 1024;
+
+    // ---- cached refs, resolved once ----
+    const $env = document.getElementById('env');
+    const $tabs = document.getElementById('tabs');
+    const $scenes = document.querySelectorAll('.scene');
+    const $tabButtons = $tabs.querySelectorAll('button');
+
+    const $runPooled = document.getElementById('runPooled');
+    const $runLeaky = document.getElementById('runLeaky');
+    const $runKinds = document.getElementById('runKinds');
+    const $v1 = document.getElementById('v1');
+    const $v1text = document.getElementById('v1text');
+    const $v1badge = document.getElementById('v1badge');
+    const $out1 = document.getElementById('out1');
+
+    const $runLeakAb = document.getElementById('runLeakAb');
+    const $v2 = document.getElementById('v2');
+    const $v2text = document.getElementById('v2text');
+    const $out2 = document.getElementById('out2');
+
+    const $runMatrix = document.getElementById('runMatrix');
+    const $mbody = document.getElementById('mbody');
+
+    // ---- environment banner, read from the library rather than from navigator ----
+    const probe = new GcProfiler(64);
+    const SOURCE = probe.source;
+    probe.stop();
+
+    const SOURCE_NOTE = SOURCE === 'gc'
+        ? 'precise GC events from <code>perf_hooks</code>. You are running this in node.'
+        : (SOURCE === 'heap'
+            ? 'Chrome\u2019s <code>performance.memory</code>. Bytes, but no GC event kinds.'
+            : 'no memory channel at all \u2014 Firefox and Safari expose neither. Only frame anomalies are answerable here.');
+
+    $env.innerHTML = 'Source: <b>' + SOURCE + '</b> \u2014 ' + SOURCE_NOTE;
+
+    // ---- scene switching ----
+    function selectScene(name) {
+        for (let i = 0; i < $tabButtons.length; i++) {
+            const b = $tabButtons[i];
+            b.setAttribute('aria-pressed', b.dataset.scene === name ? 'true' : 'false');
+        }
+        for (let i = 0; i < $scenes.length; i++) {
+            $scenes[i].classList.toggle('on', $scenes[i].dataset.scene === name);
+        }
+    }
+
+    $tabs.addEventListener('click', (e) => {
+        const b = e.target.closest('button');
+        if (b) selectScene(b.dataset.scene);
+    });
+
+    // ---- the one rule of this page: the lamp is whatever the report says ----
+    function showVerdict(el, textEl, report) {
+        el.dataset.v = report.verdict;
+        textEl.textContent = report.verdict;
+    }
+
+    // ---- workloads ----
+    const pool = [];
+    for (let i = 0; i < 64; i++) pool.push({ x: 0, y: 0 });
+    let poolIdx = 0;
+
+    const kept = [];
+
+    function framePooled() {
+        const p = pool[poolIdx = (poolIdx + 1) & 63];
+        p.x += 1;
+        p.y = p.x * 0.5;
+    }
+
+    // Retained ON THE JS HEAP on purpose. A retained Float64Array would be the
+    // wrong leak for this scene: its backing store is external memory, which
+    // bytesPerFrame cannot see by construction -- that is the blind spot scene 2
+    // is about, and using it here would show a leak passing for the wrong reason.
+    function frameLeaky() {
+        const a = new Array(256);
+        for (let i = 0; i < 256; i++) a[i] = { v: i };
+        kept.push(a);
+    }
+
+    async function runFrameGate(fn, rules, label) {
+        setBusy(true);
+        let calNote = '';
+        if (rules === null) {
+            if (budget === 0) {
+                const q = await calibrate();
+                calNote = 'calibrated: quiet baseline ' + Math.round(q)
+                    + ' B/frame -> budget ' + budget + ' B/frame\n\n';
+            }
+            rules = { maxBytesPerFrame: budget, maxDroppedFrames: 4 };
+        }
+        kept.length = 0;
+        const result = await measureFrames(fn, { frames: FRAMES, warmup: WARMUP });
+        const report = checkFrames(result, rules);
+
+        showVerdict($v1, $v1text, report);
+        $v1badge.textContent = gateBadge(report);
+
+        const answered = [];
+        const refused = [];
+        for (const k of Object.keys(report.checked)) {
+            (report.checked[k] ? answered : refused).push(k);
+        }
+
+        let text = label + '\n\n' + calNote;
+        text += 'bytes/frame : ' + result.bytesPerFrame + '\n';
+        text += 'dropped     : ' + result.droppedFrames + '\n';
+        text += 'answered    : ' + (answered.length ? answered.join(', ') : '(none)') + '\n';
+        text += 'refused     : ' + (refused.length ? refused.join(', ') : '(none)') + '\n\n';
+        text += explainReport(report);
+        $out1.textContent = text;
+        setBusy(false);
+    }
+
+    function setBusy(on) {
+        $runPooled.disabled = on;
+        $runLeaky.disabled = on;
+        $runKinds.disabled = on;
+        $runLeakAb.disabled = on;
+        $runMatrix.disabled = on;
+    }
+
+    // The byte budget is DERIVED, never hardcoded. A fixed number would be a
+    // number tuned on one machine: measured on node 22 the pooled path reads
+    // 94-471 B/frame depending on the run, and Chrome's performance.memory is
+    // coarser again. Calibrating against this runtime's own quiet baseline is
+    // both honest and what the library's baseline lane exists to do.
+    let budget = 0;
+
+    async function calibrate() {
+        const base = await measureFrames(framePooled, { frames: FRAMES, warmup: WARMUP });
+        // Four times the quiet baseline, with a floor so a near-zero reading
+        // cannot produce a budget nothing can pass.
+        budget = Math.max(2048, Math.round(base.bytesPerFrame * 4));
+        return base.bytesPerFrame;
+    }
+
+    // Kind rules: answerable only where real GC events exist, i.e. node.
+    const KIND_RULES = { maxMajorsPerKFrame: 0, maxPauseMsPerFrame: 4 };
+
+    $runPooled.addEventListener('click', () => {
+        runFrameGate(framePooled, null, 'pooled \u2014 the hot path allocates nothing');
+    });
+
+    $runLeaky.addEventListener('click', () => {
+        runFrameGate(frameLeaky, null, 'leaky \u2014 256 objects retained per frame');
+    });
+
+    $runKinds.addEventListener('click', () => {
+        runFrameGate(framePooled, KIND_RULES,
+            'pooled, gated on GC event KINDS \u2014 a question only node can answer');
+    });
+
+    // ---- scene 2: the external channel ----
+    $runLeakAb.addEventListener('click', () => {
+        setBusy(true);
+        const gc = new GcProfiler(64);
+        const before = performance.now();
+        let mu = readMemUsage();
+        gc.sampleHeap(before, readHeapUsed(), mu);
+
+        const stores = [];
+        for (let i = 0; i < 300; i++) stores.push(new Float64Array(4096));
+        stores[0][0] = 1;
+
+        mu = readMemUsage();
+        gc.sampleHeap(performance.now(), readHeapUsed(), mu);
+        const summary = gc.summary();
+        gc.stop();
+
+        const report = checkNoGc(summary, { maxArrayBuffersGrowth: 1024 * KB });
+        showVerdict($v2, $v2text, report);
+
+        let text = 'retained : ' + stores.length + ' \u00d7 32 KB = 9.4 MB of backing store\n';
+        text += 'arrayBuffers.supported : ' + summary.arrayBuffers.supported + '\n';
+        text += 'arrayBuffers.settled   : ' + summary.arrayBuffers.settled + '\n';
+        text += 'checked                : ' + JSON.stringify(report.checked) + '\n\n';
+        text += explainReport(report);
+        text += '\n\nIn node this rule reads process.memoryUsage().arrayBuffers and fails a\n';
+        text += 'retained ring outright, while maxAllocRate passes it. Here there is no\n';
+        text += 'such channel, so the gate withholds the verdict instead of inventing one.';
+        $out2.textContent = text;
+        setBusy(false);
+    });
+
+    // Browsers have no process.memoryUsage(); node does. Returning undefined
+    // leaves the external channel unsampled, which reports as unsupported --
+    // deliberately not as zero growth.
+    function readMemUsage() {
+        return typeof process !== 'undefined' && typeof process.memoryUsage === 'function'
+            ? process.memoryUsage()
+            : undefined;
+    }
+
+    function readHeapUsed() {
+        if (typeof performance !== 'undefined' && performance.memory
+            && typeof performance.memory.usedJSHeapSize === 'number') {
+            return performance.memory.usedJSHeapSize;
+        }
+        return undefined;
+    }
+
+    // ---- scene 3: probe every rule against this runtime ----
+    const PROBE_RULES = [
+        ['maxDroppedFrames', 4, 'frames'],
+        ['maxBytesPerFrame', 512, 'frames'],
+        ['maxMajorsPerKFrame', 0, 'frames'],
+        ['maxPauseMsPerFrame', 4, 'frames'],
+        ['maxMajor', 0, 'summary'],
+        ['maxPauseMs', 8, 'summary'],
+        ['maxAllocRate', 1024 * KB, 'summary'],
+        ['maxArrayBuffersGrowth', 1024 * KB, 'summary']
+    ];
+
+    const WHY = {
+        heap: 'this source reports bytes, not GC event kinds',
+        uasm: 'this source reports one quantized total it cannot decompose',
+        none: 'this runtime exposes no memory or GC channel',
+        external: 'needs process.memoryUsage(), which browsers do not have',
+        samples: 'needs at least two samples to form a delta'
+    };
+
+    $runMatrix.addEventListener('click', async () => {
+        setBusy(true);
+        $mbody.textContent = '';
+
+        const result = await measureFrames(framePooled, { frames: FRAMES, warmup: WARMUP });
+        const summary = result.summary;
+
+        for (let i = 0; i < PROBE_RULES.length; i++) {
+            const name = PROBE_RULES[i][0];
+            const limit = PROBE_RULES[i][1];
+            const lane = PROBE_RULES[i][2];
+            const rules = {};
+            rules[name] = limit;
+
+            const report = lane === 'frames' ? checkFrames(result, rules) : checkNoGc(summary, rules);
+            const ok = report.checked[name] === true;
+
+            let why = '';
+            if (!ok) {
+                if (name === 'maxArrayBuffersGrowth') why = WHY.external;
+                else if (SOURCE === 'none') why = WHY.none;
+                else if (SOURCE === 'uasm') why = WHY.uasm;
+                else if (SOURCE === 'heap') why = WHY.heap;
+                else why = WHY.samples;
+            }
+
+            const tr = document.createElement('tr');
+            const c1 = document.createElement('td');
+            const c2 = document.createElement('td');
+            const c3 = document.createElement('td');
+            c1.textContent = name;
+            c2.textContent = ok ? 'yes' : 'no';
+            c2.className = ok ? 'yes' : 'no';
+            c3.textContent = why;
+            tr.appendChild(c1); tr.appendChild(c2); tr.appendChild(c3);
+            $mbody.appendChild(tr);
+        }
+        setBusy(false);
+    });
+</script>
+</body>
+</html>

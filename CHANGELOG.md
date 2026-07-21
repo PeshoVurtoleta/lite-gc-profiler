@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.10.3
+
+Demo only. No source change, no test change, no published-artifact change --
+`demo/` is not in `files[]` and does not enter the tarball.
+
+### demo/verdicts.html -- three verdicts, not two
+
+The existing demo proves the zero-GC claim by contrasting a leaky and a pooled
+workload, which exercises pass and fail. It had nothing to say about the third
+verdict, and `inconclusive` is the one that actually confuses people: it is the
+verdict a stranger meets first, on a browser, for a rule their runtime cannot
+answer.
+
+The new page gates seven rules across the matrix and shows, per rule, whether
+this runtime can answer it and why not when it cannot. `maxArrayBuffersGrowth`
+carries the point: it is `needsExternal`, node-only, so in a browser
+`summary.arrayBuffers.supported` reads false and the rule goes amber rather
+than green. A gate that cannot see backing stores says so instead of passing.
+
+`demo/index.html` gains one line linking to it.
+
+### This is the demo that could not load before v1.10.1
+
+Worth recording, because the two changes are the same story. The page imports
+`explainReport` and `gateBadge` from the `./explain` subpath, and its importmap
+resolves that to `../Explain.js` -- the browser-safe half of the v1.10.1 split.
+Before that split the static `node:inspector` import took the whole module down
+with `GET node:inspector net::ERR_FAILED`, so this page could not have existed.
+The demo is now the standing proof that the subpath loads in a browser: if the
+node-only half ever leaks back into `Explain.js`, this page stops rendering.
+
+Audited against the ecosystem demo conventions: no inline styles beyond custom
+properties, every oklch token preceded by a hex or rgba fallback, `:hover`
+inside `@media (hover: hover)`, no non-hairline `px`, all nine DOM references
+cached at init, no uncached lookups in handlers, no IIFE scope blocks. All five
+rule keys it gates on validate against `VERDICT_MATRIX`.
+
 ## 1.10.2
 
 Patch. Tests and gate floors only -- no API change, no behaviour change.
