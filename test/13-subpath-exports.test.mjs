@@ -41,7 +41,7 @@ test('./test-helpers subpath resolves', async () => {
 });
 
 test('./explain subpath resolves', async () => {
-    const mod = await import(resolve(ROOT, 'Explain.js'));
+    const mod = await import(resolve(ROOT, 'ExplainNode.js'));
     assert.equal(typeof mod.startExplainSampling, 'function');
     assert.equal(typeof mod.formatExplainConsole, 'function');
 });

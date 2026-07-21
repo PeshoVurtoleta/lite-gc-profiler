@@ -4,7 +4,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startExplainSampling, formatExplainConsole } from '../Explain.js';
+import { startExplainSampling } from '../ExplainSampling.js';
+import { formatExplainConsole } from '../Explain.js';
 
 // ---- lifecycle ----
 

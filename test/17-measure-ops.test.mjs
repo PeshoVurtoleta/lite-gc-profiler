@@ -173,7 +173,15 @@ test('checkOps: throws when result is not a measureOps result', () => {
 });
 
 test('assertOps: returns the report on pass', () => {
-    const rep = assertOps(noopWorkload, { maxBytesPerOp: 1024 }, { ops: 500 });
+    // stabilize:true is load-bearing, not decoration. The subject here is that
+    // assertOps RETURNS the report when the verdict is pass -- the measurement
+    // is scaffolding, and the unanchored path is the noisy one. Measured on one
+    // box, five runs of this exact noop at 500 ops: 1.4 to 51.5 B/op without
+    // stabilize, 0.0 to 1.6 with it. On an M4 the unanchored path reached
+    // 1057 B/op and threw GcBudgetError against this 1024 budget, failing a
+    // test that has nothing to do with budgets.
+    const rep = assertOps(noopWorkload, { maxBytesPerOp: 1024 },
+        { ops: 2000, warmup: 200, stabilize: true });
     assert.equal(rep.verdict, 'pass');
 });
 
@@ -244,11 +252,19 @@ test('compareOps: candidate leaks vs clean control -> fail', () => {
     // rule by more than an order of magnitude on any machine -- so this test no
     // longer needs the "GC intervention edge case" early-return it used to
     // carry. That silent skip could pass a real regression unnoticed.
+    // Array(256), not Array(64), and 2000 ops rather than 500. A tagged slot is
+    // 8 bytes on a plain build and 4 under pointer compression, so Array(64)
+    // measured ~560 B/op on one machine and roughly half that on a compressed
+    // one -- while the noop CONTROL at 500 ops can pick up a few hundred B/op
+    // of its own. Once the control's noise is within an order of magnitude of
+    // the candidate's signal, the delta can collapse below the 20 B/op rule and
+    // this reads 'pass', which is what happened on an M4. Measured here at
+    // Array(256)/2000 ops: delta 2109 B/op across five runs, spread of 0.
     const sinkK = [];
     function control(i)   { return i | 0; }                                    // no allocation
-    function candidate(i) { sinkK.push(new Array(64).fill(i)); return i; }
-    const ctlR = measureOps(control,   { ops: 500, warmup: 50, stabilize: true });
-    const canR = measureOps(candidate, { ops: 500, warmup: 50, stabilize: true });
+    function candidate(i) { sinkK.push(new Array(256).fill(i)); return i; }
+    const ctlR = measureOps(control,   { ops: 2000, warmup: 200, stabilize: true });
+    const canR = measureOps(candidate, { ops: 2000, warmup: 200, stabilize: true });
     assert.notEqual(canR.bytesPerOp, null);
     const rep = compareOps(ctlR, canR, { maxExtraBytesPerOp: 20 });
     assert.equal(rep.verdict, 'fail');

@@ -1,5 +1,113 @@
 # Changelog
 
+## 1.10.1
+
+Patch. No API change, no behaviour change -- everything here was found after
+v1.10.0 shipped. Three intermittent test failures that were measuring the host
+machine rather than the code, one silent coverage regression, and the
+documentation for the channel v1.10.0 introduced.
+
+### Explain.js is browser-loadable again
+
+`Explain.js` opened with a static `import { Session } from 'node:inspector'`,
+in a file whose own header says its formatters exist so they can run "in a
+failed CI job or a browser". A static import of a node builtin makes the whole
+module unloadable in a browser, so a demo importing the `./explain` subpath got
+`GET node:inspector net::ERR_FAILED` before a single formatter ran -- taking
+`explainReport`, `explainDiff`, `formatExplainConsole` and `gateBadge` down
+with the one function that actually needed node.
+
+ESM cannot conditionally static-import, and `startExplainSampling` is
+synchronous by contract, so a dynamic import would have been a breaking
+change. Instead the sampler moves to `ExplainSampling.js`, `ExplainNode.js`
+re-exports both halves, and `./explain` gains a `browser` condition:
+
+    "./explain": { "browser": "./Explain.js", "node": "./ExplainNode.js", ... }
+
+Node consumers see all five exports exactly as before. Browsers get the four
+formatters and no module-load failure. Verified by bundling `Explain.js` with
+`esbuild --platform=browser`, which succeeds, while the previous shape fails
+the same bundle with "Could not resolve node:inspector".
+
+### Restored: the v1.9.2 branch-coverage tests
+
+This branch carried pre-v1.9.2 copies of two test files, silently undoing the
+branch work: `test/12-test-helper.test.mjs` at 8 scenarios instead of 14 and
+`test/24-cli-gate.test.mjs` at 20 instead of 21. The effect showed up only in
+coverage -- `TestHelpers.js` back at 58.82% branch and `Register.mjs` at
+83.33%, both of which v1.9.2 had taken to 100%. Restored: overall branch
+88.29 -> 88.95, suite 745 -> 752.
+
+Worth recording why the gate did not catch it. `prepublishOnly` enforces
+floors of 95/95/85, and branch coverage fell from 88.95 to 88.29 -- a real
+regression that stayed comfortably above the floor, so the gate passed. The
+ratchet rule (measured minus one, once exceeded by 2 points across three runs
+on both machines) exists precisely to close that gap and has not been applied
+since the floors were set. At a branch floor of 88 this revert would have
+failed the release rather than needing to be noticed by eye.
+
+### Test-suite fix: two ops-lane tests were sized for one machine
+
+Both intermittent, both in `test/17-measure-ops.test.mjs`, both the same
+mistake in different directions.
+
+`assertOps: returns the report on pass` measured a noop at 500 ops **without
+`stabilize`** and gated it at 1024 B/op. The unanchored path is the noisy one:
+five runs of that exact noop measured 1.4 to 51.5 B/op on one box, and 0.0 to
+1.6 with `stabilize: true` -- a thirtyfold collapse from the anchoring alone,
+not from the op count. On an M4 the unanchored path reached 1057 B/op and threw
+`GcBudgetError` at a test whose subject is whether `assertOps` returns its
+report. Now anchored, at 2000 ops: 246x headroom under the same budget.
+
+`compareOps: candidate leaks vs clean control -> fail` retained an
+`Array(64)` per op against a 20 B/op rule. A tagged slot is 8 bytes on a plain
+build and 4 under pointer compression, so the signal roughly halves on some
+machines while the noop CONTROL at 500 ops can carry a few hundred B/op of its
+own. Once the control's noise is within an order of magnitude of the
+candidate's signal the delta collapses and the leak reads `pass`. Now
+`Array(256)` at 2000 ops: delta 2105 B/op, a 105x margin that survives
+compression.
+
+The rule the cookbook already gives users applies to the suite too: size the
+signal, not the threshold.
+
+### Torture fix: a rate rule was a hardware detector
+
+`g26-5-external-memory` shared one rule set across five assertions, and it
+included `maxAllocRate: 200 MB/s`. That rule is `allocBytes * 1000 /
+elapsedMs`, and these windows are a few milliseconds long, so its denominator
+is really "how fast does this host run the loop". Measured on one box, the
+identical workload produced 31, 11 and 5 MB/s across three consecutive runs --
+windows of 3.9, 5.9 and 13.1 ms. On an M4 the same workload cleared 200 MB/s,
+the co-rule fired, and `[axis A] an unsettled window routes to inconclusive`
+got `fail` instead: a second violation had appeared that had nothing to do
+with the routing under test. Axis B's exactly-one-violation pin was one step
+behind it.
+
+The four routing assertions now gate only the rule whose routing they are
+about. Axis B keeps the co-rule, because its pin IS the conjunction -- exactly
+one rule fires and it is the external one -- but at a threshold no host can
+reach; the substantive claim, that `heapUsed` barely moves for a multi-MB
+backing-store leak, is measured directly in bytes by the sibling axis B test
+rather than inferred from a threshold. Verified by re-running the file with
+the co-rule threshold set to 1 byte/sec, which is an arbitrarily fast machine:
+the routing tests are unaffected.
+
+### Cookbook
+
+Recipe 21 documents the external channel, with the measured blind-spot
+numbers, the `forceSettle()` requirement, and why `external` is read but never
+gated. Recipe 20's matrix table gains the `needsExternal` state. Coverage
+holds at **53 of 53 exports**. Every sample was executed against this build.
+
+### Carried forward
+
+The v1.9.2 evidence-lane fixtures and cookbook Recipes 19-20 were absent from
+this branch and are restored: three narrator tests were again gating on live
+measurements with absolute thresholds at 100-200 ops, which is how a
+string-formatting test comes to depend on the host machine's heap.
+Suite: 722 -> 752.
+
 ## 1.10.0
 
 Batch 13: the external-memory channel (G25), a parity gate, and rule-key
@@ -41,28 +149,6 @@ diagnosis.
 
 Pinned by `test/torture/g26-5-external-memory.test.mjs` (16 scenarios).
 
-### Torture fix: a rate rule was a hardware detector
-
-`g26-5-external-memory` shared one rule set across five assertions, and it
-included `maxAllocRate: 200 MB/s`. That rule is `allocBytes * 1000 /
-elapsedMs`, and these windows are a few milliseconds long, so its denominator
-is really "how fast does this host run the loop". Measured on one box, the
-identical workload produced 31, 11 and 5 MB/s across three consecutive runs --
-windows of 3.9, 5.9 and 13.1 ms. On an M4 the same workload cleared 200 MB/s,
-the co-rule fired, and `[axis A] an unsettled window routes to inconclusive`
-got `fail` instead: a second violation had appeared that had nothing to do
-with the routing under test. Axis B's exactly-one-violation pin was one step
-behind it.
-
-The four routing assertions now gate only the rule whose routing they are
-about. Axis B keeps the co-rule, because its pin IS the conjunction -- exactly
-one rule fires and it is the external one -- but at a threshold no host can
-reach; the substantive claim, that `heapUsed` barely moves for a multi-MB
-backing-store leak, is measured directly in bytes by the sibling axis B test
-rather than inferred from a threshold. Verified by re-running the file with
-the co-rule threshold set to 1 byte/sec, which is an arbitrarily fast machine:
-the routing tests are unaffected.
-
 ### Parity and rule-key gates
 
 `test/27-parity.test.mjs` (7 scenarios) checks the export surface against
@@ -71,21 +157,6 @@ than shipping. `test/26-rule-key-validation.test.mjs` (7 scenarios) pins that
 every lane rejects rule keys it does not implement -- a silently-ignored rule
 makes a gate pass everything, which is the failure mode this package exists
 to prevent.
-
-### Cookbook
-
-Recipe 21 documents the external channel, with the measured blind-spot
-numbers, the `forceSettle()` requirement, and why `external` is read but never
-gated. Recipe 20's matrix table gains the `needsExternal` state. Coverage
-holds at **53 of 53 exports**. Every sample was executed against this build.
-
-### Carried forward
-
-The v1.9.2 evidence-lane fixtures and cookbook Recipes 19-20 were absent from
-this branch and are restored: three narrator tests were again gating on live
-measurements with absolute thresholds at 100-200 ops, which is how a
-string-formatting test comes to depend on the host machine's heap.
-Suite: 722 -> 745.
 
 ## 1.9.2
 

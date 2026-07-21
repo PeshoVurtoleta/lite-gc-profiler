@@ -1,6 +1,6 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 294 torture scenarios shipped across v1.1.0 through v1.10.0
+**Status:** 294 torture scenarios shipped across v1.1.0 through v1.10.1
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
@@ -459,7 +459,7 @@ the predicate's shape. If a lane ever admits caller-supplied durations, that
 is the first test to write.
 
 **Total shipped: 294 torture scenarios + 3 global invariants + 3 CLI
-integration scenarios (G16.5).** Full suite: 745 tests, under a publish-gated
+integration scenarios (G16.5).** Full suite: 752 tests, under a publish-gated
 coverage law (lines 95 / funcs 95 / branches 85, shipped files only).
 
 **G26.5 (v1.10.0) -- external memory + forced-GC provenance.** 16 scenarios

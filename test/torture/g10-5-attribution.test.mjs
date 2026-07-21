@@ -15,7 +15,7 @@ import {
     GcBudgetError, GcInconclusiveError,
     GC_MAJOR, GC_MINOR
 } from '../../Gc.js';
-import { startExplainSampling } from '../../Explain.js';
+import { startExplainSampling } from '../../ExplainSampling.js';
 import { assertAxisA, assertAxisC, assertAxisD, makeSummary, makePhase } from './harness.mjs';
 
 function makePhaseWithRegion(gc) {

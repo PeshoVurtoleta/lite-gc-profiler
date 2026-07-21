@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.10.0
+# @zakkster/lite-gc-profiler v1.10.1
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
