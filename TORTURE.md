@@ -1,7 +1,8 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** 294 torture scenarios shipped across v1.1.0 through v1.10.2
-(G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G99.9,
+**Status:** shipped across v1.1.0 through v1.11.0
+(G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G21.5,
+G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
 suites for the G16.5 partial-report path.
@@ -486,6 +487,41 @@ tests (`test/25-error-messages.test.mjs`) which pin what error messages must
 tell a stranger. They are not adversarial scenarios and are not axis-classified,
 but they guard the same property from the other end -- a gate whose output
 nobody can act on fails quietly too.
+
+**G26.6 (v1.11.0) -- per-call retained-allocation assertion.** 25 scenarios
+in `test/torture/g26-6-allocs.test.mjs` across axes A-D plus resource safety.
+`measureAllocs` is the estimator most likely to be trusted for a hard `== 0`
+claim inside another package's CI, so a silent pass here propagates a false
+zero-GC guarantee across the ecosystem -- the axis-A weight is higher than
+usual.
+
+Axis A (7): the fail-closed floor. `source:'none'`, `settled:false` (a batch
+missed its forced settle -- a partial min is not a floor), `bytesPerCall:null`
+despite settled, and the three non-finite traps -- `NaN`, `Infinity`, and an
+unmet `needsHeap` -- each of which a naive `actual > limit` gate would PASS
+because `NaN > 0` is false. All must be inconclusive; `assertAllocs` must throw
+`GcInconclusiveError`.
+
+Axis B (4): real retention that must fail. A genuine retainer measured across
+real batches (the min cannot drop below the function's own surviving
+allocation, so one artificially-low batch cannot rescue it), a synthetic result
+whose min exceeds the limit, the boundary (min exactly at limit passes, one
+over fails), and `assertAllocs` throwing `GcBudgetError`.
+
+Axis C (4): clean signal under hostile conditions. Zero-retention across many
+batches, a single-batch run (min equals max), `iterations:1`, and an
+astronomical-but-legal limit that must not overflow into a false breach.
+
+Axis D (5): self-consistency. `checkAllocs` never mutates its input, repeated
+checks agree byte-for-byte, `assertAllocs` agrees with `checkAllocs` on the
+same measurement, the report's `bytesPerCall` equals the result's, and the
+reported min equals `min(batchBytes)/iterations` on a real run.
+
+Plus resource safety (3): the measurement guard releases when the workload
+throws (a leaked guard would make the next `measureAllocs` throw
+"already in flight"), `measureAllocs` throws without `--expose-gc` (stubbed
+`globalThis.gc`), and the guard is never taken when that pre-check fails --
+so a following real measurement runs cleanly.
 
 ---
 

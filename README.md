@@ -774,6 +774,77 @@ summary so they don't inflate `steady`-phase counters.
   for GC-event-count gating; picking either separately is honest and
   correct.
 
+## Per-call assertion: `measureAllocs` and the zero-retention claim
+
+`measureOps` gives you a per-op allocation *rate* from one heap delta across a
+steady phase. `measureAllocs` gives you a per-call *assertion*: does one call
+retain any bytes at all? The two look similar and answer different questions.
+
+```js
+import { measureAllocs, assertAllocs } from '@zakkster/lite-gc-profiler';
+
+// The zero-retention claim, as a test.
+assertAllocs(
+  (i) => pool.acquire().release(),      // reuses a slot -> retains nothing
+  { maxBytesPerCall: 0 },
+  { iterations: 5_000, batches: 8 }
+);
+```
+
+**Requires `node --expose-gc`.** The estimator forces a collection at each
+batch boundary; without one, a per-call figure is a rate wearing an assertion's
+clothes, and this package will not pretend otherwise -- `measureAllocs` throws
+at measurement time when `globalThis.gc` is absent.
+
+### Why min-over-batches
+
+Each batch brackets its `iterations` calls between two forced collections and
+divides the surviving heap delta by the call count. The reported `bytesPerCall`
+is the **minimum** across `batches` batches, because ambient interference only
+ever *adds* bytes -- a stray timer, a late incremental mark -- and never
+subtracts the function's own retention. The floor is therefore the true
+per-call cost, and the min converges on it from above:
+
+```js
+const r = measureAllocs(leakyNode, { iterations: 2_000, batches: 8 });
+// r.batchBytes    per-batch totals, e.g. noisy [160k, 194k, 202k, 144k, ...]
+// r.bytesPerCall  the min / iterations, e.g. a clean 72
+// r.maxBytesPerCall  the spread, so a jumpy run is visible
+```
+
+### "Retained", precisely
+
+`measureAllocs` measures bytes that **survive a forced collection** --
+allocation the call kept alive. Transient garbage (allocated and immediately
+collectable) is invisible, because the pre-`after` settle reclaims it before the
+reading. This is not a gap to apologize for: a heap bracket can only see what is
+still on the heap, and the gating question -- *does this hot-path function leak
+state per call?* -- is a retention question. A pooled reactive node that reuses
+slots retains 0; a leaky one retains a growing amount. `maxBytesPerCall: 0`
+asserts the former. If you want transient allocation *rate* instead, that is
+`measureOps` with `maxBytesPerOp`.
+
+### One rule
+
+- `maxBytesPerCall` -- per-call retained bytes, the min over batches
+
+Verifiability matches `maxBytesPerOp` in the exported `VERDICT_MATRIX`: it needs
+a memory channel (`needsHeap`/`needsUasm`) and is `no` on `source: 'none'`. A
+run where any batch missed its forced settle reports `settled: false`, and the
+gate routes that to **inconclusive**, never a false pass -- a partial min is not
+a floor.
+
+### `measureAllocs` vs `measureOps`
+
+| | `measureOps` | `measureAllocs` |
+| --- | --- | --- |
+| question | allocation *rate* per op | *retained* bytes per call |
+| estimator | one steady-phase heap delta | min over N forced-settle batches |
+| needs `--expose-gc` | only for `stabilize` | always |
+| sees transient garbage | yes (as rate) | no (settled away) |
+| rule | `maxBytesPerOp` | `maxBytesPerCall` |
+| best for | throughput + rate budgets | the literal `: 0` assertion |
+
 ## Per-frame measurement: `measureFrames` and the render-loop lane
 
 The ops lane answers "what does one call cost?" The frame lane answers

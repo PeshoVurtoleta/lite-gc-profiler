@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.10.3';
+const VERSION = '1.11.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -1115,6 +1115,11 @@ const VERDICT_MATRIX = {
     // the whole-window rules: bytes-per-op needs a memory channel, event-kind
     // rates need 'gc' source. Semantics documented in assertOps().
     maxBytesPerOp:    { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' },
+    // G26 (v1.11.0). Per-CALL allocation from measureAllocs, distinct from the
+    // per-OP rate above: same memory-channel requirement, different estimator
+    // (min-over-batches vs single-window delta). Shares maxBytesPerOp's row
+    // because both need a heap channel and neither can be read from GC events.
+    maxBytesPerCall:  { gc: 'needsHeap', heap: 'needsHeap', uasm: 'needsUasm', none: 'no' },
     maxMajorsPerKOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxMinorsPerKOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
     maxPauseMsPerOp:  { gc: 'yes',       heap: 'no',        uasm: 'no',        none: 'no' },
@@ -2916,6 +2921,290 @@ function assertOps(fn, rules, opts) {
     return report;
 }
 
+// ---------------------------------------------------------------------------
+// G26 (v1.11.0) -- measureAllocs: the per-call allocation assertion.
+//
+// measureOps reports a per-op allocation RATE from one heap delta across a
+// steady phase. That is honest as a rate but cannot support the claim "this
+// function allocates nothing per call": a steady phase long enough to be
+// stable is long enough for ambient GC to move heapUsed by kilobytes, so a
+// zero-alloc function reads as a small positive rate and a small allocator can
+// read as zero when a collection lands mid-window.
+//
+// measureAllocs answers "does one call allocate?" by exploiting an asymmetry
+// measureOps ignores: ambient interference only ever ADDS bytes to a batch, it
+// never subtracts the function's own allocations. So across many batches the
+// MINIMUM converges on the true per-call cost from above. The min-over-batches
+// estimator is what turns a noisy rate into an assertion with a real zero.
+// ---------------------------------------------------------------------------
+
+const ALLOCS_SCHEMA = 'lite-gc-allocs/1';
+const ALLOCS_RULES = ['maxBytesPerCall'];
+
+/**
+ * Measure per-call RETAINED allocation with a batched, min-over-batches
+ * estimator.
+ *
+ * "Retained" is the load-bearing word. Each batch brackets its iterations
+ * between two forced collections, so the delta counts only bytes that SURVIVE
+ * a GC -- allocation the call kept alive. Transient garbage (allocated and
+ * immediately collectable) is invisible, because the pre-`after` settle
+ * reclaims it before the reading. This is not a limitation to apologize for:
+ * a heap bracket can only ever see what is still on the heap, and the question
+ * worth gating -- "does this hot-path function leak state per call?" -- is
+ * exactly a retention question. A pooled reactive node that reuses slots
+ * retains 0; a leaky one retains a growing amount. maxBytesPerCall: 0 asserts
+ * the former.
+ *
+ * For each batch: forceSettle, read heapUsed, run fn iterations times,
+ * forceSettle, read heapUsed, take the clamped delta / iterations. The
+ * reported bytesPerCall is the MINIMUM across batches, because no batch can
+ * retain less than the function's own surviving allocation once everything
+ * else has been collected -- so the floor is the answer.
+ *
+ * Requires node --expose-gc: a per-call figure without forced settling is a
+ * rate wearing an assertion's clothes, and this package does not ship that.
+ * Throws at measurement time (not construction) so code that never calls it
+ * stays portable, matching measureOps({stabilize:true}).
+ *
+ * @param {Function} fn            synchronous workload, called as fn(i)
+ * @param {object} opts
+ * @param {number} opts.iterations calls per batch (required, positive int)
+ * @param {number} [opts.batches=8]
+ * @param {number} [opts.warmup=iterations] pre-batch calls, unaccounted
+ * @param {string} [opts.source='auto']
+ * @param {number} [opts.capacity]
+ * @returns {object} AllocsResult (schema lite-gc-allocs/1)
+ */
+function measureAllocs(fn, opts) {
+    if (typeof fn !== 'function') throw new TypeError('measureAllocs: fn must be a function');
+    if (_isAsyncFunction(fn)) {
+        throw new TypeError(
+            'measureAllocs: fn is async. Per-call allocation is measured across a '
+            + 'synchronous before/after heap bracket; an await allocates promise '
+            + 'machinery that lands in a later microtask, outside that bracket, so '
+            + 'the number would systematically under-report. Use measureOpsAsync '
+            + 'for async workloads.'
+        );
+    }
+    if (!opts || typeof opts !== 'object') throw new TypeError('measureAllocs: opts is required');
+
+    const iterations = opts.iterations;
+    if (!Number.isFinite(iterations) || iterations <= 0 || (iterations | 0) !== iterations) {
+        throw new RangeError('measureAllocs: opts.iterations must be a positive integer');
+    }
+    const batches = opts.batches === undefined ? 8 : opts.batches;
+    if (!Number.isFinite(batches) || batches <= 0 || (batches | 0) !== batches) {
+        throw new RangeError('measureAllocs: opts.batches must be a positive integer');
+    }
+    const warmup = opts.warmup === undefined ? iterations : opts.warmup;
+    if (!Number.isFinite(warmup) || warmup < 0 || (warmup | 0) !== warmup) {
+        throw new RangeError('measureAllocs: opts.warmup must be a non-negative integer');
+    }
+
+    // The estimator is meaningless without forced settling. Guard on the CI
+    // path (measurement time) rather than construction so non-opting code runs
+    // anywhere, identical to measureOps stabilize.
+    const canForce = typeof globalThis.gc === 'function';
+    if (!canForce) {
+        throw new RangeError(
+            'measureAllocs: requires node --expose-gc (globalThis.gc must be a '
+            + 'function). The min-over-batches estimator depends on forcing a '
+            + 'collection at each batch boundary; without it, a per-call figure '
+            + 'is a rate, not an assertion. Run: node --expose-gc ...'
+        );
+    }
+
+    const gc = new GcProfiler(_validateCapacity('measureAllocs', opts.capacity), { source: opts.source || 'auto' });
+    _enterMeasurement('measureAllocs');
+    gc.start();
+
+    const source = gc.source;
+    const isNode = typeof process !== 'undefined' && process.memoryUsage;
+    const canSampleMemory = source !== 'none';
+
+    // Read heapUsed after a double-forced settle. Returns -1 when no channel
+    // exposes memory (source 'none') or the reading is non-finite -- a bad
+    // reading must not become a real byte count downstream.
+    function settledHeap() {
+        gc.forceSettle();
+        if (!canSampleMemory) return -1;
+        const t = typeof performance !== 'undefined' ? performance.now() : 0;
+        if (isNode) {
+            const mu = process.memoryUsage();
+            const used = mu.heapUsed;
+            gc.sampleHeap(t, used, mu);
+            return _isFiniteMetric(used) ? used : -1;
+        }
+        gc.sampleHeap(t);
+        const used = _readHeapUsedFor(gc);
+        return _isFiniteMetric(used) ? used : -1;
+    }
+
+    const batchBytes = [];
+    let anyUnmeasured = false;
+
+    try {
+        gc.phase('warmup');
+        for (let i = 0; i < warmup; i++) fn(i);
+
+        gc.phase('steady');
+        for (let b = 0; b < batches; b++) {
+            const before = settledHeap();
+            for (let i = 0; i < iterations; i++) fn(i);
+            const after = settledHeap();
+            if (before < 0 || after < 0) {
+                anyUnmeasured = true;
+                batchBytes.push(null);
+                continue;
+            }
+            // Clamp: a negative delta means GC freed a survivor from an earlier
+            // batch despite the pre-batch settle. Honest per-call floor is 0,
+            // not a negative that would break threshold math.
+            const delta = after - before;
+            batchBytes.push(delta > 0 ? delta : 0);
+        }
+    } finally {
+        gc.stop();
+        _exitMeasurement();
+    }
+    const summary = gc.summary();
+
+    // bytesPerCall is the MIN over measured batches; maxBytesPerCall exposes
+    // the spread so a caller can see a noisy run. When no batch produced a
+    // finite reading (source 'none', or every memoryUsage was bad), the figure
+    // is null -- not measured -- and the gate routes it to inconclusive.
+    let bytesPerCall = null;
+    let maxBytesPerCall = null;
+    let measuredBatches = 0;
+    for (let b = 0; b < batchBytes.length; b++) {
+        const v = batchBytes[b];
+        if (v === null) continue;
+        measuredBatches++;
+        const perCall = v / iterations;
+        if (bytesPerCall === null || perCall < bytesPerCall) bytesPerCall = perCall;
+        if (maxBytesPerCall === null || perCall > maxBytesPerCall) maxBytesPerCall = perCall;
+    }
+
+    return {
+        schema: ALLOCS_SCHEMA,
+        iterations, batches, warmupCalls: warmup,
+        measuredBatches,
+        bytesPerCall,
+        maxBytesPerCall,
+        batchBytes,
+        // True only if every batch got both forced settles AND a finite
+        // reading. anyUnmeasured means at least one batch is a hole, which the
+        // gate treats as unverifiable rather than trusting a partial min.
+        settled: canForce && !anyUnmeasured && measuredBatches === batches,
+        source: summary.source,
+        summary
+    };
+}
+
+/**
+ * Gate a measureAllocs result. Verdict semantics identical to checkOps:
+ * fail > inconclusive > pass. The dominant rule is maxBytesPerCall: 0.
+ */
+function checkAllocs(result, rules) {
+    if (!result || result.schema !== ALLOCS_SCHEMA) {
+        throw new TypeError('checkAllocs: result must be a measureAllocs() result');
+    }
+    _validateRules('checkAllocs', rules, ALLOCS_RULES);
+    const r = rules || {};
+
+    const checked = {};
+    const violations = [];
+    let inconclusive = false;
+    const reasons = [];
+
+    if (r.maxBytesPerCall !== undefined) {
+        // Verifiability mirrors maxBytesPerOp exactly. An unmeasured or
+        // partial run (settled:false) cannot support a per-call assertion.
+        const verifiable = _isCheckableAllocs('maxBytesPerCall', result) && result.settled;
+        if (!verifiable) {
+            checked.maxBytesPerCall = false;
+            inconclusive = true;
+            if (!result.settled && result.source !== 'none') {
+                reasons.push('maxBytesPerCall: run did not settle on every batch '
+                    + '(a batch lacked a finite heap reading), so the per-call floor is unverifiable');
+            } else {
+                reasons.push('maxBytesPerCall: no memory channel on source "' + result.source
+                    + '", so per-call allocation was not measured');
+            }
+        } else {
+            checked.maxBytesPerCall = true;
+            const actual = result.bytesPerCall;
+            if (actual > r.maxBytesPerCall) {
+                violations.push({
+                    rule: 'maxBytesPerCall',
+                    metric: 'bytesPerCall',
+                    actual,
+                    limit: r.maxBytesPerCall,
+                    reason: 'bytesPerCall ' + actual.toFixed(2) + ' > limit ' + r.maxBytesPerCall.toFixed(2)
+                        + ' (min over ' + result.measuredBatches + ' batches of ' + result.iterations + ' calls)'
+                });
+            }
+        }
+    }
+
+    let verdict;
+    if (violations.length > 0) verdict = 'fail';
+    else if (inconclusive) verdict = 'inconclusive';
+    else verdict = 'pass';
+
+    return {
+        kind: 'checkAllocs',
+        verdict,
+        source: result.source,
+        checked,
+        violations,
+        reasons,
+        bytesPerCall: result.bytesPerCall
+    };
+}
+
+// Per-call verifiability. Mirrors _isCheckableOps but reads bytesPerCall.
+function _isCheckableAllocs(rule, result) {
+    const row = VERDICT_MATRIX[rule];
+    if (!row) return false;
+    const state = row[result.source];
+    if (state === 'yes') return true;
+    if (state === 'no') return false;
+    if (state === 'needsHeap') return _isFiniteMetric(result.bytesPerCall);
+    if (state === 'needsUasm') {
+        return result.summary && result.summary.uasm && result.summary.uasm.samples >= 2;
+    }
+    return false;
+}
+
+/**
+ * measureAllocs + checkAllocs, throwing like assertOps.
+ *
+ * @param {Function} fn
+ * @param {object} rules   e.g. { maxBytesPerCall: 0 }
+ * @param {object} opts    Same as measureAllocs, plus optional allowInconclusive.
+ */
+function assertAllocs(fn, rules, opts) {
+    const result = measureAllocs(fn, opts);
+    const report = checkAllocs(result, rules);
+    if (report.verdict === 'fail') {
+        throw new GcBudgetError(report);
+    }
+    if (report.verdict === 'inconclusive' && !(opts && opts.allowInconclusive)) {
+        throw new GcInconclusiveError(report);
+    }
+    return report;
+}
+
+// Detect an async function so measureAllocs can reject it with a pointer to
+// measureOpsAsync. Covers `async function` and async arrows; a sync function
+// that returns a promise is not detectable here and is out of scope -- the
+// contract is about the call site allocating promise machinery synchronously.
+function _isAsyncFunction(fn) {
+    return fn && fn.constructor && fn.constructor.name === 'AsyncFunction';
+}
+
 // Delta rule names -- mirror maxExtra* on compareGc.
 const COMPARE_OPS_RULES = {
     maxExtraBytesPerOp:   'maxBytesPerOp',
@@ -4692,6 +4981,8 @@ export {
     // Batch 6 (v1.3.0) -- per-op primitives.
     measureOps, checkOps, assertOps,
     compareOps, assertCompareOps,
+    // G26 (v1.11.0) -- per-call allocation assertion.
+    measureAllocs, checkAllocs, assertAllocs,
     // Batch 7 (v1.4.0) -- per-frame primitives.
     measureFrames, checkFrames, assertFrames,
     compareFrames, assertCompareFrames,

@@ -289,6 +289,7 @@ Pick the one whose *shape* matches your workload.
 | your workload | primitive | schema |
 | --- | --- | --- |
 | synchronous hot path, tight loop | `measureOps` | `lite-gc-ops/1` |
+| synchronous hot path, "retains nothing per call" as a hard `== 0` | `measureAllocs` | `lite-gc-allocs/1` |
 | async hot path, awaits between calls | `measureOpsAsync` | `lite-gc-ops-async/1` |
 | render loop, work per frame, frame budget | `measureFrames` | `lite-gc-frames/1` |
 | whole-window observation, no per-op or per-frame accounting | `assertNoGc` / `checkNoGc` | `lite-gc-report/1` |
@@ -296,7 +297,11 @@ Pick the one whose *shape* matches your workload.
 Rules of thumb:
 
 - **Solid.js signals**, **Preact Signals sync path**, **any function
-  that returns synchronously** -- `measureOps`.
+  that returns synchronously** -- `measureOps` for the allocation *rate*,
+  `measureAllocs` when you want to *assert* the call retains nothing.
+- **A pooled primitive** -- an object pool's acquire/release, a reused
+  reactive node, a ring-buffer write -- where the claim is "one call
+  keeps no new state alive": `measureAllocs` with `maxBytesPerCall: 0`.
 - **Vue reactivity effects**, **Svelte 5 runes**, **Preact Signals
   batched effects**, **any function that awaits its own work** --
   `measureOpsAsync`.
@@ -364,6 +369,63 @@ objects are not.
 setup, because two measurements running concurrently silently
 contaminate each other's readings on the shared heap. Use them
 sequentially, which is what `compareOps` does internally anyway.
+
+---
+
+## Recipe 3b: The zero-retention assertion with `measureAllocs`
+
+**Goal.** Prove a hot-path function keeps *nothing* alive per call, as a
+`node:test` line that fails the build if it ever starts leaking state.
+
+`measureOps` gives you a rate; `maxBytesPerOp: 0` on it is really
+"below the noise floor," which is why Recipe 3 spends its length on
+choosing a defensible multiple. `measureAllocs` gives you a floor
+directly, so `maxBytesPerCall: 0` means what it says.
+
+```js
+import { assertAllocs } from '@zakkster/lite-gc-profiler';
+
+// A pooled node: acquire reuses a free slot, release returns it.
+// If this ever starts retaining per call, the test goes red.
+assertAllocs(
+  (i) => { const n = pool.acquire(); n.value = i; pool.release(n); },
+  { maxBytesPerCall: 0 },
+  { iterations: 5_000, batches: 8 }
+);
+```
+
+**How it reaches a real zero.** Each batch brackets its calls between
+two forced collections and divides the *surviving* heap delta by the
+call count. The reported `bytesPerCall` is the **minimum** across
+batches. Ambient noise -- a stray timer, a late incremental mark --
+only ever *adds* bytes, so the floor is the truth and the min finds it:
+
+```js
+const r = measureAllocs(leakyNode, { iterations: 2_000, batches: 8 });
+r.batchBytes;      // noisy per-batch totals: [160k, 194k, 144k, 202k, ...]
+r.bytesPerCall;    // the clean floor: 72
+r.maxBytesPerCall; // the spread, so you can see a jumpy run
+```
+
+**"Retained", not "allocated".** `measureAllocs` sees only bytes that
+survive the forced collection. Transient garbage -- allocated and
+immediately dropped -- is invisible, because the settle before the
+reading reclaims it. That is the right measurement for the question
+*does this call leak state?*, and the wrong one for *what is this
+call's allocation rate?* (that is `measureOps`).
+
+**Requires `node --expose-gc`.** Without it the estimator has no way to
+force a collection at each boundary, so `measureAllocs` throws rather
+than reporting a rate dressed as an assertion. Your test runner already
+passes it (`node --expose-gc --test ...`); a fixture that runs without
+it gets a clear error, not a silent wrong number.
+
+**Gotcha.** `measureAllocs` is *sync-only*. An `async` function is
+rejected at the call site with a pointer to `measureOpsAsync`: an
+`await` allocates promise machinery in a later microtask, outside the
+batch's before/after bracket, so the number would systematically
+under-report. If the workload awaits, its retention is not a
+`measureAllocs` question.
 
 ---
 

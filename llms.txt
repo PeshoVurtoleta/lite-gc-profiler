@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.10.3
+# @zakkster/lite-gc-profiler v1.11.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -19,6 +19,7 @@ test-helpers/explain and the lite-gc-gate CLI.
   `aggregateGc`, `gateReps`, `assertReps`,
   `measureOps`, `checkOps`, `assertOps`,
   `compareOps`, `assertCompareOps`,
+  `measureAllocs`, `checkAllocs`, `assertAllocs`,
   `measureFrames`, `checkFrames`, `assertFrames`,
   `compareFrames`, `assertCompareFrames`,
   `measureOpsAsync`, `checkOpsAsync`, `assertOpsAsync`,
@@ -130,6 +131,15 @@ callback increments one integer per batch beyond delivering entries.
 Self-noise on old hardware: 0 majors, 2-4 minors, ~0.5 ms longest pause,
 250-770 KB heap growth per 500ms noop window (mostly V8, not the
 profiler).
+
+`measureAllocs` (v1.11.0) turns this into an assertion you can run on
+your OWN hot path: it measures per-call RETAINED bytes (allocation
+surviving a forced collection) via a min-over-batches estimator, so
+`maxBytesPerCall: 0` is the literal zero-retention claim. Requires
+`--expose-gc`; rejects async fns (use `measureOpsAsync`); an unsettled
+or non-finite run is inconclusive, never a false pass. Distinct from
+`measureOps`, which reports an allocation RATE (`maxBytesPerOp`) and
+sees transient garbage that `measureAllocs` settles away.
 
 ## License
 

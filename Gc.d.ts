@@ -5,7 +5,7 @@ export interface NodeMemoryUsageLike {
     arrayBuffers?: number;
 }
 
-export const VERSION: '1.10.3';
+export const VERSION: '1.11.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -852,6 +852,81 @@ export function checkOps(result: MeasureOpsResult, rules?: OpsRules): OpsGateRes
  * GcInconclusiveError on inconclusive (unless opts.allowInconclusive).
  */
 export function assertOps(fn: MeasureOpsFn, rules: OpsRules, opts: MeasureOpsOptions): OpsGateResult;
+
+/**
+ * Options for measureAllocs and assertAllocs. Requires node --expose-gc:
+ * the min-over-batches estimator forces a collection at each batch boundary.
+ */
+export interface MeasureAllocsOptions {
+    /** Calls per batch. Required, positive integer. */
+    iterations: number;
+    /** Number of batches; the reported figure is the min across them. Default 8. */
+    batches?: number;
+    /** Pre-batch calls, unaccounted, to warm hidden classes/JIT. Default iterations. */
+    warmup?: number;
+    source?: GcSource | 'auto';
+    capacity?: number;
+    /** assertAllocs only: return instead of throwing on an inconclusive verdict. */
+    allowInconclusive?: boolean;
+}
+
+/**
+ * A measureAllocs result. `bytesPerCall` is the per-call RETAINED allocation
+ * (bytes surviving a forced collection), taken as the MINIMUM across batches
+ * so ambient noise -- which only ever adds -- is stripped off. Null when the
+ * source cannot provide a memory signal (source='none') or no batch produced
+ * a finite reading. `settled` is false if any batch missed its forced settle
+ * or a heap reading, which routes the gate to inconclusive.
+ */
+export interface MeasureAllocsResult {
+    schema: 'lite-gc-allocs/1';
+    iterations: number;
+    batches: number;
+    warmupCalls: number;
+    measuredBatches: number;
+    bytesPerCall: number | null;
+    maxBytesPerCall: number | null;
+    batchBytes: Array<number | null>;
+    settled: boolean;
+    source: GcSource;
+    summary: GcSummary;
+}
+
+/** Per-call gate rules. `maxBytesPerCall: 0` is the zero-retention assertion. */
+export interface AllocsRules {
+    maxBytesPerCall?: number;
+}
+
+/** Per-call gate report; use assertAllocs to throw instead. */
+export interface AllocsGateResult {
+    kind: 'checkAllocs';
+    verdict: 'pass' | 'fail' | 'inconclusive';
+    source: GcSource;
+    checked: Partial<Record<keyof AllocsRules, boolean>>;
+    violations: Array<{ rule: string; metric: string; limit: number; actual: number; reason: string }>;
+    reasons: string[];
+    bytesPerCall: number | null;
+}
+
+/**
+ * Measure per-call retained allocation with a batched, min-over-batches
+ * estimator. Requires node --expose-gc. Rejects async functions -- use
+ * measureOpsAsync. See MeasureAllocsResult for the meaning of "retained".
+ */
+export function measureAllocs(fn: MeasureOpsFn, opts: MeasureAllocsOptions): MeasureAllocsResult;
+
+/**
+ * Gate a measureAllocs result. Returns the report; use assertAllocs to throw
+ * on non-pass verdicts. A run that did not settle on every batch is
+ * inconclusive, never a false pass.
+ */
+export function checkAllocs(result: MeasureAllocsResult, rules?: AllocsRules): AllocsGateResult;
+
+/**
+ * Measure and gate per-call allocation in one call. Throws GcBudgetError on
+ * fail, GcInconclusiveError on inconclusive (unless opts.allowInconclusive).
+ */
+export function assertAllocs(fn: MeasureOpsFn, rules: AllocsRules, opts: MeasureAllocsOptions): AllocsGateResult;
 
 /**
  * Compare two measureOps results. Convenience form accepts two functions

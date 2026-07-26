@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.11.0
+
+`measureAllocs` -- the per-call retained-allocation assertion (G26). The
+niche-definer: every hot-path function in the ecosystem can now assert
+"retains nothing per call" as a `node:test` line, not as a benchmark badge.
+
+### Added
+
+- **`measureAllocs(fn, opts)`** -- measures per-call RETAINED bytes with a
+  batched, min-over-batches estimator. For each of `opts.batches` batches it
+  brackets `opts.iterations` calls between two forced collections and divides
+  the surviving heap delta by the call count; the reported `bytesPerCall` is
+  the **minimum** across batches. Ambient interference only ever adds bytes, so
+  the floor is the true per-call cost and the min converges on it from above.
+  Returns `{ schema, iterations, batches, warmupCalls, measuredBatches,
+  bytesPerCall, maxBytesPerCall, batchBytes, settled, source, summary }`
+  (schema `lite-gc-allocs/1`).
+- **`checkAllocs(result, rules)`** and **`assertAllocs(fn, rules, opts)`** --
+  gate a result; same verdict discipline as `checkOps` (fail > inconclusive >
+  pass). `assertAllocs` throws `GcBudgetError`/`GcInconclusiveError`.
+- **Rule `maxBytesPerCall`** -- per-call retained bytes. Added to
+  `VERDICT_MATRIX` sharing `maxBytesPerOp`'s row (`needsHeap`/`needsUasm`,
+  `none: 'no'`). The dominant use is `maxBytesPerCall: 0`, the literal
+  zero-retention assertion.
+
+### Why it is not measureOps
+
+`measureOps` reads one steady-phase heap delta and reports an allocation
+*rate*; a steady phase long enough to be stable is long enough for ambient GC
+to move `heapUsed` by kilobytes, so a zero-alloc function reads as a small
+positive rate and a small allocator can read as zero when a collection lands
+mid-window. `measureAllocs` answers a different question -- *does one call
+retain state?* -- and the min-over-batches estimator turns the noisy rate into
+an assertion with a real, reachable `0`.
+
+### "Retained", precisely
+
+`measureAllocs` sees bytes that **survive a forced collection**. Transient
+garbage is invisible, because the pre-`after` settle reclaims it. This is not a
+gap: a heap bracket can only see what is still on the heap, and the gating
+question -- does a hot-path function leak state per call? -- is a retention
+question. A pooled node that reuses slots retains 0; a leaky one retains a
+growing amount. For transient allocation *rate*, use `measureOps` with
+`maxBytesPerOp`.
+
+### Fail-closed
+
+- **Requires `node --expose-gc`.** The estimator forces a collection at each
+  batch boundary; without one, a per-call figure is a rate, not an assertion.
+  Throws `RangeError` at measurement time (not construction), so non-opting
+  code stays portable -- identical to `measureOps({stabilize:true})`.
+- **`settled: false`** (any batch missed its forced settle or a finite heap
+  reading) routes the gate to **inconclusive**. A partial min is not a floor.
+- **`source: 'none'`** -> `bytesPerCall: null` -> inconclusive, honoring a
+  memory-unaware simulation.
+- **Non-finite `bytesPerCall`** (NaN/Infinity from a mocked `memoryUsage`) ->
+  inconclusive via `_isFiniteMetric`, never a laundered pass. `NaN > 0` is
+  false, so a naive gate would have passed it.
+- **async `fn`** is rejected with a `TypeError` pointing at `measureOpsAsync`:
+  an `await` allocates promise machinery in a later microtask, outside the
+  batch bracket, so the number would systematically under-report.
+
+### Testing
+
+51 new scenarios: 26 standard-case (`test/29-measure-allocs.test.mjs`) and 25
+torture across axes A-D plus resource-safety (`test/torture/g26-6-allocs.test.mjs`),
+including the guard-release-on-throw and no-`--expose-gc` paths. Full suite:
+819 tests. Coverage holds above the enforced 96/88/95 line/branch/function
+thresholds.
+
 ## 1.10.3
 
 Demo only. No source change, no test change, no published-artifact change --
