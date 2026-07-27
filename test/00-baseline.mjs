@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as api from '../Gc.js';
 
-const EXPECTED_VERSION = '1.11.0';
+const EXPECTED_VERSION = '1.12.0';
 
 test('VERSION constant matches expected release version', () => {
     assert.equal(api.VERSION, EXPECTED_VERSION,
@@ -23,7 +23,7 @@ test('all named exports resolve', () => {
         'compareGc', 'assertCompare',
         'aggregateGc', 'gateReps', 'assertReps',
         'captureFingerprint', 'createBaseline',
-        'checkAgainstBaseline', 'assertAgainstBaseline',
+        'checkAgainstBaseline', 'assertAgainstBaseline', 'ratchetBaseline',
         'formatConsole', 'formatJson', 'formatMarkdown', 'formatGithubAnnotations',
         'GcBudgetError', 'GcInconclusiveError',
         'GC_DEFAULT_RULES', 'GC_DEFAULT_DIFFERENTIAL_RULES', 'REP_POLICY_DEFAULTS',

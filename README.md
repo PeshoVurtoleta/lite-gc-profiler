@@ -1232,6 +1232,7 @@ lite-gc-gate run <script> [options]
 | `--json path` | Also write the JSON envelope to this path |
 | `--baseline path` | Check against a baseline JSON file |
 | `--update-baseline` | Write current aggregate as new baseline |
+| `--ratchet` | Tighten `--baseline` toward a passing run (only ever lowers; needs `--baseline`, excludes `--update-baseline`) |
 | `--accept-fingerprint-mismatch` | Allow baseline comparison across fingerprints |
 | `--allow-inconclusive` | Exit 2 instead of 1 on inconclusive |
 
@@ -1266,6 +1267,29 @@ lite-gc-gate run bench/hot.mjs --reps 20 --baseline gc-baseline.json --update-ba
 # Every subsequent build:
 lite-gc-gate run bench/hot.mjs --reps 20 --baseline gc-baseline.json --format github
 ```
+
+**Example: ratchet the baseline on every green build.**
+
+A static baseline only catches regressions below the line you first drew. If a
+release improves `major` from 8 to 3 and a later one slips back to 7, a baseline
+frozen at 8 still passes -- the win evaporated silently. `--ratchet` makes the
+baseline a lockfile that only ever tightens:
+
+```
+# On every green build, after the gate passes, tighten the committed floor:
+lite-gc-gate run bench/hot.mjs --reps 20 --baseline gc-baseline.json --ratchet
+# -> "baseline ratcheted (3 metrics tightened: gc.major, gc.totalMs, gc.count)"
+# then commit the updated gc-baseline.json
+```
+
+On a passing run it rewrites `gc-baseline.json` with the element-wise minimum of
+the old floor and this run, and prints what moved. On a failing or inconclusive
+run it leaves the file byte-identical and exits non-zero -- you never ratchet
+toward a number you just failed. Unlike `--update-baseline` (which overwrites in
+either direction and can enshrine a regression), `--ratchet` is safe to run
+unattended in CI: it can only lower the floor, and only on a run that cleared
+the current one. A metric the run could not measure is carried forward
+unchanged -- the floor a run did not see is one it cannot move.
 
 **`process.exit()` handling (v1.3.0+).** If the target script calls
 `process.exit()` before `beforeExit` can settle, the register preload's

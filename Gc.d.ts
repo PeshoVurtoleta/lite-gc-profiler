@@ -5,7 +5,7 @@ export interface NodeMemoryUsageLike {
     arrayBuffers?: number;
 }
 
-export const VERSION: '1.11.0';
+export const VERSION: '1.12.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -689,6 +689,38 @@ export function assertAgainstBaseline(
     baseline: GcBaseline,
     options?: CheckAgainstBaselineOptions
 ): GcBaselineResult;
+
+/** Result of ratchetBaseline (G28, v1.12.0). */
+export interface GcRatchetResult {
+    /**
+     * The tightened baseline, or the OLD baseline unchanged (same object
+     * reference) when nothing moved or the ratchet was refused.
+     */
+    baseline: GcBaseline;
+    /** True if any metric moved down. */
+    ratcheted: boolean;
+    /** Which metrics tightened, e.g. ['gc.major', 'heap.allocBytes']. */
+    changed: string[];
+    /** Set when ratcheted is false due to a guard. */
+    reason?: 'invalid_baseline' | 'fingerprint_mismatch' | (string & {});
+    /** True when acceptFingerprintMismatch was used to ratchet across hosts. */
+    fingerprintMismatchAccepted?: boolean;
+}
+
+/**
+ * Tighten a committed baseline toward a passing run (G28). Returns a NEW
+ * baseline whose every metric is the element-wise minimum of old and current,
+ * so a floor can only move DOWN. A metric absent or non-finite in the current
+ * aggregate is carried forward unchanged. Refuses across a fingerprint mismatch
+ * unless options.acceptFingerprintMismatch. Only meaningful on a run that
+ * passed checkAgainstBaseline -- being a pure min, it can never loosen a floor,
+ * so a misuse fails to tighten rather than enshrining a regression.
+ */
+export function ratchetBaseline(
+    oldBaseline: GcBaseline,
+    currentAggregate: GcAggregate,
+    options?: CheckAgainstBaselineOptions
+): GcRatchetResult;
 
 // ---- report kind discriminator (G7 addition) ----
 

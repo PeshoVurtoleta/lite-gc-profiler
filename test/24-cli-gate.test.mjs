@@ -308,3 +308,71 @@ test('CLI: a truncated report file is an infrastructure error, never a pass', ()
         'the failure must name the parse rather than surfacing a raw stack; got: ' + out.slice(0, 200));
     assert.doesNotMatch(out, /\bPASS\b/, 'an unparseable report must never narrate a pass');
 });
+
+// ---------------------------------------------------------------------------
+// G28 (v1.12.0): --ratchet
+// ---------------------------------------------------------------------------
+
+test('CLI: --ratchet without --baseline is a usage error (exit 3)', () => {
+    const res = cli(['run', CLEAN, '--ratchet']);
+    assert.equal(res.status, 3);
+    assert.match(res.stderr, /--ratchet requires --baseline/);
+});
+
+test('CLI: --ratchet with --update-baseline is a usage error (exit 3)', () => {
+    const res = cli(['run', CLEAN, '--baseline', 'x.json', '--ratchet', '--update-baseline']);
+    assert.equal(res.status, 3);
+    assert.match(res.stderr, /mutually exclusive/);
+});
+
+test('CLI: --ratchet tightens a loose baseline on a passing run and rewrites the file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lite-gc-g28cli-'));
+    const baselinePath = join(dir, 'baseline.json');
+
+    // Capture a baseline, then LOOSEN it far beyond any real run so the current
+    // run is guaranteed better on at least one metric AND passes the check.
+    const wrote = cli(['run', CLEAN, '--baseline', baselinePath, '--update-baseline']);
+    assert.equal(wrote.status, 0, 'stderr=' + wrote.stderr);
+    const loose = JSON.parse(readFileSync(baselinePath, 'utf8'));
+    for (const block of [loose.gc, loose.heap, loose.uasm]) {
+        if (!block) continue;
+        for (const k in block) { block[k].min = 1e12; block[k].median = 1e12; block[k].max = 1e12; }
+    }
+    writeFileSync(baselinePath, JSON.stringify(loose, null, 2));
+
+    const ratcheted = cli(['run', CLEAN, '--baseline', baselinePath, '--ratchet']);
+    assert.equal(ratcheted.status, 0, 'a passing ratchet exits 0; stderr=' + ratcheted.stderr);
+    assert.match(ratcheted.stdout, /baseline ratcheted/);
+
+    // The file must now be tighter than the absurd 1e12 we wrote.
+    const after = JSON.parse(readFileSync(baselinePath, 'utf8'));
+    let anyTightened = false;
+    for (const block of [after.gc, after.heap, after.uasm]) {
+        if (!block) continue;
+        for (const k in block) { if (block[k].max < 1e12) anyTightened = true; }
+    }
+    assert.ok(anyTightened, 'at least one metric must have ratcheted below the loosened ceiling');
+});
+
+test('CLI: --ratchet on a regressing run leaves the baseline untouched and fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lite-gc-g28cli-fail-'));
+    const baselinePath = join(dir, 'baseline.json');
+
+    // A baseline captured from the CLEAN target, then pinned to an
+    // impossibly-tight floor so the DIRTY run must regress against it.
+    cli(['run', CLEAN, '--baseline', baselinePath, '--update-baseline']);
+    const tight = JSON.parse(readFileSync(baselinePath, 'utf8'));
+    for (const block of [tight.gc, tight.heap, tight.uasm]) {
+        if (!block) continue;
+        for (const k in block) { block[k].min = 0; block[k].median = 0; block[k].max = 0; }
+    }
+    writeFileSync(baselinePath, JSON.stringify(tight, null, 2));
+    const before = readFileSync(baselinePath, 'utf8');
+
+    const res = cli(['run', DIRTY, '--baseline', baselinePath, '--ratchet']);
+    // A regression exits 1 (or 2 if the run was inconclusive on this host);
+    // either way it must NOT be 0, and the file must be byte-identical.
+    assert.notEqual(res.status, 0, 'a regressing ratchet must not exit 0');
+    assert.equal(readFileSync(baselinePath, 'utf8'), before,
+        'a failing ratchet must leave the committed baseline untouched');
+});

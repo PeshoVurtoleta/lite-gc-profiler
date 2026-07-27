@@ -1,8 +1,8 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** shipped across v1.1.0 through v1.11.0
+**Status:** shipped across v1.1.0 through v1.12.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G21.5,
-G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G99.9,
+G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G28.6, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
 suites for the G16.5 partial-report path.
@@ -522,6 +522,42 @@ throws (a leaked guard would make the next `measureAllocs` throw
 "already in flight"), `measureAllocs` throws without `--expose-gc` (stubbed
 `globalThis.gc`), and the guard is never taken when that pre-check fails --
 so a following real measurement runs cleanly.
+
+**G28.6 (v1.12.0) -- the ratchet baseline.** 19 scenarios in
+`test/torture/g28-6-ratchet.test.mjs` across axes A-D, plus 4 CLI cases in
+`test/24-cli-gate.test.mjs`. A ratchet that tightens on bad evidence is worse
+than no ratchet: it would enshrine a phantom floor nobody can meet, or silently
+erase a real one. The invariant under every axis is that a ratchet can only ever
+LOWER a floor, and only on evidence it can actually see.
+
+Axis A (8): must not tighten on unusable input. An invalid-schema baseline and a
+null baseline return unchanged with a reason; a non-aggregate current throws
+(a caller who passes the wrong thing must find out, not get a false "held"); a
+`NaN` or `Infinity` current metric cannot tighten (never min against a
+non-number); a partial stat tightens only its finite fields; a fingerprint
+mismatch refuses by default and stamps the audit trail when overridden.
+
+Axis B (3): real improvement that must tighten and hold. The give-back scenario
+(improve 8->3, regress to 7: static baseline passes it, ratcheted baseline
+fails it); a long chain of improvements interleaved with worse runs ratchets
+monotonically to the best ever seen; one metric improving while another
+regresses tightens only the winner and holds the loser's floor.
+
+Axis C (3): clean tighten under hostile shapes. Empty metric maps ratchet
+nothing without throwing; a baseline missing `uasm` entirely is handled; a
+current carrying metrics the baseline lacks does not grow the baseline's
+surface.
+
+Axis D (5): self-consistency. Never loosens (for any old/current pair the result
+is `<=` old on every metric); idempotent (ratcheting the same run twice is a
+no-op); a no-op returns the same object reference unmutated; a real ratchet does
+not mutate the input baseline (returns a new object, original untouched);
+`changed` lists exactly the metrics whose values moved.
+
+The 4 CLI cases pin the wiring: `--ratchet` without `--baseline` and with
+`--update-baseline` are both usage errors (exit 3); a passing run rewrites the
+file tighter; a regressing run leaves the committed file byte-identical and
+exits non-zero.
 
 ---
 

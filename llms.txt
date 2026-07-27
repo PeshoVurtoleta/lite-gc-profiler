@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.11.0
+# @zakkster/lite-gc-profiler v1.12.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -28,6 +28,7 @@ test-helpers/explain and the lite-gc-gate CLI.
   `aggregateFrameReports`, `checkAggregateFramesReport`, `assertAggregateFramesReport`,
   `captureFingerprint`,
   `createBaseline`, `checkAgainstBaseline`, `assertAgainstBaseline`,
+  `ratchetBaseline`,
   `formatConsole`, `formatJson`, `formatMarkdown`,
   `formatGithubAnnotations`, `GcBudgetError`, `GcInconclusiveError`,
   `GC_DEFAULT_RULES`, `GC_DEFAULT_DIFFERENTIAL_RULES`,
@@ -116,6 +117,21 @@ test-helpers/explain and the lite-gc-gate CLI.
   comparable metrics at all -> `inconclusive` with
   `reason: 'no_comparable_metrics'`, never `pass`.
 - Fingerprint mismatch -> inconclusive (D6).
+- ratchetBaseline (G28, v1.12.0): tighten a committed baseline toward a
+  PASSING run. Returns { baseline, ratcheted, changed, reason? }; every
+  metric is the element-wise min of old and current, so a floor only ever
+  moves DOWN. A metric absent or non-finite in the current aggregate is
+  carried forward unchanged (never min against a hole). Fingerprint-guarded
+  like checkAgainstBaseline. Pure min -> misuse can only fail to tighten,
+  never enshrine a regression. Distinct from --update-baseline, which
+  overwrites in either direction. It closes the static-floor blind spot: a
+  baseline frozen at major=8 passes a regression 3->7; a ratcheted floor at
+  3 catches it.
+- CLI --ratchet (v1.12.0): on `lite-gc-gate run ... --baseline b.json
+  --ratchet`, capture -> checkAgainstBaseline -> on pass rewrite b.json
+  tighter (prints what moved), on fail/inconclusive leave it byte-identical
+  and exit non-zero. Requires --baseline; mutually exclusive with
+  --update-baseline.
 - `summary.phases`/`summary.byRegion` define keys via defineProperty
   (v1.5.2), so a phase named `__proto__` is a real key. Prototype and
   shape are unchanged; no assertion style change is needed.

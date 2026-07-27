@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.11.0';
+const VERSION = '1.12.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -2203,6 +2203,111 @@ function assertAgainstBaseline(currentAggregate, baseline, options) {
         throw new GcInconclusiveError(rep);
     }
     return rep;
+}
+
+// ---------------------------------------------------------------------------
+// G28 (v1.12.0) -- the ratchet baseline.
+//
+// createBaseline + checkAgainstBaseline are a STATIC floor: they catch a
+// regression below the line you drew, but not the quiet give-back of an
+// improvement you took AFTER drawing it. If `major` was 8, you cut it to 3,
+// then a refactor pushes it back to 7, a baseline frozen at 8 still passes --
+// the win evaporated silently. ratchetBaseline closes that: a committed
+// lockfile that only ever tightens, so ground taken is ground held. Same rule
+// the coverage floors already use ("measured minus one, only when exceeded"),
+// brought to perf baselines.
+// ---------------------------------------------------------------------------
+
+/**
+ * Tighten a baseline toward a passing current run. Returns a NEW baseline whose
+ * every metric is the element-wise minimum of old and current -- a metric can
+ * only move down, never up.
+ *
+ * Two guards, because a ratchet that tightens on bad evidence is worse than no
+ * ratchet:
+ *   1. Callers must only ratchet a run that PASSED checkAgainstBaseline. This
+ *      function does not re-run the check (the CLI enforces ordering), but it
+ *      is a pure min: it can never LOOSEN a baseline, so even a misuse cannot
+ *      enshrine a regression -- the worst a bad call does is fail to tighten.
+ *   2. A metric present in the old baseline but absent or non-finite in the
+ *      current aggregate is carried forward UNCHANGED, never dropped and never
+ *      min'd against a non-number. The floor a run did not measure is a floor
+ *      it has no standing to move.
+ *
+ * Fingerprint mismatch is refused (old baseline returned unchanged) unless
+ * options.acceptFingerprintMismatch, mirroring checkAgainstBaseline.
+ *
+ * @returns {{ baseline: object, ratcheted: boolean, changed: string[], reason?: string }}
+ */
+function ratchetBaseline(oldBaseline, currentAggregate, options) {
+    const opts = options || {};
+    if (!oldBaseline || oldBaseline.schema !== BASELINE_SCHEMA) {
+        return { baseline: oldBaseline, ratcheted: false, changed: [], reason: 'invalid_baseline' };
+    }
+    if (!currentAggregate || typeof currentAggregate !== 'object' ||
+            typeof currentAggregate.reps !== 'number') {
+        throw new TypeError('ratchetBaseline: currentAggregate must be a result from aggregateGc');
+    }
+
+    const currentFp = captureFingerprint();
+    const fpMatch = _fingerprintMatches(currentFp, oldBaseline.fingerprint);
+    if (!fpMatch && !opts.acceptFingerprintMismatch) {
+        return { baseline: oldBaseline, ratcheted: false, changed: [], reason: 'fingerprint_mismatch' };
+    }
+
+    const changed = [];
+    const groups = ['gc', 'heap', 'uasm'];
+    // Deep-ish copy of the old baseline as the starting point, so metrics the
+    // current run did not measure are carried forward verbatim.
+    const next = {
+        schema: BASELINE_SCHEMA,
+        fingerprint: oldBaseline.fingerprint,
+        capturedAt: oldBaseline.capturedAt,
+        reps: oldBaseline.reps,
+        sources: (oldBaseline.sources || []).slice(),
+        gc: _copyStatsMap(oldBaseline.gc || {}),
+        heap: _copyStatsMap(oldBaseline.heap || {}),
+        uasm: _copyStatsMap(oldBaseline.uasm || {})
+    };
+
+    for (let gi = 0; gi < groups.length; gi++) {
+        const group = groups[gi];
+        const oldMap = oldBaseline[group] || {};
+        const curMap = currentAggregate[group] || {};
+        for (const name in oldMap) {
+            const os = oldMap[name];
+            const cs = curMap[name];
+            // Guard 2: no current stat, or a non-finite one, carries the old
+            // value forward untouched. min/median/max each guarded on their own
+            // so a partial current stat (finite median, NaN max) still tightens
+            // the fields it can and preserves the field it cannot.
+            if (!cs) continue;
+            const merged = { min: os.min, median: os.median, max: os.max };
+            let moved = false;
+            for (const field of ['min', 'median', 'max']) {
+                if (_isFiniteMetric(cs[field]) && _isFiniteMetric(os[field]) && cs[field] < os[field]) {
+                    merged[field] = cs[field];
+                    moved = true;
+                }
+            }
+            if (moved) {
+                next[group][name] = merged;
+                changed.push(group + '.' + name);
+            }
+        }
+    }
+
+    const ratcheted = changed.length > 0;
+    // Refresh provenance only when a ratchet actually happened, and only to the
+    // current capture. A no-op ratchet leaves the old file byte-identical.
+    if (ratcheted) {
+        next.fingerprint = currentFp;
+        next.capturedAt = new Date().toISOString();
+        if (currentAggregate.sources) next.sources = currentAggregate.sources.slice();
+    }
+    const out = { baseline: ratcheted ? next : oldBaseline, ratcheted, changed };
+    if (!fpMatch) out.fingerprintMismatchAccepted = true;
+    return out;
 }
 
 // ---- formatters (G7) ----
@@ -4977,6 +5082,7 @@ export {
     compareGc, assertCompare,
     aggregateGc, gateReps, assertReps,
     captureFingerprint, createBaseline, checkAgainstBaseline, assertAgainstBaseline,
+    ratchetBaseline,
     formatConsole, formatJson, formatMarkdown, formatGithubAnnotations,
     // Batch 6 (v1.3.0) -- per-op primitives.
     measureOps, checkOps, assertOps,

@@ -52,6 +52,7 @@ out of it if you have.
 5. [Adding a gate to CI](#recipe-5-adding-a-gate-to-ci)
 6. [Comparing against a control](#recipe-6-comparing-against-a-control)
 7. [Baseline lock: capture once, gate forever](#recipe-7-baseline-lock-capture-once-gate-forever)
+7b. [Ratcheting the baseline so wins can't slip back](#recipe-7b-ratcheting-the-baseline-so-wins-cant-slip-back)
 8. [Explaining a failure](#recipe-8-explaining-a-failure)
 9. [Gating across worker threads](#recipe-9-gating-across-worker-threads)
 10. [Explain mode: finding the allocator](#recipe-10-explain-mode-finding-the-allocator)
@@ -696,6 +697,75 @@ if (report.verdict !== 'pass') fs.writeFileSync('gc-drift.md', formatMarkdown(re
   support** in this batch. For those, capture the clean floor on the
   known-good build, store it as a hard-coded threshold, and gate
   against it. Recipe 3.
+
+---
+
+## Recipe 7b: Ratcheting the baseline so wins can't slip back
+
+**The blind spot in a static baseline.** Recipe 7 freezes a floor and
+gates below it. But it only catches regressions below the line you
+*first drew*. Say `major` GCs were 8 when you captured, you refactor
+down to 3, then a later change slips back to 7. Against a baseline
+frozen at 8, that 7 still PASSES -- the improvement evaporated and the
+gate said nothing. A static floor cannot defend ground you took after
+it was set.
+
+**The fix: a floor that only ever tightens.**
+
+```
+# On every green build, after the gate passes:
+npx lite-gc-gate run test/gc-window.mjs --reps 20 --baseline gc-baseline.json --ratchet
+# -> "baseline ratcheted (3 metrics tightened: gc.major, gc.totalMs, gc.count)"
+# then commit the updated gc-baseline.json
+```
+
+`--ratchet` checks against the committed baseline first. On a **pass**
+it rewrites the file with the element-wise minimum of the old floor and
+this run -- every metric moves down or stays -- and prints what moved.
+On a **fail or inconclusive** it leaves the file byte-identical and
+exits non-zero. You never ratchet toward a number you just failed.
+
+Now that regression from 3 back to 7 fails, because the committed floor
+is 3, not 8.
+
+Programmatically:
+
+```js
+import { aggregateGc, checkAgainstBaseline, ratchetBaseline } from '@zakkster/lite-gc-profiler';
+
+const current = aggregateGc(summaries);
+if (checkAgainstBaseline(current, baseline).verdict === 'pass') {
+    const { baseline: next, ratcheted, changed } = ratchetBaseline(baseline, current);
+    if (ratcheted) {
+        fs.writeFileSync('gc-baseline.json', JSON.stringify(next, null, 2));
+        console.log('tightened:', changed.join(', '));
+    }
+}
+```
+
+**Ratchet vs `--update-baseline`.** They are not the same tool.
+`--update-baseline` writes the current run verbatim, in *either*
+direction -- run it after a regression and you have just made the
+regression the new floor. It is the deliberate "rebaseline from
+scratch" button, for when you have intentionally traded one metric for
+another. `--ratchet` is the everyday CI button: it can only lower the
+floor, and only on a passing run, so it is safe to leave running
+unattended on every green build.
+
+**Gotchas.**
+
+- **Commit the ratcheted file.** The ratchet rewrites your working
+  copy; the tightening only sticks if you commit it. A CI job that
+  ratchets but discards the workspace has done nothing.
+- **A metric the run could not measure holds its old floor.** If a
+  channel stops reporting `major` (source changed, a NaN from a broken
+  clock), that metric is carried forward unchanged, never dropped. The
+  floor a run did not see is one it cannot move.
+- **`--ratchet` needs `--baseline`** and refuses to combine with
+  `--update-baseline` (their intents contradict). Both are usage
+  errors, exit 3.
+- **Cross-host ratcheting is refused** by the same fingerprint guard as
+  the check. Do not pin one machine's numbers as another's floor.
 
 ---
 

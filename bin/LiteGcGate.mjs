@@ -11,6 +11,7 @@
 //   --json path           Also write the JSON envelope to this path
 //   --baseline path       Check against a baseline JSON file
 //   --update-baseline     Write the current aggregate as a new baseline (to --baseline path)
+//   --ratchet             Tighten the --baseline toward a passing run (element-wise min; only ever lowers). Requires --baseline; mutually exclusive with --update-baseline.
 //   --accept-fingerprint-mismatch    Allow baseline comparison across fingerprints
 //   --allow-inconclusive  Do not throw on inconclusive; exit 2 instead of 1
 //
@@ -27,7 +28,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
     checkNoGc, gateReps,
-    createBaseline, checkAgainstBaseline,
+    createBaseline, checkAgainstBaseline, ratchetBaseline,
     aggregateGc,
     formatConsole, formatJson, formatMarkdown, formatGithubAnnotations
 } from '../Gc.js';
@@ -44,6 +45,7 @@ function usage(err) {
         '  --json path           Also write JSON envelope to this path',
         '  --baseline path       Check against a baseline JSON file',
         '  --update-baseline     Write current aggregate as new baseline',
+        '  --ratchet             Tighten --baseline toward a passing run (only ever lowers)',
         '  --accept-fingerprint-mismatch',
         '  --allow-inconclusive  Exit 2 instead of 1 on inconclusive',
         '',
@@ -66,10 +68,17 @@ function parseArgs(argv) {
         else if (a === '--json') { args.jsonOutPath = argv[++i]; }
         else if (a === '--baseline') { args.baselinePath = argv[++i]; }
         else if (a === '--update-baseline') { args.flags.updateBaseline = true; }
+        else if (a === '--ratchet') { args.flags.ratchet = true; }
         else if (a === '--accept-fingerprint-mismatch') { args.flags.acceptFingerprintMismatch = true; }
         else if (a === '--allow-inconclusive') { args.flags.allowInconclusive = true; }
         else usage('unknown arg: ' + a);
         i++;
+    }
+    // --ratchet needs a baseline to tighten, and contradicts a blind overwrite.
+    if (args.flags.ratchet && !args.baselinePath) usage('--ratchet requires --baseline');
+    if (args.flags.ratchet && args.flags.updateBaseline) {
+        usage('--ratchet and --update-baseline are mutually exclusive: update overwrites '
+            + 'the baseline in either direction, ratchet only tightens a passing run');
     }
     return args;
 }
@@ -204,6 +213,30 @@ function main() {
         try { baseline = JSON.parse(readFileSync(args.baselinePath, 'utf8')); }
         catch (e) { process.stderr.write('lite-gc-gate: failed to load baseline: ' + e.message + '\n'); process.exit(3); }
         report = checkAgainstBaseline(agg, baseline, { acceptFingerprintMismatch: args.flags.acceptFingerprintMismatch });
+
+        // G28: --ratchet tightens the committed baseline, but ONLY on a run
+        // that passed. A fail or inconclusive leaves the file untouched -- you
+        // never ratchet toward a number you just failed. The write happens
+        // here (not in emit) so a write failure can surface as exit 3.
+        if (args.flags.ratchet && report.verdict === 'pass') {
+            const r = ratchetBaseline(baseline, agg, {
+                acceptFingerprintMismatch: args.flags.acceptFingerprintMismatch
+            });
+            if (r.ratcheted) {
+                try {
+                    writeFileSync(args.baselinePath, JSON.stringify(r.baseline, null, 2));
+                    process.stdout.write('lite-gc-gate: baseline ratcheted ('
+                        + r.changed.length + ' metric' + (r.changed.length === 1 ? '' : 's')
+                        + ' tightened: ' + r.changed.join(', ') + ')\n');
+                } catch (e) {
+                    process.stderr.write('lite-gc-gate: baseline ratchet write failed: ' + e.message + '\n');
+                    process.exit(3);
+                }
+            } else {
+                process.stdout.write('lite-gc-gate: baseline held (nothing tightened'
+                    + (r.reason ? '; ' + r.reason : '') + ')\n');
+            }
+        }
     } else if (summaries.length > 1) {
         report = gateReps(summaries, rules, options);
     } else {

@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.12.0
+
+The ratchet baseline (G28). `createBaseline` gave you a static floor: it catches
+a regression below the line you drew, but not the quiet give-back of an
+improvement you took after drawing it. `ratchetBaseline` closes that -- a
+committed lockfile that only ever tightens, so ground taken is ground held.
+
+### Added
+
+- **`ratchetBaseline(oldBaseline, currentAggregate, options?)`** -- returns a
+  NEW baseline whose every metric is the element-wise minimum of old and
+  current. A metric can only move DOWN. Returns
+  `{ baseline, ratcheted, changed, reason? }`: the tightened baseline (or the
+  old one, same reference, if nothing moved), whether anything moved, and which
+  metrics tightened.
+- **CLI `--ratchet`** on `lite-gc-gate run ... --baseline b.json`. Captures the
+  aggregate, runs `checkAgainstBaseline`, and on a **pass** rewrites `b.json`
+  with the tightened floor (printing what moved); on a **fail or inconclusive**
+  it leaves the file untouched and exits non-zero. `--ratchet` requires
+  `--baseline` and is mutually exclusive with `--update-baseline`.
+
+### Why it is not --update-baseline
+
+`--update-baseline` writes the current aggregate verbatim, in either direction:
+run it after a regression and you enshrine the regression as the new floor.
+It is the deliberate "rebaseline from scratch" tool. `--ratchet` is the
+everyday CI tool -- safe to run on every green build, because it can only
+tighten and only on a run that passed.
+
+### Fail-closed
+
+- **Never tightens on a metric it cannot see.** A metric present in the old
+  baseline but absent or non-finite in the current aggregate (a channel that
+  stopped reporting, a NaN from a broken clock) is carried forward unchanged --
+  never dropped, never min'd against a non-number. The floor a run did not
+  measure is a floor it has no standing to move.
+- **`min`, `median`, and `max` all ratchet together**, so the regression band
+  (`current.median > baseline.max`) tightens with the center rather than
+  staying as wide as the noisiest early capture forever.
+- **Fingerprint-guarded** like `checkAgainstBaseline`: refuses to ratchet
+  across a host mismatch unless `acceptFingerprintMismatch`, and stamps
+  `fingerprintMismatchAccepted` when overridden.
+- **Pure min, so misuse cannot loosen a floor.** Even ratcheting a run that
+  should have failed can only fail to tighten, never enshrine a regression --
+  the worst outcome is a no-op.
+
+### Testing
+
+30 new scenarios: 11 standard (`test/30-ratchet.test.mjs`), 19 torture across
+axes A-D (`test/torture/g28-6-ratchet.test.mjs`), plus 4 CLI cases in
+`test/24-cli-gate.test.mjs` (both usage errors, a tightening pass, and a
+regressing run that leaves the committed file byte-identical). Full suite: 830
+tests, coverage above the 96/88/95 thresholds.
+
 ## 1.11.0
 
 `measureAllocs` -- the per-call retained-allocation assertion (G26). The
