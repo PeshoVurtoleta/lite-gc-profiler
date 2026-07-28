@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.13.0
+
+Allocation attribution (G27). `measureAllocs` told you a hot-path function
+retains N bytes per call; when N is over budget, the next question was always
+"allocated WHERE?". This answers it inline: opt into `{ attribute: true }` and
+the result carries the top allocation call sites, named, so a gate failure
+points at a line instead of a number.
+
+### Added
+
+- **`measureAllocs(fn, { attribute: true })`** runs `node:inspector`'s
+  HeapProfiler sampling profiler over the batch loop and attaches
+  `result.attribution`: `{ available, reason?, totalSampledBytes, nativeBytes,
+  sites: [{ function, url, line, column, selfBytes, selfPct }] }`, heaviest
+  first. New option `topSites` (default 5) caps the list.
+- **`checkAllocs` failure messages name the top site** when attribution is
+  present: `bytesPerCall 128 > limit 0 (...); top allocation site: makeNode
+  (Pool.js:42) (85% of sampled bytes)`.
+
+### The load-bearing rule: attribution never gates
+
+Sampling is probabilistic, so the top site is a hint -- and a hint must never
+fail a build. `bytesPerCall` and the `maxBytesPerCall` gate are computed from
+the heap-delta estimator exactly as before; attribution rides alongside and its
+absence is benign. A transient-only workload that the sampler saw allocate
+megabytes still passes `maxBytesPerCall: 0`, because retention -- not sampled
+churn -- is what the gate measures. This is the inverse of every other lane's
+fail-closed discipline: here the metric that fails closed is `bytesPerCall`;
+attribution is explicitly advisory.
+
+### Node-only, degrades cleanly
+
+`node:inspector` is imported lazily and only when `attribute: true`, so the
+common path is untouched and the dependency is truly optional. In a browser or
+a runtime without it, attribution degrades to `{ available: false, reason:
+'no_inspector' }` -- never a throw, never a failed measurement. Other reasons
+(`connect_failed`, `start_failed`, `stop_failed`) cover a busy inspector or an
+older Node; all are documented in INCONCLUSIVE.md.
+
+### Session hygiene
+
+One inspector session per attributed call, created inside the measurement guard
+and torn down before it -- so the in-flight guard covers the session's whole
+life, and a workload that throws mid-batch still disconnects the session. No
+session is pooled or cached across runs; carrying inspector state between runs
+is exactly the cross-contamination `_enterMeasurement` forbids. Native and
+Node-internal frames (and the library's and profiler's own frames) are filtered
+out of user attribution and summed into a separate `nativeBytes` bucket.
+
+### Testing
+
+35 new scenarios: 22 standard (`test/31-attribution.test.mjs`, including
+pure-function unit tests of the tree walk and frame filter against synthetic
+profiles) and 13 torture (`test/torture/g27-6-attribution.test.mjs`, axes A-D:
+degrade-never-throw, verdict-invariance, session hygiene across repeated runs,
+and shape consistency). Full suite: 888 tests, coverage above 96/95/88.
+
 ## 1.12.0
 
 The ratchet baseline (G28). `createBaseline` gave you a static floor: it catches

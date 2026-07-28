@@ -1,8 +1,8 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** shipped across v1.1.0 through v1.12.0
+**Status:** shipped across v1.1.0 through v1.13.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G21.5,
-G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G28.6, G99.9,
+G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G27.6, G28.6, G99.9,
 G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
 suites for the G16.5 partial-report path.
@@ -522,6 +522,41 @@ throws (a leaked guard would make the next `measureAllocs` throw
 "already in flight"), `measureAllocs` throws without `--expose-gc` (stubbed
 `globalThis.gc`), and the guard is never taken when that pre-check fails --
 so a following real measurement runs cleanly.
+
+**G27.6 (v1.13.0) -- allocation attribution.** 13 torture scenarios in
+`test/torture/g27-6-attribution.test.mjs` across axes A-D, plus pure-function
+unit tests of the tree walk and frame filter in `test/31-attribution.test.mjs`.
+Attribution is the one lane ALLOWED to be absent -- it is advisory, sampled,
+best-effort -- so the torture is the inverse of the usual. Instead of proving a
+metric fails closed, it proves attribution can degrade in every way WITHOUT
+corrupting the measurement, the inspector session, or the verdict.
+
+Axis A (3): degrade, never throw. `attribute: true` never throws for lack of a
+usable sampler; an unavailable attribution still carries a reason string; the
+gate is verifiable on an attributed run exactly as on a plain one.
+
+Axis B (3): attribution NEVER changes a verdict -- the load-bearing rule. A
+transient-only workload passes `maxBytesPerCall: 0` even though the sampler saw
+megabytes of churn; the verdict is identical with and without attribution for
+the same retainer; the site suffix is the ONLY difference attribution makes to a
+failure message.
+
+Axis C (3): session hygiene. A workload that throws under attribution still
+releases the measurement guard (so the next run is not blocked); ten attributed
+runs in a row do not contaminate each other; an attributed run followed by a
+plain run leaves the plain run's `attribution` null (no session leaked in).
+
+Axis D (4): shape consistency. Shown site bytes never exceed the user total they
+subset; `selfPct` matches `selfBytes / totalSampledBytes`; every reported site
+has a real URL and numeric line; attribution availability is stable across a
+batch of identical runs on one host.
+
+The unit tests cover the branches the live inspector cannot provoke on a runtime
+where it works: empty and native-only profile heads, non-finite `selfSize`
+(NaN/Infinity contribute nothing), Node-internal and bare-internal-name frame
+filtering, `topSites` capping without losing the total, same-site accumulation
+across branches, and a 20k-deep tree that would overflow a recursive walk (the
+walk is iterative).
 
 **G28.6 (v1.12.0) -- the ratchet baseline.** 19 scenarios in
 `test/torture/g28-6-ratchet.test.mjs` across axes A-D, plus 4 CLI cases in

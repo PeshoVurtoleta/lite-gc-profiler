@@ -428,6 +428,37 @@ batch's before/after bracket, so the number would systematically
 under-report. If the workload awaits, its retention is not a
 `measureAllocs` question.
 
+**When it fails, find the line: `{ attribute: true }`.** A red
+`maxBytesPerCall` tells you a call retains bytes; attribution tells you
+where they were allocated.
+
+```js
+const r = measureAllocs(leakyNode, { iterations: 3_000, batches: 6, attribute: true });
+r.attribution.sites[0];
+// { function: 'makeNode', url: '.../Pool.js', line: 42, selfBytes: 1_470_680, selfPct: 85.0 }
+```
+
+And the gate failure names it for you:
+
+```
+bytesPerCall 72.00 > limit 0.00 (...); top allocation site: makeNode (Pool.js:42) (85% of sampled bytes)
+```
+
+Three things to know before you lean on it:
+
+- **It never fails your build on its own.** Attribution is a sampled
+  hint. `bytesPerCall` gates exactly as it does without `attribute`; the
+  site is advisory. A transient-only workload the sampler saw churn
+  through megabytes still passes `maxBytesPerCall: 0` -- retention is the
+  claim, not sampled bytes.
+- **It is Node-only and never throws.** In a browser, a worker, or with
+  another inspector attached, `r.attribution.available` is `false` with a
+  `reason` (see INCONCLUSIVE.md) and your number is still valid. Leave
+  `attribute` off (the default) and the inspector is never touched.
+- **Turn it on for the failing test, not the whole suite.** It spins an
+  inspector session per call and samples the whole batch loop -- cheap
+  enough for a diagnosis, not something to pay for on every green run.
+
 ---
 
 ## Recipe 4: Reading a verdict correctly

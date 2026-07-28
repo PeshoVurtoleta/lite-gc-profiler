@@ -834,6 +834,54 @@ run where any batch missed its forced settle reports `settled: false`, and the
 gate routes that to **inconclusive**, never a false pass -- a partial min is not
 a floor.
 
+### Attribution: where did it allocate?
+
+When `maxBytesPerCall` fails, the next question is *which line*. Opt into
+`{ attribute: true }` and `measureAllocs` runs `node:inspector`'s HeapProfiler
+sampler over the batch loop and names the heaviest allocation sites:
+
+```js
+const r = measureAllocs(leakyNode, { iterations: 3_000, batches: 6, attribute: true });
+
+r.attribution;
+// {
+//   available: true,
+//   totalSampledBytes: 1_729_864,
+//   nativeBytes: 85_664,
+//   sites: [
+//     { function: 'makeNode', url: 'file:///app/Pool.js', line: 42, selfBytes: 1_470_680, selfPct: 85.0 },
+//     ...
+//   ]
+// }
+```
+
+And a `checkAllocs` failure names the top site directly:
+
+```
+bytesPerCall 72.00 > limit 0.00 (min over 6 batches of 3000 calls);
+top allocation site: makeNode (Pool.js:42) (85% of sampled bytes)
+```
+
+Three things are load-bearing about this design:
+
+- **Attribution never gates.** Sampling is probabilistic, so the top site is a
+  *hint* -- it can never fail a build. `bytesPerCall` and the `maxBytesPerCall`
+  gate are computed from the heap-delta estimator exactly as without
+  `attribute`; the attribution rides alongside. A transient-only workload the
+  sampler saw allocate megabytes still passes `maxBytesPerCall: 0`, because
+  retention, not sampled churn, is what the gate measures.
+- **It degrades, never throws.** `node:inspector` is Node-only and imported
+  lazily. In a browser, a worker, or when another inspector is already attached,
+  attribution reports `{ available: false, reason }` (see INCONCLUSIVE.md) and
+  the number is still valid. `measureAllocs` without `attribute` never touches
+  the inspector, so the common path is unchanged.
+- **The session is born and buried inside the measurement.** One inspector
+  session per attributed call, never pooled across runs, always disconnected --
+  even if the workload throws. Native and Node-internal frames are filtered out
+  of the user sites and summed into `nativeBytes`.
+
+Use `topSites` to change how many sites are kept (default 5).
+
 ### `measureAllocs` vs `measureOps`
 
 | | `measureOps` | `measureAllocs` |

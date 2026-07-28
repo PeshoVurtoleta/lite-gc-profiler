@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.12.0';
+const VERSION = '1.13.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -3046,6 +3046,157 @@ function assertOps(fn, rules, opts) {
 const ALLOCS_SCHEMA = 'lite-gc-allocs/1';
 const ALLOCS_RULES = ['maxBytesPerCall'];
 
+// ---------------------------------------------------------------------------
+// G27 (v1.13.0) -- allocation attribution.
+//
+// measureAllocs says a function retains N bytes/call; when N is over budget the
+// next question is "allocated WHERE?". This attaches the answer using
+// node:inspector's HeapProfiler SAMPLING profiler, which runs a Poisson sampler
+// over allocations and returns a call tree whose nodes carry selfSize.
+//
+// Load-bearing rule: attribution NEVER gates. Sampling is probabilistic, so the
+// top site is a hint, and a hint must not fail a build. bytesPerCall and the
+// maxBytesPerCall gate are computed from the heap-delta estimator exactly as
+// before; attribution rides alongside and its absence is benign.
+// ---------------------------------------------------------------------------
+
+// Lazily-required inspector module, cached. `null` before first attempt,
+// `false` if the require failed (no node:inspector -- a browser, a locked-down
+// runtime), the module object once loaded.
+let _inspectorModule = null;
+
+function _loadInspector() {
+    if (_inspectorModule !== null) return _inspectorModule || null;
+    try {
+        const req = typeof require === 'function'
+            ? require
+            : (typeof module !== 'undefined' && module.createRequire
+                ? module.createRequire(import.meta.url) : null);
+        _inspectorModule = req ? req('node:inspector') : false;
+    } catch (_e) {
+        _inspectorModule = false;
+    }
+    return _inspectorModule || null;
+}
+
+// The URL of THIS module, so attribution can drop the library's own frames.
+const _SELF_URL = (typeof import.meta !== 'undefined' && import.meta.url) || '';
+
+// A frame is a user allocation site if it is not ours, not the inspector's,
+// not a Node internal, and carries a real source URL. Empty-URL frames are
+// native/synthetic (e.g. Array.push into C++), and Node internals (node:*,
+// or bare names like 'per_thread' the sampler emits for builtin C++ glue)
+// cannot be a user allocation site -- both are summed into nativeBytes, not
+// dropped silently.
+function _isUserFrame(cf) {
+    const url = cf.url || '';
+    if (url === '') return false;
+    if (url === _SELF_URL) return false;
+    if (url.indexOf('node:') === 0) return false;          // node:internal/..., node:inspector
+    if (url.indexOf('node:inspector') >= 0) return false;
+    if (url.indexOf('/lite-gc-profiler/') >= 0 && url.indexOf('Gc.js') >= 0) return false;
+    // A bare internal name (no scheme, no path separator, no file extension)
+    // is Node builtin glue like 'per_thread', not a user source file.
+    if (url.indexOf('://') < 0 && url.indexOf('/') < 0 && url.indexOf('.') < 0) return false;
+    return true;
+}
+
+/**
+ * Walk a HeapProfiler sampling profile head, summing selfSize per user site.
+ * Pure: no I/O, no inspector calls.
+ * @returns {{ totalSampledBytes:number, nativeBytes:number, sites:object[] }}
+ */
+function _attributeProfile(profileHead, topSites) {
+    const bySite = new Map();
+    let userTotal = 0;
+    let nativeTotal = 0;
+
+    const stack = [profileHead];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node) continue;
+        const cf = node.callFrame || {};
+        const self = _isFiniteMetric(node.selfSize) ? node.selfSize : 0;
+        if (self > 0) {
+            if (_isUserFrame(cf)) {
+                userTotal += self;
+                const key = (cf.functionName || '') + '|' + cf.url + '|' + cf.lineNumber;
+                const e = bySite.get(key);
+                if (e) { e.selfBytes += self; }
+                else {
+                    bySite.set(key, {
+                        function: cf.functionName || '(anonymous)',
+                        url: cf.url,
+                        line: typeof cf.lineNumber === 'number' ? cf.lineNumber : -1,
+                        column: typeof cf.columnNumber === 'number' ? cf.columnNumber : -1,
+                        selfBytes: self
+                    });
+                }
+            } else {
+                nativeTotal += self;
+            }
+        }
+        const kids = node.children;
+        if (kids) for (let i = 0; i < kids.length; i++) stack.push(kids[i]);
+    }
+
+    const sites = Array.from(bySite.values()).sort((a, b) => b.selfBytes - a.selfBytes);
+    for (let i = 0; i < sites.length; i++) {
+        sites[i].selfPct = userTotal > 0 ? (sites[i].selfBytes / userTotal) * 100 : 0;
+    }
+    return {
+        totalSampledBytes: userTotal,
+        nativeBytes: nativeTotal,
+        sites: sites.slice(0, topSites)
+    };
+}
+
+/**
+ * Start an inspector sampling session, or return why it could not. Caller MUST
+ * call the returned stop() in a finally if ok. Never throws.
+ */
+function _startAllocSampler() {
+    const inspector = _loadInspector();
+    if (!inspector) return { ok: false, reason: 'no_inspector' };
+
+    let session;
+    try {
+        session = new inspector.Session();
+        session.connect();
+    } catch (_e) {
+        return { ok: false, reason: 'connect_failed' };
+    }
+
+    // In-process inspector sessions resolve post() callbacks synchronously, so
+    // we can drive the protocol without going async and breaking the sync
+    // bracket measureAllocs depends on. If a runtime ever defers, `done` stays
+    // false and we treat it as a failure rather than blocking.
+    function postSync(method, params) {
+        let done = false, error = null, result = null;
+        session.post(method, params, (err, res) => { done = true; error = err; result = res; });
+        if (!done) return { ok: false };
+        if (error) return { ok: false, error };
+        return { ok: true, result };
+    }
+
+    const en = postSync('HeapProfiler.enable');
+    if (!en.ok) { try { session.disconnect(); } catch (_e) {} return { ok: false, reason: 'start_failed' }; }
+    const st = postSync('HeapProfiler.startSampling', { samplingInterval: 512 });
+    if (!st.ok) { try { session.disconnect(); } catch (_e) {} return { ok: false, reason: 'start_failed' }; }
+
+    return {
+        ok: true,
+        stop() {
+            let profile = null, reason = null;
+            const sp = postSync('HeapProfiler.stopSampling');
+            if (sp.ok && sp.result && sp.result.profile) profile = sp.result.profile;
+            else reason = 'stop_failed';
+            try { session.disconnect(); } catch (_e) {}
+            return { profile, reason };
+        }
+    };
+}
+
 /**
  * Measure per-call RETAINED allocation with a batched, min-over-batches
  * estimator.
@@ -3106,6 +3257,13 @@ function measureAllocs(fn, opts) {
     if (!Number.isFinite(warmup) || warmup < 0 || (warmup | 0) !== warmup) {
         throw new RangeError('measureAllocs: opts.warmup must be a non-negative integer');
     }
+    // G27: opt-in allocation attribution. Advisory only -- never changes the
+    // verdict. topSites caps how many heaviest sites to keep.
+    const attribute = opts.attribute === true;
+    const topSites = opts.topSites === undefined ? 5 : opts.topSites;
+    if (attribute && (!Number.isFinite(topSites) || topSites <= 0 || (topSites | 0) !== topSites)) {
+        throw new RangeError('measureAllocs: opts.topSites must be a positive integer');
+    }
 
     // The estimator is meaningless without forced settling. Guard on the CI
     // path (measurement time) rather than construction so non-opting code runs
@@ -3149,6 +3307,16 @@ function measureAllocs(fn, opts) {
     const batchBytes = [];
     let anyUnmeasured = false;
 
+    // G27: start the sampler (if opted in) INSIDE the measurement guard and
+    // tear it down before it, so the in-flight guard covers the session's whole
+    // life. A failed start degrades to a reason; it never fails the run.
+    let sampler = null;
+    let attribution = null;
+    if (attribute) {
+        sampler = _startAllocSampler();
+        if (!sampler.ok) attribution = { available: false, reason: sampler.reason };
+    }
+
     try {
         gc.phase('warmup');
         for (let i = 0; i < warmup; i++) fn(i);
@@ -3170,6 +3338,23 @@ function measureAllocs(fn, opts) {
             batchBytes.push(delta > 0 ? delta : 0);
         }
     } finally {
+        // Stop the sampler BEFORE gc.stop()/_exitMeasurement, and never let a
+        // teardown failure escape -- attribution is advisory. If the workload
+        // threw mid-batch, this still runs and disconnects the session.
+        if (sampler && sampler.ok) {
+            const out = sampler.stop();
+            if (out.profile) {
+                const attr = _attributeProfile(out.profile.head, topSites);
+                attribution = {
+                    available: true,
+                    totalSampledBytes: attr.totalSampledBytes,
+                    nativeBytes: attr.nativeBytes,
+                    sites: attr.sites
+                };
+            } else {
+                attribution = { available: false, reason: out.reason || 'stop_failed' };
+            }
+        }
         gc.stop();
         _exitMeasurement();
     }
@@ -3202,6 +3387,9 @@ function measureAllocs(fn, opts) {
         // reading. anyUnmeasured means at least one batch is a hole, which the
         // gate treats as unverifiable rather than trusting a partial min.
         settled: canForce && !anyUnmeasured && measuredBatches === batches,
+        // G27: present only when { attribute: true } was requested. Advisory;
+        // never affects the verdict. null when not requested.
+        attribution: attribution,
         source: summary.source,
         summary
     };
@@ -3241,6 +3429,20 @@ function checkAllocs(result, rules) {
             checked.maxBytesPerCall = true;
             const actual = result.bytesPerCall;
             if (actual > r.maxBytesPerCall) {
+                // G27: if attribution rode along and named a site, append it to
+                // the failure message. Advisory only -- the verdict was already
+                // decided by the delta estimator above; this just points at the
+                // line to fix.
+                let where = '';
+                const attr = result.attribution;
+                if (attr && attr.available && attr.sites && attr.sites.length > 0) {
+                    const top = attr.sites[0];
+                    const loc = top.url
+                        ? ' (' + String(top.url).replace(/^.*[/\\]/, '') + ':' + top.line + ')'
+                        : '';
+                    where = '; top allocation site: ' + top.function + loc
+                        + ' (' + top.selfPct.toFixed(0) + '% of sampled bytes)';
+                }
                 violations.push({
                     rule: 'maxBytesPerCall',
                     metric: 'bytesPerCall',
@@ -3248,6 +3450,7 @@ function checkAllocs(result, rules) {
                     limit: r.maxBytesPerCall,
                     reason: 'bytesPerCall ' + actual.toFixed(2) + ' > limit ' + r.maxBytesPerCall.toFixed(2)
                         + ' (min over ' + result.measuredBatches + ' batches of ' + result.iterations + ' calls)'
+                        + where
                 });
             }
         }
@@ -5089,6 +5292,11 @@ export {
     compareOps, assertCompareOps,
     // G26 (v1.11.0) -- per-call allocation assertion.
     measureAllocs, checkAllocs, assertAllocs,
+    // G27 (v1.13.0) -- allocation attribution internals, exported for direct
+    // unit testing of the pure tree-walk and frame filter (the sampler's
+    // failure branches cannot be provoked on a runtime where the inspector
+    // works). Underscore-prefixed: not part of the supported surface.
+    _attributeProfile, _isUserFrame,
     // Batch 7 (v1.4.0) -- per-frame primitives.
     measureFrames, checkFrames, assertFrames,
     compareFrames, assertCompareFrames,

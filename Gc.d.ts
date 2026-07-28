@@ -5,7 +5,7 @@ export interface NodeMemoryUsageLike {
     arrayBuffers?: number;
 }
 
-export const VERSION: '1.12.0';
+export const VERSION: '1.13.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -898,8 +898,46 @@ export interface MeasureAllocsOptions {
     warmup?: number;
     source?: GcSource | 'auto';
     capacity?: number;
+    /**
+     * G27: run node:inspector's HeapProfiler sampler over the batch loop and
+     * attach the top allocation call sites to result.attribution. Advisory
+     * only -- attribution NEVER changes the verdict. Node-only; degrades to
+     * { available: false } elsewhere. Default false.
+     */
+    attribute?: boolean;
+    /** G27: how many heaviest sites to keep when attribute is true. Default 5. */
+    topSites?: number;
     /** assertAllocs only: return instead of throwing on an inconclusive verdict. */
     allowInconclusive?: boolean;
+}
+
+/** One attributed allocation site (G27). selfBytes are sampled, not exact. */
+export interface AllocsAttributionSite {
+    function: string;
+    url: string;
+    line: number;
+    column: number;
+    selfBytes: number;
+    /** Share of user-attributed sampled bytes, 0..100. */
+    selfPct: number;
+}
+
+/**
+ * Allocation attribution (G27). Present on MeasureAllocsResult only when
+ * { attribute: true } was requested; null otherwise. `available: false` with a
+ * reason when the sampler could not run (see INCONCLUSIVE.md attribution
+ * codes). Always advisory -- never affects the gate verdict.
+ */
+export interface AllocsAttribution {
+    available: boolean;
+    /** When available is false: why. */
+    reason?: 'no_inspector' | 'connect_failed' | 'start_failed' | 'stop_failed' | (string & {});
+    /** Sum of selfSize over user frames (bytes). */
+    totalSampledBytes?: number;
+    /** Sum of selfSize over native/internal frames the sampler could not attribute. */
+    nativeBytes?: number;
+    /** Heaviest sites first, capped at topSites. */
+    sites?: AllocsAttributionSite[];
 }
 
 /**
@@ -920,6 +958,8 @@ export interface MeasureAllocsResult {
     maxBytesPerCall: number | null;
     batchBytes: Array<number | null>;
     settled: boolean;
+    /** G27: present when attribute:true, else null. Advisory, never gates. */
+    attribution: AllocsAttribution | null;
     source: GcSource;
     summary: GcSummary;
 }
@@ -959,6 +999,23 @@ export function checkAllocs(result: MeasureAllocsResult, rules?: AllocsRules): A
  * fail, GcInconclusiveError on inconclusive (unless opts.allowInconclusive).
  */
 export function assertAllocs(fn: MeasureOpsFn, rules: AllocsRules, opts: MeasureAllocsOptions): AllocsGateResult;
+
+/**
+ * G27 internal: pure walk of a HeapProfiler sampling profile head, summing
+ * selfSize per user site. Exported for direct unit testing; not part of the
+ * supported surface (underscore-prefixed).
+ */
+export function _attributeProfile(profileHead: unknown, topSites: number): {
+    totalSampledBytes: number;
+    nativeBytes: number;
+    sites: AllocsAttributionSite[];
+};
+
+/**
+ * G27 internal: true if a sampled call frame is a user allocation site (not the
+ * library, the inspector, a Node internal, or a native/synthetic frame).
+ */
+export function _isUserFrame(callFrame: { url?: string }): boolean;
 
 /**
  * Compare two measureOps results. Convenience form accepts two functions

@@ -156,6 +156,24 @@ state: warn, surface, and fix the measurement.
 
 ---
 
+## Allocation attribution codes (G27)
+
+These are NOT inconclusive verdicts. They appear on
+`result.attribution.reason` when you ran `measureAllocs(fn, { attribute: true })`
+and the sampler could not produce a profile. Attribution is advisory: its
+absence never changes a verdict, and `bytesPerCall` gates exactly as it would
+without `attribute`. You are seeing one of these because the "where did it
+allocate" hint is missing, not because the measurement failed.
+
+| `attribution.reason` | What it means | What to do |
+| --- | --- | --- |
+| `no_inspector` | this runtime has no `node:inspector` -- a browser, a worker, or a locked-down sandbox | attribution is Node-only; the `bytesPerCall` number is still valid. Run under Node to get sites |
+| `connect_failed` | an inspector `Session` could not connect -- usually another inspector is already attached (`--inspect`, a debugger, another profiler) | detach the other inspector, or drop `--inspect` while gating |
+| `start_failed` | the session connected but `HeapProfiler.startSampling` was rejected -- an older Node, or a restricted environment | the gate still works on the delta; upgrade Node if you need sites |
+| `stop_failed` | sampling ran but `stopSampling` returned no profile -- a session torn down early, or a runtime quirk | re-run; if it persists, gate without `attribute` and profile the workload manually |
+
+---
+
 ## Still stuck?
 
 `explainReport(report)` prints which rules went unverified and why, in

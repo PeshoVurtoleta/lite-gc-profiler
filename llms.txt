@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.12.0
+# @zakkster/lite-gc-profiler v1.13.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -156,6 +156,22 @@ surviving a forced collection) via a min-over-batches estimator, so
 or non-finite run is inconclusive, never a false pass. Distinct from
 `measureOps`, which reports an allocation RATE (`maxBytesPerOp`) and
 sees transient garbage that `measureAllocs` settles away.
+
+Allocation attribution (G27, v1.13.0): `measureAllocs(fn, { attribute:
+true })` runs node:inspector's HeapProfiler SAMPLING profiler over the
+batch loop and attaches `result.attribution` = { available, reason?,
+totalSampledBytes, nativeBytes, sites: [{ function, url, line, column,
+selfBytes, selfPct }] }, heaviest first (topSites default 5). checkAllocs
+appends the top site to a failure reason. LOAD-BEARING: attribution NEVER
+gates -- sampling is probabilistic, the top site is a hint, bytesPerCall
+gates exactly as before and attribution's absence is benign (the inverse
+of every other lane's fail-closed rule). Node-only; degrades to
+{ available: false, reason: 'no_inspector' | 'connect_failed' |
+'start_failed' | 'stop_failed' } elsewhere, never throws. One inspector
+session per call, born+buried inside the measurement guard (never pooled),
+torn down even if the workload throws. Native/internal/library frames are
+filtered to a separate nativeBytes bucket. Without `attribute`, inspector
+is never touched and attribution is null.
 
 ## License
 
