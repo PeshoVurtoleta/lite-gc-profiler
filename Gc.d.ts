@@ -5,7 +5,7 @@ export interface NodeMemoryUsageLike {
     arrayBuffers?: number;
 }
 
-export const VERSION: '1.14.0';
+export const VERSION: '1.14.1';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;

@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.14.0';
+const VERSION = '1.14.1';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -3068,11 +3068,16 @@ let _inspectorModule = null;
 function _loadInspector() {
     if (_inspectorModule !== null) return _inspectorModule || null;
     try {
-        const req = typeof require === 'function'
-            ? require
-            : (typeof module !== 'undefined' && module.createRequire
-                ? module.createRequire(import.meta.url) : null);
-        _inspectorModule = req ? req('node:inspector') : false;
+        // process.getBuiltinModule is the only SYNCHRONOUS route to a builtin
+        // from an ESM module (Node 22.12+). `require` exists only in CJS, and
+        // there is no `module` binding in ESM -- the previous form resolved to
+        // null in every shipped configuration, since this package is ESM-only.
+        _inspectorModule =
+            (typeof process !== 'undefined' && typeof process.getBuiltinModule === 'function')
+                ? (process.getBuiltinModule('node:inspector') || false)
+            : (typeof require === 'function')
+                ? require('node:inspector')
+            : false;
     } catch (_e) {
         _inspectorModule = false;
     }

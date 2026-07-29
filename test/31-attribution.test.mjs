@@ -14,6 +14,29 @@ import { measureAllocs, checkAllocs, assertAllocs } from '../Gc.js';
 function makeThing(i) { return { a: i, b: i * 2, tag: 't' + (i & 7) }; }
 
 // ---------------------------------------------------------------------------
+// the environment guard -- attribution MUST actually work here
+// ---------------------------------------------------------------------------
+//
+// This suite runs under `node --expose-gc`, where node:inspector is present, so
+// attribution is REQUIRED to be available. Every other test in this file
+// tolerates `available: false` (it may run on a runtime without the inspector),
+// which means a dead inspector loader -- one that silently degrades to
+// no_inspector in every configuration -- would let the whole suite pass green
+// while the feature does nothing. This single test refuses that: it asserts the
+// mechanism is genuinely live in the environment the tests actually run in, so
+// a loader that cannot reach node:inspector fails loudly instead of silently.
+
+test('attribution is genuinely available under --expose-gc in Node (loader is live)', () => {
+    const keep = [];
+    const r = measureAllocs((i) => { keep.push(makeThing(i)); },
+        { iterations: 2000, batches: 4, attribute: true });
+    assert.equal(r.attribution.available, true,
+        'node:inspector is present under --expose-gc, so attribution must be available; ' +
+        'available:false here means the inspector loader could not reach node:inspector ' +
+        '(reason=' + r.attribution.reason + ')');
+});
+
+// ---------------------------------------------------------------------------
 // the opt-in contract
 // ---------------------------------------------------------------------------
 

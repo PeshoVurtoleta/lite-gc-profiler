@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.14.1
+
+Bugfix: allocation attribution (G27) never actually ran when the package was
+imported as a real ES module.
+
+The inspector loader reached `node:inspector` through `require` or
+`module.createRequire`. In a genuine `.mjs` import -- the only way this ESM-only
+package is ever loaded -- there is no `require` and no `module` binding, so the
+loader resolved to `false` and every attributed run silently reported
+`{ available: false, reason: 'no_inspector' }`. Attribution had never worked
+outside a `node --input-type=module -e` eval string, where Node happens to
+expose a global `module` that a real file does not.
+
+The whole G27 test suite passed anyway -- 22 standard cases and 17 torture
+scenarios, before and after -- because each one tolerates `available: false` to
+stay portable across runtimes without the inspector. Passing in both states was
+the tell: a feature that is supposed to work here, and a suite that could not
+tell whether it did.
+
+### Fixed
+
+- `_loadInspector` now uses `process.getBuiltinModule('node:inspector')` (the
+  sanctioned synchronous route to a builtin from ESM, Node 22.12+), falling back
+  to `require` only under CJS. On Node without `getBuiltinModule` it degrades
+  cleanly to `available: false` rather than crashing.
+
+### Guarded
+
+- A new test asserts attribution is genuinely `available` under `--expose-gc` in
+  Node -- the one environment the suite actually runs in. Every other attribution
+  test tolerates an absent inspector by design; this one refuses to, so a loader
+  that cannot reach `node:inspector` fails loudly instead of passing green. It
+  fails on the pre-1.14.1 loader and passes on the fix.
+
 ## 1.14.0
 
 The pool-escape canary: `watchPool`. A detector for the INVERSE of a leak. A
