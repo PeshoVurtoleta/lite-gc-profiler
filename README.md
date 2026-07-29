@@ -1526,6 +1526,57 @@ Default is 512 KB.
 
 Node-only. Browsers do not expose the inspector protocol.
 
+## Pool-escape canary: `watchPool`
+
+Every other lane in this package catches a leak -- an object that should die and
+lives. `watchPool` catches the inverse. A pool exists so a hot path reuses
+objects instead of allocating them; its failure mode is a slot that should live
+*dying* -- it escaped the pool's bookkeeping, lost its last reference, and got
+collected. That is invisible to a leak detector and to an allocation gate,
+because nothing leaked and nothing over-allocated; something was lost.
+
+```js
+import { watchPool, assertNoEscapes } from '@zakkster/lite-gc-profiler';
+
+const watch = watchPool({ label: 'node-pool' });
+
+// As the pool hands slots out and takes them back:
+watch.register(node, slotId);   // checked out
+watch.release(node, slotId);    // checked in
+
+// ...exercise the pool...
+
+const report = await watch.settle({ cycles: 8, gap: 2 });
+assertNoEscapes(report);   // throws iff a slot was collected while checked out
+watch.dispose();
+```
+
+This lane is deliberately different from the assertion lanes, and the
+differences are not incidental -- each is forced by one measured fact:
+**FinalizationRegistry callbacks fire only after a collection AND a macrotask,
+never synchronously with `gc()`.**
+
+- **It is async, and there is no sync form.** `settle()` drives `gc()` then
+  yields to the macrotask queue so pending finalizers deliver. A synchronous
+  `watchPool` would be a lie about when the mechanism can observe anything.
+- **It is a positive detector, never a gate.** A reported escape is real. An
+  empty `escapes` list is "none seen across N cycles" -- *never* "none exist,"
+  because a finalizer may not have run yet or may never run. So `assertNoEscapes`
+  throws on a non-empty list and is a no-op on an empty one. There is no
+  `assertPoolClean`; "no escapes seen" cannot be certified. The single sentence
+  to remember: **absence of detected escapes is not proof that none occurred.**
+- **It degrades, never throws for lack of the mechanism.** Without
+  `FinalizationRegistry` or a forceable `globalThis.gc` (run under
+  `--expose-gc`), the report is `{ available: false, reason }` and the assertion
+  is inert.
+- **It never pins what it watches.** The registry holds the slot id as its held
+  value and the object only as a weak target -- holding the object would keep
+  every slot alive and report zero escapes by construction.
+
+Because the signal is probabilistic, give `settle` a generous budget when you
+want to catch an escape reliably: more `cycles`, a few ms of `gap`. `report.settled`
+tells you whether the loop quiesced or ran out of budget.
+
 ## A note on cost: self-noise, measured
 
 The observer receives node-allocated entry lists between GC events, and the

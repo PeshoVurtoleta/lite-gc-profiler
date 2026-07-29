@@ -1694,6 +1694,74 @@ one run and +9.17 MB on the next, in separate processes.
 
 ---
 
+## Recipe 22: Catching the inverse of a leak -- a pooled slot that escaped
+
+**Goal.** Your object pool is supposed to reuse slots forever. Prove no slot is
+silently lost -- collected while the pool still thinks it is checked out.
+
+**Primitive.** `watchPool` + `assertNoEscapes` (v1.14.0). This is a detector,
+not a gate. It reports escapes it *sees*; it never certifies that none exist.
+
+**Why the other lanes miss this.** A leak is an object that lives too long;
+`measureAllocs`, the differential lane, and `lite-leak` all hunt that. A pool
+escape is the opposite -- an object that *dies* when it should have been reused.
+Nothing leaked and nothing over-allocated, so every leak-shaped tool is blind to
+it. The only observable signal is the collection itself, via a
+FinalizationRegistry.
+
+**Code.**
+
+```js
+import { watchPool, assertNoEscapes } from '@zakkster/lite-gc-profiler';
+
+const watch = watchPool({ label: 'buffer-pool' });
+
+// Instrument the pool's checkout/checkin. slotId is whatever identifies the
+// slot to YOU -- an index, a key. It is what the report will name.
+function acquire() {
+  const slot = pool.take();
+  watch.register(slot, slot.id);   // checked out
+  return slot;
+}
+function recycle(slot) {
+  watch.release(slot, slot.id);    // checked in -- no longer an escape candidate
+  pool.giveBack(slot);
+}
+
+// Exercise the pool under whatever workload you want to trust.
+runWorkload();
+
+// Drive the async settle loop and inspect.
+const report = await watch.settle({ cycles: 12, gap: 3 });
+assertNoEscapes(report);   // throws GcPoolEscapeError iff a slot escaped
+watch.dispose();
+```
+
+**Reading the verdict.**
+
+- `report.escapes` -- each is a slot collected while still checked out. Real,
+  every one.
+- `report.escapeCount === 0 && report.settled` -- no escape seen in the budget.
+  This is the strongest clean statement the tool can make, and it is NOT a pass:
+  **absence of detected escapes is not proof that none occurred.**
+- `report.settled === false` -- the loop ran out of `cycles` before quiescing;
+  widen the budget.
+
+**Gotchas.**
+
+- **Run under `--expose-gc`.** Without a forceable gc the report is
+  `{ available: false, reason: 'no_gc' }` and `assertNoEscapes` is inert. This
+  is a diagnostic to run in a dedicated test process, not in production.
+- **It is async.** Finalizers fire only after a collection *and* a macrotask, so
+  `settle()` must be awaited. There is no synchronous form.
+- **Give it a generous budget to catch reliably.** Finalization timing is up to
+  the engine; `cycles: 12, gap: 3` catches promptly, a stingy budget may miss.
+- **Never read an empty report as a guarantee.** Use `assertNoEscapes` to fail a
+  run when an escape is *seen*, not to certify a pool is correct. There is no
+  `assertPoolClean`, by design.
+
+---
+
 ## CLI: Running lite-gc-gate directly
 
 **Goal.** Run a gate from the shell without writing a wrapper script.

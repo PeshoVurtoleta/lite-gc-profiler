@@ -1,9 +1,9 @@
 # @zakkster/lite-gc-profiler — Torture Test Plan
 
-**Status:** shipped across v1.1.0 through v1.13.0
+**Status:** shipped across v1.1.0 through v1.14.0
 (G3.5, G5.5, G10.5, G13.5, G14.5, G14.6, G17.5, G18.5, G20.5, G21.5,
-G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G27.6, G28.6, G99.9,
-G99.10). All axes represented. Plus 3 CLI integration scenarios
+G22.5, G23.5, G24.5, G24.6, G25.5, G25.6, G26.5, G26.6, G27.6, G28.6, G29.6,
+G99.9, G99.10). All axes represented. Plus 3 CLI integration scenarios
 (`test/18-partial-report.test.mjs`) that live alongside the torture
 suites for the G16.5 partial-report path.
 
@@ -593,6 +593,43 @@ The 4 CLI cases pin the wiring: `--ratchet` without `--baseline` and with
 `--update-baseline` are both usage errors (exit 3); a passing run rewrites the
 file tighter; a regressing run leaves the committed file byte-identical and
 exits non-zero.
+
+---
+
+**G29.6 (v1.14.0) -- the pool-escape canary.** 13 torture scenarios in
+`test/torture/g29-6-canary.test.mjs` across axes A-D, plus 15 standard cases in
+`test/32-canary.test.mjs`. This is the one lane whose signal is NON-DETERMINISTIC
+by nature -- finalizer timing is up to V8 -- so the torture asserts invariants
+and statistical properties across repeated runs, not single deterministic
+outcomes. The danger unique to this lane is treating ABSENCE as proof, so half
+the suite guards exactly that.
+
+Axis A (3): absence is advisory, never proof. A clean pool never throws across
+budgets of 1/2/4/8 cycles; an empty escapes list always carries the not-proof
+note; a tiny budget on a clean pool still never manufactures a false escape.
+
+Axis B (3): a real escape is caught -- statistically, not single-shot. A dropped
+checked-out slot is caught within a generous budget; many escapes are all
+eventually reported with none extra; repeated runs each catch their own escape
+independently.
+
+Axis C (3): the no-pin invariant under load. Only truly-dropped slots fire under
+churn (released-then-collected slots stay silent -- the released bucket is the
+correctness distinction); a large watched set is fully collectable (a pinning
+bug would report exactly zero, so a healthy count proves no pin); a slot escapes
+at most once even under repeated settle.
+
+Axis D (4): lifecycle and degrade. Dispose stops further recording; settle on a
+disposed watch resolves rather than hangs and reports settled:false; the released
+count tracks clean check-ins; releasing an unknown slot is a no-op, not a crash.
+
+**What G29.6 surfaced:** the first churn-torture expectation was wrong -- it
+under-released slots, and the detector correctly reported every
+checked-out-and-dropped slot as an escape. The fix was to the test, not the
+code: it confirmed the detector's central rule, that an escape is any slot
+collected while still checked out, exactly and only. The `no_gc` degrade path is
+covered by stubbing `globalThis.gc` to undefined (writable but non-configurable
+under `--expose-gc`, so assignment works where `delete` throws).
 
 ---
 

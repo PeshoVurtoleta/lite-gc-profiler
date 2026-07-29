@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.13.0
+# @zakkster/lite-gc-profiler v1.14.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -31,6 +31,7 @@ test-helpers/explain and the lite-gc-gate CLI.
   `ratchetBaseline`,
   `formatConsole`, `formatJson`, `formatMarkdown`,
   `formatGithubAnnotations`, `GcBudgetError`, `GcInconclusiveError`,
+  `watchPool`, `assertNoEscapes`, `GcPoolEscapeError`,
   `GC_DEFAULT_RULES`, `GC_DEFAULT_DIFFERENTIAL_RULES`,
   `REP_POLICY_DEFAULTS`, `VERDICT_MATRIX`, `VERSION`,
   `GC_MINOR`/`GC_MAJOR`/`GC_INCREMENTAL`/`GC_WEAKCB`.
@@ -172,6 +173,27 @@ session per call, born+buried inside the measurement guard (never pooled),
 torn down even if the workload throws. Native/internal/library frames are
 filtered to a separate nativeBytes bucket. Without `attribute`, inspector
 is never touched and attribution is null.
+
+Pool-escape canary (watchPool, v1.14.0): a DETECTOR for the INVERSE of a
+leak -- a pooled object that should live DIES (escaped the pool's
+bookkeeping, lost its last ref, got collected). `watchPool({ label })`
+returns a handle: register(obj, slotId) on checkout, release(obj, slotId)
+on checkin, `await settle({ cycles, gap })` to drive gc + macrotask yield
+and collect the report { available, reason?, escapes:[{slot}], escapeCount,
+settled, watched, released, label, note }, then dispose(). assertNoEscapes
+throws GcPoolEscapeError iff escapes.length > 0. FOUR LAWS, each forced by
+the measured fact that FinalizationRegistry callbacks fire only after a
+collection AND a macrotask (never synchronously with gc()): (1) async by
+construction, no sync form; (2) escapes are asserted but ABSENCE IS NOT --
+an empty escapes list is "none seen in N cycles", never "none exist", so
+there is no clean/pass verdict and assertNoEscapes never throws on empty
+(the inverse of measureAllocs's maxBytesPerCall:0 negative gate); (3)
+Node + modern-engine only, degrades to { available:false, reason:
+'no_registry' | 'no_gc' }, never throws for lack of the mechanism; (4) the
+registry holds the slot id as held value and the object only as a weak
+target -- holding the object would pin every slot and report zero escapes
+by construction. Does NOT compose with stabilize:'deep' (sync anchor vs
+async finalizer). A released-then-collected slot is NOT an escape.
 
 ## License
 

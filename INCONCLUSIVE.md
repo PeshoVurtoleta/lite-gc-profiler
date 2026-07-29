@@ -174,6 +174,26 @@ allocate" hint is missing, not because the measurement failed.
 
 ---
 
+## Pool-escape watch codes (watchPool, v1.14.0)
+
+These appear on `report.reason` when `watchPool(...).settle()` could not run its
+detector. They are NOT inconclusive verdicts -- watchPool is advisory and never
+gates. And note the deeper rule of this lane: even a fully-available run with an
+empty `escapes` list is NOT a pass. Absence of detected escapes is never proof
+that none occurred; a finalizer may not have run yet, or may never run. There is
+deliberately no clean/pass verdict to be inconclusive about.
+
+| `report.reason` | What it means | What to do |
+| --- | --- | --- |
+| `no_registry` | this runtime has no `FinalizationRegistry` -- a very old engine | the pool-escape canary is unavailable here; there is no fallback that can observe a collection |
+| `no_gc` | there is no forceable `globalThis.gc` to drive the settle loop -- finalizers cannot be provoked on demand | run under `node --expose-gc`. Without it, `settle()` returns `available: false` rather than hanging |
+
+Remember the shape: `assertNoEscapes` throws only on a NON-empty escapes list. On
+an unavailable report, or an empty one, it is a no-op. Use it to fail a run when
+an escape is *seen*, never to certify that none exists.
+
+---
+
 ## Still stuck?
 
 `explainReport(report)` prints which rules went unverified and why, in

@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.13.0';
+const VERSION = '1.14.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -5278,6 +5278,207 @@ function assertAggregateFramesReport(reports, rules, opts) {
 }
 
 
+// ---------------------------------------------------------------------------
+// watchPool -- the pool-escape canary (v1.14.0).
+//
+// A pool reuses objects so a hot path never allocates or frees per operation.
+// Its failure mode is the INVERSE of a leak: an object that should live dies --
+// a slot escaped the pool's bookkeeping, lost its last strong reference, and
+// was collected. watchPool registers each checked-out slot in a
+// FinalizationRegistry and, after an async gc+yield settle loop, reports which
+// slots were collected WHILE STILL CHECKED OUT. Those are escapes.
+//
+// This is a DETECTOR, not a gate, and every line of it is shaped by one
+// measured fact: FinalizationRegistry callbacks fire only after a collection
+// AND a macrotask, never synchronously with gc(). Four laws follow:
+//
+//   1. Async by construction. settle() drives gc() + yield; there is no sync
+//      form (a sync watchPool would be a lie).
+//   2. Escapes are asserted; absence is not. A fired finalizer for a still-
+//      checked-out slot is a real escape. An empty escapes list is "none seen
+//      in N cycles", NEVER "none exist". assertNoEscapes throws on a non-empty
+//      list and NEVER on an empty one. Positive detector, never negative gate --
+//      the exact inverse of measureAllocs's maxBytesPerCall: 0.
+//   3. Node + modern-engine only. Needs FinalizationRegistry and a forceable
+//      globalThis.gc. Absent either, available:false with a reason; never
+//      throws for lack of the mechanism.
+//   4. The registry holds NO strong reference to the watched object. The held
+//      value is the slot id (a primitive); the object is only the weak target
+//      and the unregister token. Holding the object would pin every slot alive
+//      and guarantee zero escapes by construction -- the observer changing the
+//      observed.
+// ---------------------------------------------------------------------------
+
+const POOL_ESCAPE_NOTE =
+    'advisory: escapes listed are real, but an empty list is not proof that no ' +
+    'slot escaped -- a finalizer may not have run yet, or may never run.';
+
+class GcPoolEscapeError extends Error {
+    constructor(report) {
+        const slots = report.escapes.map((e) => e.slot);
+        super('pool escape detected: ' + report.escapeCount + ' slot' +
+            (report.escapeCount === 1 ? '' : 's') +
+            ' collected while still checked out' +
+            (slots.length ? ' (' + slots.slice(0, 8).join(', ') +
+                (slots.length > 8 ? ', ...' : '') + ')' : '') +
+            (report.label ? ' [pool: ' + report.label + ']' : ''));
+        this.name = 'GcPoolEscapeError';
+        this.report = report;
+    }
+}
+
+/**
+ * Watch a pool for slots that are collected while still checked out (v1.14.0).
+ * Returns a watch handle; see the module comment for the four laws. Advisory,
+ * async, positive-only detector -- never a gate.
+ *
+ * @param {{ label?: string }} [options]
+ */
+function watchPool(options) {
+    const opts = options || {};
+    const label = opts.label === undefined ? '' : String(opts.label);
+
+    const hasRegistry = typeof FinalizationRegistry === 'function';
+    const hasGc = typeof globalThis.gc === 'function';
+    const available = hasRegistry && hasGc;
+    const unavailableReason = !hasRegistry ? 'no_registry' : (!hasGc ? 'no_gc' : null);
+
+    // Slots currently checked out. A finalizer counts as an escape ONLY if its
+    // slot is still in this set when it fires -- a released slot that is later
+    // collected is the pool working correctly, not an escape.
+    const checkedOut = new Set();
+    // Fired slot ids awaiting classification, pushed by the registry callback.
+    const pendingEscapes = [];
+    let watched = 0;
+    let released = 0;
+    let disposed = false;
+
+    // The registry callback runs on V8's finalization task. It must not touch
+    // the object (already gone) and must not throw. It records an escape iff the
+    // slot is still checked out and we have not been disposed.
+    let registry = null;
+    if (available) {
+        registry = new FinalizationRegistry(function (slotId) {
+            if (disposed) return;
+            if (checkedOut.has(slotId)) {
+                pendingEscapes.push(slotId);
+                // A slot escapes at most once; dropping it prevents any second
+                // (impossible) fire from double-counting.
+                checkedOut.delete(slotId);
+            }
+        });
+    }
+
+    function register(obj, slotId) {
+        if (!available || disposed) return;
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('watchPool.register: obj must be an object (the slot being checked out)');
+        }
+        // Held value is the slot id (primitive-safe); unregister token is the
+        // object, held weakly. The object is NEVER the held value -- that would
+        // pin it alive and guarantee zero escapes by construction.
+        registry.register(obj, slotId, obj);
+        checkedOut.add(slotId);
+        watched++;
+    }
+
+    function release(obj, slotId) {
+        if (!available || disposed) return;
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            throw new TypeError('watchPool.release: obj must be the object being checked in');
+        }
+        registry.unregister(obj);
+        if (checkedOut.delete(slotId)) released++;
+    }
+
+    function buildReport(settled) {
+        const escapes = pendingEscapes.map(function (slot) { return { slot: slot }; });
+        return {
+            available: available,
+            reason: unavailableReason || undefined,
+            escapes: escapes,
+            escapeCount: escapes.length,
+            settled: settled,
+            watched: watched,
+            released: released,
+            label: label,
+            note: POOL_ESCAPE_NOTE
+        };
+    }
+
+    /**
+     * Drive gc() + macrotask yield up to `cycles` times, delivering pending
+     * finalizers, then report. Stops early once a full quiet pass sees no new
+     * escapes and the checked-out set has stopped shrinking. Models the
+     * quiet-tick idiom of gc.settle(), but DRIVES gc where that one only waits.
+     */
+    function settle(settleOpts) {
+        const so = settleOpts || {};
+        const cycles = so.cycles > 0 ? so.cycles | 0 : 8;
+        const gap = so.gap >= 0 ? +so.gap : 2;
+
+        if (!available || disposed) {
+            return Promise.resolve(buildReport(available && !disposed));
+        }
+
+        return new Promise(function (resolve) {
+            let done = 0;
+            let lastEscapeCount = pendingEscapes.length;
+            let lastCheckedOut = checkedOut.size;
+            let quiet = 0;
+            function step() {
+                if (disposed) { resolve(buildReport(false)); return; }
+                globalThis.gc();
+                setTimeout(function () {
+                    done++;
+                    const escChanged = pendingEscapes.length !== lastEscapeCount;
+                    const setChanged = checkedOut.size !== lastCheckedOut;
+                    if (!escChanged && !setChanged) {
+                        quiet++;
+                    } else {
+                        quiet = 0;
+                        lastEscapeCount = pendingEscapes.length;
+                        lastCheckedOut = checkedOut.size;
+                    }
+                    if (quiet >= 2) { resolve(buildReport(true)); return; }
+                    if (done >= cycles) { resolve(buildReport(false)); return; }
+                    step();
+                }, gap);
+            }
+            step();
+        });
+    }
+
+    function dispose() {
+        // Idempotent. After dispose the callback stops recording (guarded by the
+        // disposed flag) and register/release become no-ops.
+        disposed = true;
+        checkedOut.clear();
+    }
+
+    return {
+        register: register,
+        release: release,
+        settle: settle,
+        dispose: dispose,
+        get available() { return available; }
+    };
+}
+
+/**
+ * Throw GcPoolEscapeError iff the report lists one or more escapes. NEVER throws
+ * on an empty escapes list -- absence is advisory, not a pass. A no-op on an
+ * unavailable report. Positive-only: there is deliberately no assertPoolClean,
+ * because "no escapes seen" can never be certified.
+ */
+function assertNoEscapes(report) {
+    if (report && report.available && report.escapes && report.escapes.length > 0) {
+        throw new GcPoolEscapeError(report);
+    }
+    return report;
+}
+
+
 export {
     VERSION,
     GcProfiler,
@@ -5310,5 +5511,8 @@ export {
     GcBudgetError, GcInconclusiveError,
     GC_DEFAULT_RULES, GC_DEFAULT_DIFFERENTIAL_RULES, REP_POLICY_DEFAULTS,
     VERDICT_MATRIX,
+    // Canary (v1.14.0) -- the pool-escape detector. Advisory, async,
+    // positive-only; watches a pool for slots collected while checked out.
+    watchPool, assertNoEscapes, GcPoolEscapeError,
     GC_MINOR, GC_MAJOR, GC_INCREMENTAL, GC_WEAKCB
 };

@@ -5,7 +5,7 @@ export interface NodeMemoryUsageLike {
     arrayBuffers?: number;
 }
 
-export const VERSION: '1.13.0';
+export const VERSION: '1.14.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -1016,6 +1016,78 @@ export function _attributeProfile(profileHead: unknown, topSites: number): {
  * library, the inspector, a Node internal, or a native/synthetic frame).
  */
 export function _isUserFrame(callFrame: { url?: string }): boolean;
+
+/** One slot that was collected while still checked out (v1.14.0). */
+export interface PoolEscape {
+    /** The slot id the caller passed to register(). */
+    slot: unknown;
+}
+
+/**
+ * A watchPool settle() report (v1.14.0). Advisory: `escapes` are real, but an
+ * empty list is NOT proof that no slot escaped. There is no "pass" verdict.
+ */
+export interface PoolEscapeReport {
+    /** Whether the mechanism (FinalizationRegistry + forceable gc) was usable. */
+    available: boolean;
+    /** When unavailable: why. */
+    reason?: 'no_registry' | 'no_gc' | (string & {});
+    /** Slots collected while still checked out. Each is a real escape. */
+    escapes: PoolEscape[];
+    escapeCount: number;
+    /** Whether the settle loop quiesced within its budget. false if it ran out. */
+    settled: boolean;
+    /** Slots registered over this watch's life. */
+    watched: number;
+    /** Slots released (checked back in) cleanly. */
+    released: number;
+    /** The label passed to watchPool, or ''. */
+    label: string;
+    /** The advisory sentence, always present. */
+    note: string;
+}
+
+/** A live pool-escape watch handle (v1.14.0). */
+export interface PoolWatch {
+    /** Record that the pool handed `obj` out under `slotId` (checked out). */
+    register(obj: object, slotId: unknown): void;
+    /** Record that `obj` was checked back in; unregisters it (not an escape). */
+    release(obj: object, slotId: unknown): void;
+    /**
+     * Drive gc() + macrotask yield up to `cycles` times (default 8, `gap` ms
+     * apart, default 2), delivering pending finalizers, then report. Async by
+     * construction -- finalizers never fire synchronously with gc().
+     */
+    settle(opts?: { cycles?: number; gap?: number }): Promise<PoolEscapeReport>;
+    /** Tear down. Idempotent; a late finalizer callback becomes inert. */
+    dispose(): void;
+    /** Whether the mechanism is usable in this runtime. */
+    readonly available: boolean;
+}
+
+/**
+ * Watch a pool for slots collected while still checked out (v1.14.0). The
+ * INVERSE of a leak: an object that should live dies. Advisory, async,
+ * positive-only DETECTOR -- never a gate. Node + modern-engine only; degrades
+ * to available:false elsewhere, never throws for lack of the mechanism.
+ *
+ * Absence of detected escapes is NOT proof that none occurred.
+ */
+export function watchPool(options?: { label?: string }): PoolWatch;
+
+/**
+ * Throw GcPoolEscapeError iff the report lists one or more escapes. NEVER throws
+ * on an empty escapes list -- absence is advisory, not a pass. A no-op on an
+ * unavailable report. Positive-only; there is deliberately no assertPoolClean.
+ */
+export function assertNoEscapes(report: PoolEscapeReport): PoolEscapeReport;
+
+/** Thrown by assertNoEscapes when a report lists one or more escapes (v1.14.0). */
+export class GcPoolEscapeError extends Error {
+    name: 'GcPoolEscapeError';
+    report: PoolEscapeReport;
+}
+
 
 /**
  * Compare two measureOps results. Convenience form accepts two functions

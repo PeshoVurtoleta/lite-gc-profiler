@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.14.0
+
+The pool-escape canary: `watchPool`. A detector for the INVERSE of a leak. A
+pool reuses objects so a hot path never allocates or frees per operation; its
+failure mode is an object that should live *dying* -- a slot escaped the pool's
+bookkeeping, lost its last strong reference, and was collected. `watchPool`
+registers each checked-out slot in a FinalizationRegistry and reports which were
+collected while still checked out.
+
+This shipped only after a written evaluation, because the mechanism has a hard
+constraint that shapes the whole design: FinalizationRegistry callbacks fire
+only after a collection AND a macrotask, never synchronously with `gc()`. So
+this is a detector, not a gate.
+
+### Added
+
+- **`watchPool({ label? })`** returns a watch handle: `register(obj, slotId)` as
+  the pool checks a slot out, `release(obj, slotId)` as it checks one back in,
+  `await settle({ cycles?, gap? })` to drive gc + yield and collect the report,
+  and `dispose()`.
+- **`assertNoEscapes(report)`** throws `GcPoolEscapeError` iff the report lists
+  escapes. It NEVER throws on an empty list -- absence is advisory, not a pass.
+- **`GcPoolEscapeError`**, carrying the report and naming the escaped slots.
+
+### The four laws (each forced by measurement, not preference)
+
+1. **Async by construction.** `settle()` returns a Promise and drives `gc()` +
+   a macrotask yield; there is no synchronous form, because a synchronous
+   watchPool would be a lie about when finalizers fire.
+2. **Escapes are asserted; absence is not.** A fired finalizer for a
+   still-checked-out slot is a real escape. An empty `escapes` list means "none
+   seen in N cycles," never "none exist." This is the exact inverse of
+   `measureAllocs`'s `maxBytesPerCall: 0` negative gate -- watchPool is a
+   positive detector, and there is deliberately no clean/pass verdict.
+3. **Node + modern-engine only.** Needs `FinalizationRegistry` and a forceable
+   `globalThis.gc`. Absent either, `available: false` with a reason
+   (`no_registry` / `no_gc`); it never throws for lack of the mechanism.
+4. **The registry holds no strong reference to the watched object.** The held
+   value is the slot id; the object is only the weak target and unregister
+   token. Holding the object would pin every slot alive and guarantee zero
+   escapes by construction -- the observer changing the observed.
+
+### Correction to the roadmap
+
+The canary does NOT integrate with `stabilize: 'deep'`, contrary to an earlier
+roadmap note. `stabilize` is a synchronous-anchor concept and finalization is
+async; a sync stabilize cannot pull an async finalizer forward. watchPool brings
+its own async settle loop and does not touch stabilize.
+
+### Testing
+
+30 new scenarios: 15 standard (`test/32-canary.test.mjs`, including the no-pin
+proof and the `no_gc` degrade path) and 13 torture
+(`test/torture/g29-6-canary.test.mjs`, axes A-D). The torture is unusual --
+finalization timing is non-deterministic, so it asserts invariants and
+statistical properties across repeated runs, not single outcomes: absence never
+throws, a real escape is caught within a generous budget, only truly-dropped
+slots fire under churn, and a slot escapes at most once. Full suite: 916 tests,
+coverage above 96/95/88.
+
 ## 1.13.0
 
 Allocation attribution (G27). `measureAllocs` told you a hot-path function
