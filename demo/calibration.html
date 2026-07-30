@@ -207,6 +207,15 @@
     main { padding: 0.75rem; }
     .panel { padding: 0.65rem 0.75rem; }
   }
+
+  /* Small utility classes, extracted from former inline styles so the demo
+     keeps to the one-inline-style rule (only style="--var: value" allowed). */
+  .caption { font-size: 0.7rem; color: var(--dim); margin: 0.5rem 0 0 0; }
+  .caption-top { font-size: 0.7rem; color: var(--dim); margin: 0 0 0.5rem 0; }
+  .dim { color: var(--dim); }
+  .tiny { font-size: 0.65rem; }
+  .foot-line { margin-top: 0.35rem; }
+  .foot-copy { margin-top: 0.35rem; font-size: 0.65rem; }
 </style>
 </head>
 <body>
@@ -246,7 +255,7 @@
         <path class="arrow" d="M236 80 L304 80" marker-end="url(#arrow-b)" />
       </g>
     </svg>
-    <p style="font-size:0.7rem;color:var(--dim);margin:0.5rem 0 0 0">Idle observer for the configured window. Any <code>gcDrops</code> counted here are the machine's spurious floor.</p>
+    <p class="caption">Idle observer for the configured window. Any <code>gcDrops</code> counted here are the machine's spurious floor.</p>
   </div>
 
   <div class="panel">
@@ -289,7 +298,7 @@
         <path class="arrow" d="M236 80 L304 80" marker-end="url(#arrow-p)" />
       </g>
     </svg>
-    <p style="font-size:0.7rem;color:var(--dim);margin:0.5rem 0 0 0">Ring-buffered <code>Uint32Array</code> pool, one write per frame, no allocations after warmup. Any <code>gcDrops</code> counted are false positives.</p>
+    <p class="caption">Ring-buffered <code>Uint32Array</code> pool, one write per frame, no allocations after warmup. Any <code>gcDrops</code> counted are false positives.</p>
   </div>
 
   <div class="panel">
@@ -331,13 +340,13 @@
         <g><circle class="state-node" data-state="idle"    cx="60"  cy="80" r="36" /><text data-state="idle"    x="60"  y="80">idle</text></g>
         <g><circle class="state-node" data-state="alloc"   cx="180" cy="80" r="36" /><text data-state="alloc"   x="180" y="80">alloc</text></g>
         <g><circle class="state-node" data-state="release" cx="300" cy="80" r="36" /><text data-state="release" x="300" y="80">release</text></g>
-        <g><circle class="state-node" data-state="done"    cx="200" cy="140" r="20" /><text data-state="done"    x="200" y="140" style="font-size:0.65rem">done</text></g>
+        <g><circle class="state-node" data-state="done"    cx="200" cy="140" r="20" /><text data-state="done"    x="200" y="140" class="tiny">done</text></g>
         <path class="arrow" d="M96 80 L144 80"  marker-end="url(#arrow-l)" />
         <path class="arrow" d="M216 80 L264 80" marker-end="url(#arrow-l)" />
         <path class="arrow" d="M300 116 Q240 130 200 122" marker-end="url(#arrow-l)" />
       </g>
     </svg>
-    <p style="font-size:0.7rem;color:var(--dim);margin:0.5rem 0 0 0">Allocates <code>Uint32Array</code> of ~<span id="cfg-leaky-size">4</span> KB per frame; retains for N frames then releases the batch. Every release is a candidate GC event.</p>
+    <p class="caption">Allocates <code>Uint32Array</code> of ~<span id="cfg-leaky-size">4</span> KB per frame; retains for N frames then releases the batch. Every release is a candidate GC event.</p>
   </div>
 
   <div class="panel">
@@ -373,13 +382,13 @@
 <section id="scene-report" class="scene wide">
   <div class="panel">
     <h2>calibration report</h2>
-    <p style="font-size:0.7rem;color:var(--dim);margin:0 0 0.5rem 0">
+    <p class="caption-top">
       Numbers reflect one run per scene. Re-run scenes for tighter estimates. The <code>uasm</code> column is ground truth when cross-origin isolation is available; otherwise the profiler-only column stands alone.
     </p>
     <table class="report" id="report-table">
       <thead><tr><th>scene</th><th>duration</th><th>heuristic <code>gcDrops</code></th><th>rate</th><th>uasm net (bytes)</th><th>verdict</th></tr></thead>
       <tbody id="report-body">
-        <tr><td colspan="6" style="color:var(--dim)">Run baseline, pooled, and leaky scenes to populate.</td></tr>
+        <tr><td colspan="6" class="dim">Run baseline, pooled, and leaky scenes to populate.</td></tr>
       </tbody>
     </table>
     <div class="controls">
@@ -395,14 +404,14 @@
 
 <footer>
   <div><span class="k">machine:</span> <span class="v" id="fp-line">-</span></div>
-  <div style="margin-top:0.35rem"><span class="k">profiler:</span> <span class="v">@zakkster/lite-gc-profiler v<span id="fp-ver">-</span></span></div>
-  <div style="margin-top:0.35rem;font-size:0.65rem">Copyright &copy; Zahary Shinikchiev &middot; single-file demo, no build step</div>
+  <div class="foot-line"><span class="k">profiler:</span> <span class="v">@zakkster/lite-gc-profiler v<span id="fp-ver">-</span></span></div>
+  <div class="foot-copy">Copyright &copy; Zahary Shinikchiev &middot; single-file demo, no build step</div>
 </footer>
 
 <script type="importmap">
 {
   "imports": {
-    "@zakkster/lite-gc-profiler": "https://esm.sh/@zakkster/lite-gc-profiler@1.2.0"
+    "@zakkster/lite-gc-profiler": "../index.js"
   }
 }
 </script>
@@ -1008,7 +1017,7 @@ function renderReport() {
     const bl = RESULTS.baseline, po = RESULTS.pooled, le = RESULTS.leaky;
     // Header row
     if (!bl && !po && !le) {
-        $reportBody.innerHTML = '<tr><td colspan="6" style="color:var(--dim)">Run baseline, pooled, and leaky scenes to populate.</td></tr>';
+        $reportBody.innerHTML = '<tr><td colspan="6" class="dim">Run baseline, pooled, and leaky scenes to populate.</td></tr>';
         return;
     }
     rows.push('<tr class="section"><td colspan="6">spurious-drop channel (should be near zero)</td></tr>');
@@ -1020,7 +1029,7 @@ function renderReport() {
 }
 
 function baselineRow(r) {
-    if (!r) return '<tr><td>baseline</td><td colspan="5" style="color:var(--dim)">not run</td></tr>';
+    if (!r) return '<tr><td>baseline</td><td colspan="5" class="dim">not run</td></tr>';
     const kind = r.spuriousRatePerSec < 0.01 ? 'ok' : (r.spuriousRatePerSec < 0.1 ? 'warn' : 'err');
     return '<tr><td>baseline (idle)</td>'
         + '<td>' + r.durationSec.toFixed(1) + ' s</td>'
@@ -1030,7 +1039,7 @@ function baselineRow(r) {
         + '<td>' + verdictBadge(kind) + '</td></tr>';
 }
 function pooledRow(r) {
-    if (!r) return '<tr><td>pooled</td><td colspan="5" style="color:var(--dim)">not run</td></tr>';
+    if (!r) return '<tr><td>pooled</td><td colspan="5" class="dim">not run</td></tr>';
     const kind = r.spuriousRatePerSec < 0.01 ? 'ok' : (r.spuriousRatePerSec < 0.05 ? 'warn' : 'err');
     return '<tr><td>pooled (' + r.writesPerFrame + ' writes/frame)</td>'
         + '<td>' + r.durationSec.toFixed(1) + ' s</td>'
@@ -1040,7 +1049,7 @@ function pooledRow(r) {
         + '<td>' + verdictBadge(kind) + '</td></tr>';
 }
 function leakyRow(r) {
-    if (!r) return '<tr><td>leaky</td><td colspan="5" style="color:var(--dim)">not run</td></tr>';
+    if (!r) return '<tr><td>leaky</td><td colspan="5" class="dim">not run</td></tr>';
     const kind = r.detectionRate >= 0.5 ? 'ok' : (r.detectionRate >= 0.2 ? 'warn' : 'err');
     return '<tr><td>leaky (release every ' + r.retainFrames + ' frames)</td>'
         + '<td>' + r.durationSec.toFixed(1) + ' s</td>'

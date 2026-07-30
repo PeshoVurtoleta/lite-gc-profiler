@@ -303,6 +303,11 @@
             cursor: progress;
         }
 
+        #gateHint {
+            font-size: 0.78rem;
+            color: var(--ink-faint);
+        }
+
         .gate-explain {
             font-family: var(--mono);
             font-size: 0.78rem;
@@ -417,7 +422,7 @@
         <div class="gate-head">
             <span class="badge" id="gateBadge" title="Result of the last gate run"></span>
             <button class="gate-btn" id="gateRun">Run gate</button>
-            <span id="gateHint" style="font-size:0.78rem;color:var(--ink-faint);">
+            <span id="gateHint">
                 assertFrames({ maxBytesPerFrame: 512 }) &mdash; runs the currently-selected mode above
             </span>
         </div>
