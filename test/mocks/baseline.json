@@ -1,0 +1,101 @@
+{
+  "schema": "lite-gc-baseline/1",
+  "fingerprint": {
+    "node": "v26.3.1",
+    "v8": "14.6.202.34-node.20",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M4 Pro"
+  },
+  "capturedAt": "2026-08-01T22:16:12.688Z",
+  "reps": 2,
+  "sources": [
+    "gc"
+  ],
+  "gc": {
+    "major": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "minor": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "incremental": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "weakcb": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "maxMs": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "totalMs": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "p99Ms": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "count": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    }
+  },
+  "heap": {
+    "allocRateBytesPerSec": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "allocBytes": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "gcDrops": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "samples": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    }
+  },
+  "uasm": {
+    "growthRate": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "bytes": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "peak": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    },
+    "samples": {
+      "min": 0,
+      "median": 0,
+      "max": 0
+    }
+  }
+}

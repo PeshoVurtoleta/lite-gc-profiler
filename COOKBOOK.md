@@ -67,6 +67,10 @@ out of it if you have.
 19. [Comparing two measured windows](#recipe-19-comparing-two-measured-windows)
 20. [What your source can and cannot verify](#recipe-20-what-your-source-can-and-cannot-verify)
 21. [Catching a leak the heap cannot see](#recipe-21-catching-a-leak-the-heap-cannot-see)
+22. [Catching the inverse of a leak: a pooled slot that escaped](#recipe-22-catching-the-inverse-of-a-leak----a-pooled-slot-that-escaped)
+23. [Gating a Vue reactivity effect](#recipe-23-gating-a-vue-reactivity-effect)
+24. [Gating a React render](#recipe-24-gating-a-react-render)
+25. [Gating Angular change detection](#recipe-25-gating-angular-change-detection)
 
 **CLI**
 
@@ -1759,6 +1763,155 @@ watch.dispose();
 - **Never read an empty report as a guarantee.** Use `assertNoEscapes` to fail a
   run when an escape is *seen*, not to certify a pool is correct. There is no
   `assertPoolClean`, by design.
+
+---
+
+## Recipe 23: Gating a Vue reactivity effect
+
+**Goal.** Prove that when a reactive dependency changes and Vue re-runs an
+effect, the re-run retains nothing. A reactive node that allocates per tick
+turns a smooth component into a GC generator under load.
+
+**Primitive.** `measureAllocs` + `checkAllocs` (or `assertAllocs` in a test).
+The hot path is *triggering* the effect -- writing the reactive source.
+
+**Code (real Vue + Vitest).**
+
+```js
+import { test } from 'vitest';
+import { ref, effect } from '@vue/reactivity';   // or 'vue'
+import { assertAllocs } from '@zakkster/lite-gc-profiler';
+
+test('a reactive tick retains nothing', () => {
+    const count = ref(0);
+    const view = { total: 0 };                 // preallocated derived-state slot
+    effect(() => { view.total = count.value * 2; });
+
+    // The tick: mutate the source, which re-runs the effect synchronously.
+    assertAllocs((i) => { count.value = i; },
+        { maxBytesPerCall: 0 },
+        { iterations: 5_000, batches: 8 });
+});
+```
+
+**Run it under `--expose-gc`.** `measureAllocs` forces a collection at each
+batch boundary, so the test process needs the flag. In Vitest:
+
+```js
+// vitest.config.js
+export default {
+    test: { pool: 'forks', poolOptions: { forks: { execArgv: ['--expose-gc'] } } }
+};
+```
+
+**Runnable example.** [`examples/vue.mjs`](examples/vue.mjs) is the same gate
+with a zero-dependency stand-in for `ref`/`effect`, so it runs with nothing
+installed: `node --expose-gc examples/vue.mjs`.
+
+**Gotchas.**
+
+- Gate the effect *body* you wrote, not Vue's scheduler. `count.value = i`
+  re-runs the effect synchronously (`@vue/reactivity`); a `watchEffect` under
+  the full runtime flushes on a microtask, which pushes allocation outside the
+  batch bracket -- gate the sync `effect`, or measure the async flush with
+  `measureOpsAsync`.
+- A computed that returns a fresh object each run will never floor at 0. That is
+  the finding, not a false positive: reuse the slot or accept the rate lane
+  (`measureOps` + `maxBytesPerOp`) instead.
+
+---
+
+## Recipe 24: Gating a React render
+
+**Goal.** Prove a component re-render with new state retains nothing per render.
+A render that allocates objects it does not need churns the heap on every
+keystroke, and reconciliation makes it worse.
+
+**Primitive.** `measureAllocs` + `checkAllocs`. The hot path is one render pass.
+
+**Code (real React + Vitest).**
+
+```js
+import { test } from 'vitest';
+import { createElement } from 'react';
+import TestRenderer from 'react-test-renderer';
+import { assertAllocs } from '@zakkster/lite-gc-profiler';
+
+test('a render retains nothing', () => {
+    let root;
+    TestRenderer.act(() => { root = TestRenderer.create(createElement(Row, { i: 0 })); });
+
+    // The tick: re-render with fresh props, as on a state change.
+    assertAllocs((i) => {
+        TestRenderer.act(() => { root.update(createElement(Row, { i })); });
+    }, { maxBytesPerCall: 0 }, { iterations: 2_000, batches: 8 });
+});
+```
+
+**Run it under `--expose-gc`** (see the Vitest `execArgv` config in Recipe 23).
+
+**Runnable example.** [`examples/react.mjs`](examples/react.mjs) isolates your
+render body with a zero-dependency stand-in for the render + `useState` cycle:
+`node --expose-gc examples/react.mjs`.
+
+**Gotchas.**
+
+- React itself allocates elements per render (`createElement` returns a fresh
+  object). A strict `maxBytesPerCall: 0` on the full `createElement + update`
+  path will not floor at zero -- that is React's cost, not yours. To gate *your*
+  code, either measure the render body in isolation (as the runnable example
+  does) or set a defensible threshold above React's fixed per-render floor with
+  the differential lane (Recipe 17).
+- `act()` must wrap every update or React warns and batches unpredictably,
+  smearing allocation across the batch boundary.
+
+---
+
+## Recipe 25: Gating Angular change detection
+
+**Goal.** Prove a change-detection cycle retains nothing per tick. Angular runs
+`detectChanges()` constantly under zone.js; a template binding that allocates
+per cycle multiplies straight into jank.
+
+**Primitive.** `measureAllocs` + `checkAllocs`. The hot path is one CD cycle
+(or one signal `effect` flush).
+
+**Code (real Angular + Vitest).**
+
+```js
+import { test, beforeEach } from 'vitest';
+import { TestBed } from '@angular/core/testing';
+import { assertAllocs } from '@zakkster/lite-gc-profiler';
+
+test('a change-detection cycle retains nothing', () => {
+    const fixture = TestBed.createComponent(RowComponent);
+
+    // The tick: set an input, run one CD cycle.
+    assertAllocs((i) => {
+        fixture.componentInstance.i = i;
+        fixture.detectChanges();
+    }, { maxBytesPerCall: 0 }, { iterations: 2_000, batches: 8 });
+});
+```
+
+For a signals component, gate the `effect` flush instead -- set the signal and
+let the reactive graph recompute, the same shape as the Vue recipe.
+
+**Run it under `--expose-gc`** (see the Vitest `execArgv` config in Recipe 23).
+
+**Runnable example.** [`examples/angular.mjs`](examples/angular.mjs) gates a
+zero-dependency stand-in for a component's `detectChanges` update block:
+`node --expose-gc examples/angular.mjs`.
+
+**Gotchas.**
+
+- Zone.js and the full TestBed allocate per cycle around your component. As with
+  React, a strict zero gates the framework, not your template -- isolate the
+  binding update (as the runnable example does) or gate above the framework
+  floor with a differential.
+- `ChangeDetectionStrategy.OnPush` skips cycles when inputs are referentially
+  equal; feed a genuinely changing input (`i` above) or you will measure skipped
+  cycles that allocate nothing and learn nothing.
 
 ---
 

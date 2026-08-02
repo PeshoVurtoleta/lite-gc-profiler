@@ -1,0 +1,12 @@
+{
+  "kind": "gc",
+  "verdict": "inconclusive",
+  "ok": false,
+  "violations": [],
+  "checked": {
+    "maxMajor": false
+  },
+  "checkedByPhase": {},
+  "checkedByRegion": {},
+  "source": "none"
+}

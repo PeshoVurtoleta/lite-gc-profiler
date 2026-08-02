@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.14.2
+
+Documentation and test-coverage release. No library behavior changed; the only
+source edit is the `VERSION` constant.
+
+### Added
+
+- Framework integration docs: COOKBOOK recipes 23-25 (Vue reactivity effect,
+  React render, Angular change detection) and a README "Framework integration"
+  section. Each gates a reactive tick with `measureAllocs`/`assertAllocs` under
+  `--expose-gc`, with the Vitest `execArgv: ['--expose-gc']` config shown and
+  the honest caveat that a strict `maxBytesPerCall: 0` on the full framework
+  path gates the framework's fixed per-render cost, not your code.
+- A one-line framework-integration pointer in `llms.txt`.
+
+### Added (repository only, not published)
+
+- `examples/{vue,react,angular}.mjs`: runnable, zero-dependency examples, each
+  with a ~12-line hand-rolled stand-in for the framework's reactive primitive so
+  it runs with nothing installed and prints a `pass` verdict. Excluded from
+  `files`.
+- `test/mocks/`: canonical report fixtures for every verdict and schema
+  (pass/fail/inconclusive gate reports, a baseline, a worker aggregate, and a
+  CLI `--format json` envelope), generated from the real API by
+  `test/mocks/generate.mjs`. `test/34-mocks.test.mjs` proves each fixture
+  round-trips through its real consumer (`formatConsole/Json/Markdown`,
+  `checkAgainstBaseline`, `ratchetBaseline`, `checkAggregateReport`) to the
+  verdict its filename claims.
+- A CLI test for the ratchet-rewrite-failure lane: a `--ratchet` run whose
+  baseline rewrite fails now asserts exit 3, closing the last cheaply-reachable
+  uncovered branch in `bin/LiteGcGate.mjs` (skipped under root, which writes
+  through a read-only file).
+
+### Verified
+
+- Every claim in `llms.txt` ("Key semantics" and "Zero-alloc guarantees") was
+  audited against the suite; each is covered by a falsifying test. No bug found.
+- The GCForge viewer (`viewer/`) reads and renders every current report shape
+  -- gate verdicts, baseline lock, `lite-gc-ops-multi/1` aggregate,
+  `lite-gc-allocs/1`, and the `lite-gc-report/1` CLI envelope -- and refuses an
+  unknown schema by name.
+
+Tests: 935 pass / 0 fail. Coverage above the gate (lines 96 / branches 88 /
+functions 95).
+
 ## 1.14.1
 
 Bugfix: allocation attribution (G27) never actually ran when the package was

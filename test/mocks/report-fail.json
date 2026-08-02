@@ -1,0 +1,19 @@
+{
+  "kind": "gc",
+  "verdict": "fail",
+  "ok": false,
+  "violations": [
+    {
+      "metric": "gc.major",
+      "limit": 0,
+      "actual": 3,
+      "reason": "3 major GC(s) > 0"
+    }
+  ],
+  "checked": {
+    "maxMajor": true
+  },
+  "checkedByPhase": {},
+  "checkedByRegion": {},
+  "source": "gc"
+}

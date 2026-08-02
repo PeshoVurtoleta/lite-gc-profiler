@@ -1,0 +1,36 @@
+{
+  "schema": "lite-gc-ops-multi/1",
+  "kind": "ops-multi",
+  "contexts": 2,
+  "aggregate": {
+    "source": "gc",
+    "totalOps": 4000,
+    "bytesPerOp": 0,
+    "bytesPerOpStable": true,
+    "majorsPerKOp": 0,
+    "minorsPerKOp": 2.5,
+    "maxPauseMsPerOp": 0.2
+  },
+  "perContext": [
+    {
+      "schema": "lite-gc-ops/1",
+      "ops": 1000,
+      "source": "gc",
+      "bytesPerOp": 0,
+      "bytesPerOpStable": true,
+      "majorsPerKOp": 0,
+      "minorsPerKOp": 4,
+      "maxPauseMsPerOp": 0.2
+    },
+    {
+      "schema": "lite-gc-ops/1",
+      "ops": 3000,
+      "source": "gc",
+      "bytesPerOp": 0,
+      "bytesPerOpStable": true,
+      "majorsPerKOp": 0,
+      "minorsPerKOp": 2,
+      "maxPauseMsPerOp": 0.1
+    }
+  ]
+}

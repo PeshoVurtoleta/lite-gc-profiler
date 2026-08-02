@@ -1,0 +1,17 @@
+{
+  "schema": "lite-gc-report/1",
+  "version": "1.14.1",
+  "generatedAt": "2026-08-01T22:16:12.744Z",
+  "report": {
+    "kind": "gc",
+    "verdict": "pass",
+    "ok": true,
+    "violations": [],
+    "checked": {
+      "maxMajor": true
+    },
+    "checkedByPhase": {},
+    "checkedByRegion": {},
+    "source": "gc"
+  }
+}

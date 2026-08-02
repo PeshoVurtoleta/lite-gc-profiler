@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.14.1
+# @zakkster/lite-gc-profiler v1.14.2
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -11,6 +11,12 @@ fingerprinting, CLI with partial-report handling for hard exits,
 node:test helper, explain mode via node:inspector heap sampling.
 Single-file browser surface; node-only subpaths for register/
 test-helpers/explain and the lite-gc-gate CLI.
+
+Framework integration (Vue/React/Angular): there is nothing
+framework-specific to install -- gate a reactive tick (an effect re-run,
+a render, a change-detection cycle) with measureAllocs/assertAllocs under
+--expose-gc (Vitest: execArgv ['--expose-gc']). See COOKBOOK recipes
+23-25 and the runnable, zero-dependency examples/ directory.
 
 ## Entry points
 

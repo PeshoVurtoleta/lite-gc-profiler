@@ -1391,6 +1391,44 @@ A canonical `test/99-gc-gate.mjs` template ships under `templates/GcGate.mjs`.
 Every `@zakkster/lite-*` package that wants the Zero-GC badge copies this
 verbatim, adjusting only the workload body and package import.
 
+## Framework integration: Vue, React, Angular
+
+There is nothing framework-specific to install. The profiler gates a
+*function* -- a reactive tick -- so integration is just choosing which tick to
+wrap and running the test under `--expose-gc`.
+
+| Framework | The tick to gate | Driven by |
+| --- | --- | --- |
+| Vue | a reactivity `effect` re-run | `count.value = i` (`@vue/reactivity`) |
+| React | a component render | `root.update(...)` under `react-test-renderer` |
+| Angular | a change-detection cycle | `fixture.detectChanges()` under `TestBed` |
+
+The shape is identical in all three:
+
+```js
+const tick = (i) => { /* trigger one reactive update */ };
+assertAllocs(tick, { maxBytesPerCall: 0 }, { iterations: 5_000, batches: 8 });
+```
+
+Because `measureAllocs`/`assertAllocs` force a collection at each batch boundary,
+the test process needs `--expose-gc`. `node:test` runners already pass it; under
+**Vitest** add it to the worker args:
+
+```js
+// vitest.config.js
+export default {
+    test: { pool: 'forks', poolOptions: { forks: { execArgv: ['--expose-gc'] } } }
+};
+```
+
+One honest caveat: React, Angular, and zone.js each allocate a fixed amount per
+render/cycle *around* your code, so a strict `maxBytesPerCall: 0` on the full
+framework path gates the framework, not you. Gate your reactive body in
+isolation, or set a threshold above the framework's fixed floor with the
+differential lane. See **COOKBOOK Recipes 23-25** for the real-framework +
+Vitest form, and [`examples/`](examples/) for runnable, zero-dependency versions
+(`node --expose-gc examples/vue.mjs`).
+
 ## Formatters
 
 Four pure functions render any report into a target format. All accept the

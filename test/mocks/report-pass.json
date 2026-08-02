@@ -1,0 +1,14 @@
+{
+  "kind": "gc",
+  "verdict": "pass",
+  "ok": true,
+  "violations": [],
+  "checked": {
+    "maxMajor": true,
+    "maxMinor": true,
+    "maxPauseMs": true
+  },
+  "checkedByPhase": {},
+  "checkedByRegion": {},
+  "source": "gc"
+}

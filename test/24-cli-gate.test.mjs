@@ -16,7 +16,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, readFileSync, mkdtempSync, existsSync, unlinkSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdtempSync, existsSync, unlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -376,3 +376,42 @@ test('CLI: --ratchet on a regressing run leaves the baseline untouched and fails
     assert.equal(readFileSync(baselinePath, 'utf8'), before,
         'a failing ratchet must leave the committed baseline untouched');
 });
+
+// The ratchet REWRITE happens only after a passing check. If that write fails
+// the CLI must surface it as an infrastructure error (exit 3), never a silent
+// green -- the same fail-closed contract as --update-baseline's write, but on
+// the ratchet lane, which reads the baseline first and only then rewrites it.
+// Root can write through a read-only file, so skip there rather than lie.
+test('CLI: --ratchet whose rewrite fails -> exit 3',
+    { skip: typeof process.getuid === 'function' && process.getuid() === 0
+        ? 'root writes through a read-only file' : false },
+    () => {
+        const dir = mkdtempSync(join(tmpdir(), 'lite-gc-g28cli-wf-'));
+        const baselinePath = join(dir, 'baseline.json');
+
+        // Capture a real baseline, then loosen every floor so the next CLEAN run
+        // both PASSES and wants to tighten -- guaranteeing the ratchet reaches
+        // the write, which is the branch under test.
+        const wrote = cli(['run', CLEAN, '--baseline', baselinePath, '--update-baseline']);
+        assert.equal(wrote.status, 0, 'stderr=' + wrote.stderr);
+        const loose = JSON.parse(readFileSync(baselinePath, 'utf8'));
+        for (const block of [loose.gc, loose.heap, loose.uasm]) {
+            if (!block) continue;
+            for (const k in block) { block[k].min = 1e12; block[k].median = 1e12; block[k].max = 1e12; }
+        }
+        writeFileSync(baselinePath, JSON.stringify(loose, null, 2));
+
+        // Read stays possible, the rewrite cannot. Restore in finally so the
+        // tmp file is cleanable even if the assertions throw.
+        chmodSync(baselinePath, 0o444);
+        let res;
+        try {
+            res = cli(['run', CLEAN, '--baseline', baselinePath, '--ratchet']);
+        } finally {
+            chmodSync(baselinePath, 0o644);
+        }
+
+        assert.equal(res.status, 3,
+            'a failed ratchet rewrite is exit 3; stdout=' + res.stdout + ' stderr=' + res.stderr);
+        assert.match(res.stderr, /baseline ratchet write failed/);
+    });
