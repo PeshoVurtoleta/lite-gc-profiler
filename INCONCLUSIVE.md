@@ -30,6 +30,7 @@ So: find your line in the table, apply the fix, and keep the gate honest.
 | `reason: 'fingerprint_mismatch'` | the baseline was captured on a different machine or runtime | re-capture the baseline here, or gate ratios instead of absolutes (COOKBOOK Recipe 17) |
 | `reason: 'no_comparable_metrics'` | the baseline and this run share no metric at all | the baseline predates the metrics you are gating; re-capture it |
 | `reason: 'invalid_baseline'` | the baseline file is malformed or from an incompatible schema | re-capture; do not hand-edit baseline JSON |
+| `reason: 'not_observed'` | the summary came from a profiler that was never `start()`ed and never received synthetic data — it observed nothing, so a green gate would be a lie | call `gc.start()` before your workload; `withGcGate` and `measureOps` do this for you |
 | `reason: 'partial_report'` (CLI) | the child process died before writing a full report | read the child's own exit code, reported alongside; this is usually a crash in your workload, not in the gate |
 | a metric reads `null` in an aggregate | some context omitted or broke that metric | find the context. A `measureOps` report legitimately carries no GC rates — that is not a bug, and it is deliberately not averaged as zero |
 | a metric reads `NaN` or `Infinity` | the measurement itself broke | look for a mocked timer, a patched `process.memoryUsage`, or a workload that threw mid-run |

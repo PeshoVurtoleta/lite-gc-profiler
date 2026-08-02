@@ -9,7 +9,7 @@
 // The observer receives node-allocated entry lists between frames; the per-frame
 // methods (sampleHeap, markFrame) allocate nothing.
 
-const VERSION = '1.14.2';
+const VERSION = '1.15.0';
 
 // V8 GC kind constants (perf_hooks NODE_PERFORMANCE_GC_*).
 const GC_MINOR = 1;         // Scavenge (young generation)
@@ -307,6 +307,12 @@ class GcProfiler {
         // Observation-window floor (see start()). Infinity until the first
         // start(): a profiler that was never started counts nothing.
         this._observeSince = Infinity;
+        // Did this profiler ever observe or receive data? False until the first
+        // start() or synthetic intake (record/sampleHeap/markFrame). A never-
+        // started, never-fed profiler has a summary byte-identical to one that
+        // ran and saw zero collections; summary() surfaces this bit so checkNoGc
+        // can route the inert case to inconclusive instead of a false green.
+        this._observed = false;
         this._wantHeap = options.heap !== false;
         // Batch counter for settle(): incremented once per observer callback,
         // regardless of how many entries the batch contained. Settle uses it as
@@ -346,6 +352,7 @@ class GcProfiler {
         // start() is excluded even if it finished after -- observation covers
         // events that began under observation.
         this._observeSince = performance.now();
+        this._observed = true;
         if (!GC_SUPPORTED) { this._running = true; return this; }   // heap/none: nothing to attach
         const self = this;
         this._obs = new PerformanceObserver((list) => {
@@ -477,6 +484,9 @@ class GcProfiler {
         const t = startTime === undefined
             ? (typeof performance !== 'undefined' ? performance.now() : 0)
             : +startTime;
+        // Synthetic intake is a form of observation: a record()-only profiler
+        // (the documented start()-exempt path) legitimately carries data.
+        this._observed = true;
         this._record(kind | 0, durationMs, t);
         return this;
     }
@@ -491,6 +501,11 @@ class GcProfiler {
         if (typeof name !== 'string' || name.length === 0) {
             throw new TypeError('GcProfiler.phase: name must be a non-empty string');
         }
+        // Declaring a phase is deliberate engagement: a declared-but-empty phase
+        // is a real, verifiable measurement (it genuinely saw zero events), so
+        // the profiler counts as observed. Only a pristine, untouched profiler
+        // stays unobserved.
+        this._observed = true;
         let idx = this._phaseIndex.get(name);
         if (idx === undefined) {
             if (this._phaseIdxCount >= MAX_PHASES) {
@@ -530,6 +545,7 @@ class GcProfiler {
         if (typeof name !== 'string' || name.length === 0) {
             throw new TypeError('GcProfiler.enter: name must be a non-empty string');
         }
+        this._observed = true;
         let idx = this._regionIndex.get(name);
         if (idx === undefined) {
             if (this._regionIdxCount >= MAX_REGIONS) {
@@ -661,6 +677,7 @@ class GcProfiler {
         if (typeof used !== 'number' || !isFinite(used)) return this;
         const t = now === undefined ? (typeof performance !== 'undefined' ? performance.now() : 0) : now;
         this._heapActive = true;
+        this._observed = true;
         // G25: fold the external channel HERE, above the first-sample early
         // return. Doing it at the end of the method skipped sample one, which
         // made every growth delta read 0 from a one-sample window -- a channel
@@ -756,6 +773,7 @@ class GcProfiler {
      */
     sampleUasm(now) {
         if (!UASM_SUPPORTED) return Promise.resolve({ supported: false });
+        this._observed = true;
         const self = this;
         const t = now === undefined ? performance.now() : now;
         return performance.measureUserAgentSpecificMemory().then(function (result) {
@@ -791,6 +809,7 @@ class GcProfiler {
      * on Chrome, a long frame coincident with a heap drop is a likely GC pause.
      */
     markFrame(frameMs) {
+        this._observed = true;
         this._frames++;
         const m = +frameMs || 0;
         if (this._frameEwma === 0) this._frameEwma = m;
@@ -832,6 +851,10 @@ class GcProfiler {
             schema: 'lite-gc/1',
             source: this.source,
             supported: this.supported,
+            // v1.15.0: false iff this profiler never started and never received
+            // synthetic data. checkNoGc routes observed:false to inconclusive so
+            // a summary from a profiler nobody ever watched cannot gate green.
+            observed: this._observed,
             gc: {
                 count: this._count,
                 totalMs: this._sumMs,
@@ -1414,6 +1437,33 @@ function _validateGcRuleKeys(fnName, rules, path) {
 function checkNoGc(summary, rules) {
     const r = rules === undefined ? GC_DEFAULT_RULES : rules;
     _validateGcRuleKeys('checkNoGc', r, '');
+    // A profiler that was never .start()ed and never fed synthetic data observed
+    // nothing, yet its summary is byte-identical to one that ran and legitimately
+    // saw zero collections. Gating that green is the exact fail-open this library
+    // exists to prevent, so an explicit observed:false routes every rule to
+    // inconclusive. Only an explicit false triggers this: a hand-built or legacy
+    // summary (observed === undefined) is unaffected, preserving back-compat.
+    if (summary.observed === false) {
+        const checked = {};
+        for (const k in r) if (VERDICT_MATRIX[k]) checked[k] = false;
+        const checkedByPhase = {};
+        if (r.phases) for (const p in r.phases) {
+            const scoped = {};
+            for (const k in r.phases[p]) if (VERDICT_MATRIX[k]) scoped[k] = false;
+            checkedByPhase[p] = scoped;
+        }
+        const checkedByRegion = {};
+        if (r.perRegion) for (const rg in r.perRegion) {
+            const scoped = {};
+            for (const k in r.perRegion[rg]) if (VERDICT_MATRIX[k]) scoped[k] = false;
+            checkedByRegion[rg] = scoped;
+        }
+        return {
+            kind: 'gc', verdict: 'inconclusive', ok: false, violations: [],
+            checked, checkedByPhase, checkedByRegion,
+            source: summary.source, reason: 'not_observed'
+        };
+    }
     const source = summary.source;
     const violations = [];
     const checked = {};
@@ -1507,6 +1557,11 @@ function _inconclusiveHint(report, src) {
     if (reason === 'no_comparable_metrics') {
         return 'The baseline shares no metric with this run; it predates the'
             + ' metrics you are gating. Re-capture it.';
+    }
+    if (reason === 'not_observed') {
+        return 'This summary is from a profiler that never start()ed and never'
+            + ' received synthetic data, so it observed nothing. Call gc.start()'
+            + ' before the workload (withGcGate and measureOps do this for you).';
     }
     if (reason === 'invalid_baseline') {
         return 'The baseline is malformed or from an incompatible schema;'
@@ -2242,7 +2297,13 @@ function assertAgainstBaseline(currentAggregate, baseline, options) {
 function ratchetBaseline(oldBaseline, currentAggregate, options) {
     const opts = options || {};
     if (!oldBaseline || oldBaseline.schema !== BASELINE_SCHEMA) {
-        return { baseline: oldBaseline, ratcheted: false, changed: [], reason: 'invalid_baseline' };
+        // The first argument is not a baseline (a common miswire: the args are
+        // ratchetBaseline(baseline, aggregate) but checkAgainstBaseline is
+        // (aggregate, baseline)). Return baseline:null rather than echoing the
+        // invalid input back under the baseline key -- handing a caller an
+        // aggregate mislabeled as a baseline is how a wrong object gets written
+        // to a baseline file. reason names the miswire.
+        return { baseline: null, ratcheted: false, changed: [], reason: 'invalid_baseline' };
     }
     if (!currentAggregate || typeof currentAggregate !== 'object' ||
             typeof currentAggregate.reps !== 'number') {
@@ -2330,6 +2391,27 @@ function _pad(str, width) {
     return out;
 }
 
+// Short description of a formatter argument, for fail-closed error messages.
+function _describeVerdict(report) {
+    if (report === null || typeof report !== 'object') return String(report);
+    if (typeof report.verdict === 'string') return "'" + report.verdict + "'";
+    if (report.schema) return 'a document with schema ' + JSON.stringify(report.schema) + ' and no verdict';
+    return 'an object with no verdict field';
+}
+
+// A gate report always carries a string verdict. The formatters used to wrap
+// or crash on anything else: formatJson enveloped raw profiler internals as a
+// valid lite-gc-report/1, formatConsole/formatMarkdown threw an opaque V8
+// "cannot read properties of undefined (reading 'toUpperCase')". Both are the
+// wrong shape of failure -- one silently produces a misleading artifact, the
+// other an unreadable stack. Assert the shape once, name it, fail closed.
+function _assertGateReport(fn, report) {
+    if (report === null || typeof report !== 'object' || typeof report.verdict !== 'string') {
+        throw new TypeError(fn + ': expected a gate report with a string verdict; got '
+            + _describeVerdict(report));
+    }
+}
+
 function _title(report) {
     if (report.kind === 'compare') return 'GC gate (differential)';
     if (report.kind === 'reps') return 'GC gate (reps=' + report.reps + ')';
@@ -2349,6 +2431,7 @@ function _verdictBanner(report) {
  * CI job logs. Multi-line, no color codes.
  */
 function formatConsole(report) {
+    _assertGateReport('formatConsole', report);
     const lines = [];
     const src = report.kind === 'compare'
         ? 'control=' + report.controlSource + ', candidate=' + report.candidateSource
@@ -2413,6 +2496,7 @@ function formatConsole(report) {
  * Wraps the report in an envelope with schema tag and capture timestamp.
  */
 function formatJson(report) {
+    _assertGateReport('formatJson', report);
     return JSON.stringify({
         schema: REPORT_SCHEMA,
         version: VERSION,
@@ -2426,6 +2510,7 @@ function formatJson(report) {
  * INCONCLUSIVE) rather than emoji to stay ASCII-only per the convention.
  */
 function formatMarkdown(report) {
+    _assertGateReport('formatMarkdown', report);
     const lines = [];
     lines.push('### ' + _title(report) + ': `' + report.verdict.toUpperCase() + '`');
     lines.push('');
@@ -2502,6 +2587,7 @@ function _ghSafe(value) {
 }
 
 function formatGithubAnnotations(report) {
+    _assertGateReport('formatGithubAnnotations', report);
     const lines = [];
     const title = 'lite-gc-profiler';
     if (report.verdict === 'fail') {
@@ -2530,8 +2616,15 @@ function formatGithubAnnotations(report) {
         const reason = report.reason ? ' (' + _ghSafe(report.reason) + ')' : '';
         lines.push('::warning title=' + title + '::gate inconclusive' + reason + ': '
             + unverif.map(_ghSafe).join(', '));
-    } else {
+    } else if (report.verdict === 'pass') {
         lines.push('::notice title=' + title + '::gate passed on source=' + _ghSafe(report.source));
+    } else {
+        // No verdict (a raw summary, a measurement result, engine internals):
+        // emitting "gate passed" here was a silent false green in CI -- the one
+        // outcome the three-verdict discipline forbids. Its sibling formatters
+        // throw a TypeError on the same input; match them, fail-closed.
+        throw new TypeError('formatGithubAnnotations: expected a gate report with a'
+            + " verdict of 'pass'/'fail'/'inconclusive'; got " + _describeVerdict(report));
     }
     return lines.join('\n');
 }
@@ -5477,7 +5570,19 @@ function watchPool(options) {
  * because "no escapes seen" can never be certified.
  */
 function assertNoEscapes(report) {
-    if (report && report.available && report.escapes && report.escapes.length > 0) {
+    // A watchPool report always carries an escapes array -- empty when none were
+    // seen, and still an array (with the advisory note) even when the mechanism
+    // was unavailable. Anything else -- null, undefined, {}, a settle() that
+    // returned nothing useful -- is not a report, and accepting it silently
+    // would read a MISSING measurement as "no escapes": the very fail-open this
+    // assertion exists to prevent. The documented law that a valid but EMPTY
+    // report never throws (absence is advisory, never a pass) is preserved --
+    // only a non-report is rejected.
+    if (report === null || typeof report !== 'object' || !Array.isArray(report.escapes)) {
+        throw new TypeError('assertNoEscapes: expected a watchPool report with an'
+            + ' escapes array; got ' + (report === null ? 'null' : typeof report));
+    }
+    if (report.available && report.escapes.length > 0) {
         throw new GcPoolEscapeError(report);
     }
     return report;

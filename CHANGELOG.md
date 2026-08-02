@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.15.0
+
+Fail-open hardening. Five edges found by building the GCForge viewer against the
+library -- each a place where a missing or malformed input produced a
+confident-but-wrong answer instead of a fail-closed one. All five are corrected
+here, with tests that reproduce the old behavior and pin the new.
+
+### Fixed
+
+- **A never-started profiler no longer gates green.** `new GcProfiler().summary()`
+  returned a summary byte-identical to one from a profiler that ran and
+  legitimately saw zero collections, and `checkNoGc` passed it -- the exact
+  fail-open this library exists to prevent (zero collections because nothing was
+  watched read identically to zero because the code is clean). The summary now
+  carries `observed` (v1.15.0), false only for a profiler that never `start()`ed
+  AND never received synthetic data (`record`/`sampleHeap`/`sampleUasm`/
+  `markFrame`/`phase`/`enter`). `checkNoGc` routes `observed: false` to
+  `inconclusive` with `reason: 'not_observed'`. Back-compat: a hand-built or
+  legacy summary (no `observed` field) is unaffected -- only an explicit `false`
+  triggers the route.
+- **`formatGithubAnnotations` no longer reports "gate passed" on a document with
+  no verdict.** It emitted a green `::notice ...gate passed` for a raw summary
+  while its sibling formatters threw -- a silent false green in CI. It now throws
+  a named `TypeError`, matching the siblings.
+- **`assertNoEscapes` rejects a non-report.** `null`, `undefined`, `{}` and
+  `{escapes: null}` passed silently, reading a missing measurement as clean. It
+  now throws `TypeError` on anything without an `escapes` array. The documented
+  law is preserved: a valid but EMPTY report (including an unavailable one) still
+  never throws -- absence remains advisory, never a pass.
+- **`ratchetBaseline` returns `baseline: null` on `invalid_baseline`.** It used
+  to echo the (invalid) first argument back under the `baseline` key, so a
+  swapped-in aggregate -- `ratchetBaseline(aggregate, baseline)` instead of
+  `(baseline, aggregate)` -- could be written to a baseline file. It now returns
+  null; the `fingerprint_mismatch` path still returns the valid old baseline
+  unchanged.
+- **The text formatters validate their input.** `formatJson` enveloped arbitrary
+  objects (e.g. `profiler.stop()`, engine internals) as a valid
+  `lite-gc-report/1`; `formatConsole`/`formatMarkdown` crashed with an opaque V8
+  `toUpperCase` error. All four now assert a gate-report shape (a string
+  `verdict`) and throw a named `TypeError` naming the formatter otherwise.
+
+### Notes
+
+- `not_observed` is documented in `INCONCLUSIVE.md`.
+- No hot-path allocation was added: the `observed` flag is a single boolean
+  store, zero bytes; the torture gates for `record`/`sampleHeap`/`markFrame`
+  are unchanged.
+
 ## 1.14.2
 
 Documentation and test-coverage release. No library behavior changed; the only

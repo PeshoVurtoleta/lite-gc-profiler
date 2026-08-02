@@ -32,12 +32,16 @@ const agg = (major) => aggregateGc([dirty(major), dirty(major), dirty(major)]);
 // AXIS A -- MUST NOT tighten on unusable input
 // =============================================================================
 
-test('[A] an invalid-schema baseline is returned unchanged, not tightened', () => {
+test('[A] an invalid-schema baseline yields baseline:null, not the bad input echoed back', () => {
     const bad = { schema: 'not-a-baseline', gc: {} };
     const r = ratchetBaseline(bad, agg(1));
     assert.equal(r.ratcheted, false);
     assert.equal(r.reason, 'invalid_baseline');
-    assert.equal(r.baseline, bad, 'the (bad) input is returned as-is');
+    // v1.15.0: returning the invalid input under the `baseline` key let a
+    // wrongly-typed object (commonly a swapped-in aggregate) be written to a
+    // baseline file. The contract is now baseline:null -- the caller must not
+    // persist a baseline the function refused to produce.
+    assert.equal(r.baseline, null, 'an invalid baseline is not echoed back as a baseline');
 });
 
 test('[A] a null baseline does not throw and does not ratchet', () => {

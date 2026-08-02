@@ -249,7 +249,7 @@ test('back-compat: profiler without any phase() call still works', () => {
 });
 
 test('back-compat: rules without phases block work identically to G1', () => {
-    const gc = new GcProfiler();
+    const gc = new GcProfiler().start();
     const rep = checkNoGc(gc.summary(), { maxMajor: 0 });
     assert.equal(rep.verdict, 'pass');
     assert.deepEqual(rep.checkedByPhase, {});

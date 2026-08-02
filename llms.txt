@@ -1,4 +1,4 @@
-# @zakkster/lite-gc-profiler v1.14.2
+# @zakkster/lite-gc-profiler v1.15.0
 
 Zero-dependency GC and heap profiler that makes the zero-GC claim
 falsifiable. Precise perf_hooks GC entries in node, heap-drop heuristic
@@ -54,6 +54,20 @@ a render, a change-detection cycle) with measureAllocs/assertAllocs under
 ## Key semantics
 
 - Three-state verdict never silently green on unverifiable rules.
+- Never-observed profiler is inconclusive, not green (v1.15.0). `summary.observed`
+  is false iff the profiler never `start()`ed AND never took synthetic data
+  (record/sampleHeap/sampleUasm/markFrame/phase/enter). `checkNoGc` routes
+  `observed:false` to `inconclusive` (reason `not_observed`) -- a summary nobody
+  watched cannot pass. Only an explicit false triggers this; a hand-built/legacy
+  summary (observed undefined) is unaffected.
+- Formatters and canary assert fail-closed (v1.15.0). The four `format*` gate
+  formatters throw a named `TypeError` on a non-report (no string `verdict`) --
+  `formatJson` no longer envelopes engine internals as a valid `lite-gc-report/1`,
+  `formatGithubAnnotations` no longer emits "gate passed" for a verdict-less
+  document. `assertNoEscapes` throws `TypeError` on a non-report (no `escapes`
+  array) but still never throws on a valid EMPTY report (absence stays advisory).
+  `ratchetBaseline` returns `baseline:null` on `invalid_baseline` rather than
+  echoing the mis-passed argument back under the baseline key.
 - Gates fail CLOSED (v1.5.1, extended v1.5.2). An unknown rule key throws
   `TypeError` rather than matching nothing; a non-finite or non-numeric
   threshold throws `RangeError` on the ops/frames lanes and yields
@@ -88,7 +102,7 @@ a render, a change-detection cycle) with measureAllocs/assertAllocs under
 - Triage for the third verdict lives in `INCONCLUSIVE.md` (shipped).
   Reason codes: `source_mismatch`, `mixed_sources`, `fingerprint_mismatch`,
   `no_comparable_metrics`, `invalid_baseline`, `partial_report`,
-  `uasm_below_granularity`. `GcInconclusiveError.message` names the cause
+  `uasm_below_granularity`, `not_observed`. `GcInconclusiveError.message` names the cause
   and one next step; do not resolve an unexpected `inconclusive` by
   setting `allowInconclusive` -- that is the escape hatch, not the fix.
 - One measurement at a time. Overlapping/nested `measureOps`,

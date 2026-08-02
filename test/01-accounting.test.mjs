@@ -69,7 +69,7 @@ test('assertNoGc throws a GcBudgetError that names the violation', () => {
         () => assertNoGc(p.summary()),
         (e) => e instanceof GcBudgetError && /major GC/.test(e.message) && e.report.ok === false
     );
-    assert.doesNotThrow(() => assertNoGc(new GcProfiler(4).summary()));
+    assert.doesNotThrow(() => assertNoGc(new GcProfiler(4).start().summary()));
     p.destroy();
 });
 
