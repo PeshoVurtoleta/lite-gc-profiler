@@ -5,7 +5,7 @@ export interface NodeMemoryUsageLike {
     arrayBuffers?: number;
 }
 
-export const VERSION: '1.14.2';
+export const VERSION: '1.15.0';
 
 export const GC_MINOR: 1;
 export const GC_MAJOR: 4;
@@ -175,6 +175,15 @@ export interface GcSummary {
      */
     source: GcSource;
     supported: boolean;
+    /**
+     * v1.15.0. False iff this profiler never start()ed and never received
+     * synthetic data (record/sampleHeap/sampleUasm/markFrame/phase/enter) -- it
+     * observed nothing. checkNoGc routes observed:false to `inconclusive`
+     * (reason 'not_observed') so a summary nobody ever watched cannot gate
+     * green. Absent on hand-built/legacy summaries, which are treated as
+     * verifiable for back-compat.
+     */
+    observed?: boolean;
     gc: GcStat;
     heap: HeapStat;
     uasm: UasmStat;
@@ -694,9 +703,12 @@ export function assertAgainstBaseline(
 export interface GcRatchetResult {
     /**
      * The tightened baseline, or the OLD baseline unchanged (same object
-     * reference) when nothing moved or the ratchet was refused.
+     * reference) when nothing moved or a fingerprint mismatch was refused.
+     * `null` (v1.15.0) when reason is 'invalid_baseline': the first argument
+     * was not a baseline, so nothing valid can be returned under this key --
+     * never the invalid input echoed back.
      */
-    baseline: GcBaseline;
+    baseline: GcBaseline | null;
     /** True if any metric moved down. */
     ratcheted: boolean;
     /** Which metrics tightened, e.g. ['gc.major', 'heap.allocBytes']. */
